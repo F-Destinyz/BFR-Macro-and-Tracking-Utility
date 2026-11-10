@@ -99,3 +99,9 @@ The reward collector stores allowlisted reward values and identifiers. It does n
 - Serde/JSON for settings, macro, diagnostic, performance, and reward-history data.
 
 This is a personal utility for Brave Frontier: Reborn and is not affiliated with the game's developers.
+
+## Development Acknowledgement
+
+AI-assisted development tools, including OpenAI ChatGPT (GPT-6), were used to assist with code development, debugging, code review, testing and documentation.
+
+All implementation decisions, testing, validation and release approval are overseen by the project maintainer.

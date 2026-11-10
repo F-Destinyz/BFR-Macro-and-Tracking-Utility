@@ -1,0 +1,22 @@
+# Node / Tauri build output
+/node_modules/
+/src-tauri/target/
+/src-tauri/gen/
+/dist/*
+!/dist/index.html
+!/dist/tracker.html
+
+# IDE and local machine files
+/.vs/
+/.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Local diagnostics and temporary files
+*.log
+*.jsonl
+*.tmp
+.env
+.env.*

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BFR Macro — Run History</title>
+<style>
+:root{color-scheme:dark;font-family:Georgia,"Times New Roman",serif;background:#081321;color:#f4e6bd;--gold:#d7ad5c;--gold2:#8f6732;--muted:#b8b5aa}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:22px;background:radial-gradient(ellipse at 50% -15%,#1b3550 0,transparent 58%),linear-gradient(145deg,#07111e,#0b1b2b 58%,#10192a)}
+.shell{max-width:1180px;margin:0 auto;border:2px solid var(--gold2);border-radius:20px;padding:22px;background:linear-gradient(145deg,#0d1c2bdf,#081421f5);box-shadow:0 18px 60px #0009,inset 0 0 0 1px #e6c47a44;position:relative}
+.shell:before{content:"";position:absolute;inset:6px;border:1px solid #c49b504d;border-radius:15px;pointer-events:none}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:2px 4px 18px;border-bottom:1px solid #b88d4d66;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:12px}.crest{width:36px;height:36px;border:1px solid var(--gold);border-radius:50%;display:grid;place-items:center;color:var(--gold);font-size:20px}h1{font-size:21px;letter-spacing:1.5px;margin:0;color:#b8f1d7;font-weight:600}.subtitle{font:11px "Segoe UI",sans-serif;color:var(--muted);margin-top:4px;letter-spacing:.7px}
+.actions{display:flex;gap:8px}button{font:12px "Segoe UI",sans-serif;color:#f4e6bd;background:#14263a;border:1px solid #92703e;border-radius:8px;padding:8px 12px;cursor:pointer}button:hover{background:#203a52}button:disabled{opacity:.55;cursor:not-allowed}button.active{background:#72552c;border-color:#e2bd6b;color:#fff1c9}
+.history-panel{border:1px solid var(--gold2);border-radius:12px;background:#0c1928;padding:16px}.history-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.history-head h2{font-size:16px;margin:0;color:#e8d19b}.history-head input{font:13px "Segoe UI",sans-serif;background:#091421;border:1px solid #65502e;border-radius:7px;padding:9px 11px;color:#f4e6bd;max-width:300px;width:42%}.table-wrap{overflow:auto;max-height:calc(100vh - 190px)}table{width:100%;border-collapse:collapse;font:12px "Segoe UI",sans-serif}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid #54452d;white-space:nowrap}th{position:sticky;top:0;background:#101f30;color:#c8b27d;text-transform:uppercase;font-size:10px;letter-spacing:.7px;z-index:1}tbody tr:hover{background:#ffffff08}.pill{border:1px solid #80633b;border-radius:20px;padding:3px 7px;color:#e8d19b;font-size:10px}.empty{text-align:center;color:var(--muted);padding:30px}.status{font:11px "Segoe UI",sans-serif;color:#9ed8b9;margin:12px 3px 0;min-height:14px}.error{color:#ff9c9c}
+@media(max-width:700px){body{padding:8px}.shell{padding:14px}.history-panel{padding:10px}.history-head{align-items:flex-start;flex-direction:column}.history-head input{width:100%;max-width:none}.table-wrap{max-height:calc(100vh - 210px)}}
+</style></head>
+<body><div class="shell">
+<header><div class="brand"><div class="crest">✧</div><div><h1>BFR RUN HISTORY</h1><div class="subtitle">DUNGEON REWARDS & COMPLETIONS</div></div></div><div class="actions"><button id="clearHistory" title="Permanently clear saved Run History records">✕ Clear</button><button id="pin" title="Keep this window above other windows">♧ Pin</button><button id="refresh" title="Refresh run history">↻ Refresh</button></div></header>
+<main><section class="history-panel"><div class="history-head"><h2>Completed Runs</h2><input id="historySearch" placeholder="Search dungeon or run type…" aria-label="Search run history"></div><div class="table-wrap"><table><thead><tr><th>Completed</th><th>Time Taken</th><th>Dungeon</th><th>Type</th><th>Runs</th><th>Zel</th><th>Karma</th><th>Honor</th><th>EXP</th></tr></thead><tbody id="historyTable"><tr><td colspan="9" class="empty">Loading run history…</td></tr></tbody></table></div></section><div id="status" class="status" role="status">Loading saved records…</div></main>
+</div>
+<script>
+const fmt=n=>Number(n||0).toLocaleString();
+const timeText=ms=>ms?new Date(Number(ms)).toLocaleString():'—';
+const durationText=ms=>{const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;return h?`${h}h ${m}m`:m?`${m}m ${r}s`:`${r}s`};
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let rewards=[];
+function dungeonLabel(r){const id=String(r.dungeon_id||'').trim();return r.dungeon_name||(id?`Run ID: ${id}`:'Unknown run ID')}
+function rewardData(r){return (r.batch_id&&r.totals&&Object.keys(r.totals).length)?r.totals:(r.settlement||r.totals||{})}
+function legacyRunCount(r){const settlement=r.settlement||{},totals=r.totals||{};const count=settlement.settled_runs??settlement.runs??settlement.wins??totals.settled_runs??totals.runs??totals.wins;return Number(r.run_count??(r.path==='/api/battles/finish'?1:(count??0)))}
+function normalize(records){
+ const raw=records.filter(r=>r&&r.record_type==='battle_reward').sort((a,b)=>Number(a.timestamp_unix_ms||0)-Number(b.timestamp_unix_ms||0));
+ const byBatch=new Map(),singles=[];
+ for(const r of raw){if(r.batch_id){const old=byBatch.get(r.batch_id),oldRuns=legacyRunCount(old||{}),newRuns=legacyRunCount(r);if(!old||newRuns>oldRuns||(newRuns===oldRuns&&Number(r.timestamp_unix_ms)>Number(old.timestamp_unix_ms)))byBatch.set(r.batch_id,r)}else singles.push(r)}
+ return [...singles,...byBatch.values()].sort((a,b)=>Number(a.timestamp_unix_ms||0)-Number(b.timestamp_unix_ms||0)).map(r=>{const d=rewardData(r),runType=r.path==='/api/battles/repeat'?(r.batch_id?'repeat_batch':'repeat'):'single';return {...r,run_type:runType,display_name:dungeonLabel(r),values:{runs:legacyRunCount(r),zel:Number(d.zel||0),exp:Number(d.exp||0),karma:Number(d.karma||0),honor:Number(d.honor||0)},kind:runType==='repeat_batch'?'Repeat batch':runType==='repeat'?'Repeat battles':'Single run'}})
+}
+function elapsedTimeText(record){const start=Number(record.dungeon_started_at_unix_ms||0),end=Number(record.timestamp_unix_ms||0);return record.dungeon_start_source==='api_fallback'?'—':start>0&&end>=start?durationText(end-start):'—'}
+function render(){const q=(document.getElementById('historySearch').value||'').toLowerCase();const rows=rewards.slice().reverse().filter(r=>r.display_name.toLowerCase().includes(q)||r.kind.toLowerCase().includes(q));document.getElementById('historyTable').innerHTML=rows.map(r=>{const duration=elapsedTimeText(r);return `<tr><td>${esc(timeText(r.timestamp_unix_ms))}</td><td>${esc(duration)}</td><td>${esc(r.display_name)}</td><td><span class="pill">${esc(r.kind)}</span></td><td>${fmt(r.values.runs)}</td><td>${fmt(r.values.zel)}</td><td>${fmt(r.values.karma)}</td><td>${fmt(r.values.honor)}</td><td>${fmt(r.values.exp)}</td></tr>`}).join('')||'<tr><td colspan="9" class="empty">No matching reward records.</td></tr>'}
+async function load(){const status=document.getElementById('status');try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');const records=await invoke('tracker_read_data');if(!Array.isArray(records))throw new Error('Unexpected saved history data.');rewards=normalize(records);render();status.className='status';status.textContent=`${rewards.length.toLocaleString()} saved completion records`}catch(e){status.className='status error';status.textContent=`Could not load run history: ${String(e)}`}}
+let pinned=false;const pinButton=document.getElementById('pin');(async()=>{try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke==='function'){pinned=await invoke('tracker_get_pinned');pinButton.classList.toggle('active',pinned);pinButton.textContent=pinned?'♧ Pinned':'♧ Pin'}}catch(e){document.getElementById('status').textContent=`Pin state error: ${String(e)}`}})();
+pinButton.addEventListener('click',async()=>{try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!=='function')throw new Error('Window controls unavailable');const next=!pinned;await invoke('tracker_set_pinned',{pinned:next});pinned=next;pinButton.classList.toggle('active',pinned);pinButton.textContent=pinned?'♧ Pinned':'♧ Pin'}catch(e){document.getElementById('status').textContent=`Pin error: ${String(e)}`}});
+document.getElementById('refresh').addEventListener('click',load);
+document.getElementById('historySearch').addEventListener('input',render);
+const clearHistoryButton=document.getElementById('clearHistory');
+clearHistoryButton.addEventListener('click',async()=>{
+ if(!window.confirm('Permanently clear all saved Run History records? This does not affect settings or saved macros.'))return;
+ const status=document.getElementById('status');
+ clearHistoryButton.disabled=true;
+ try{
+  const invoke=window.__TAURI_INTERNALS__?.invoke;
+  if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');
+  await invoke('tracker_clear_history');
+  rewards=[];
+  document.getElementById('historySearch').value='';
+  render();
+  status.className='status';
+  status.textContent='Run History cleared. New completed runs will be saved from now on.';
+ }catch(e){
+  status.className='status error';
+  status.textContent=`Could not clear Run History: ${String(e)}`;
+ }finally{
+  clearHistoryButton.disabled=false;
+ }
+});
+let historyRefreshTimer=null;function startHistoryAutoRefresh(){if(historyRefreshTimer!==null)clearInterval(historyRefreshTimer);historyRefreshTimer=null;if(!document.hidden)historyRefreshTimer=setInterval(load,15000)}document.addEventListener('visibilitychange',()=>{if(document.hidden){if(historyRefreshTimer!==null)clearInterval(historyRefreshTimer);historyRefreshTimer=null}else{load();startHistoryAutoRefresh()}});load();startHistoryAutoRefresh();
+</script></body></html>

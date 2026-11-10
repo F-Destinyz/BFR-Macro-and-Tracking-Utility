@@ -1,0 +1,14 @@
+{
+  "name": "bfr-macro-utility",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "build:windows": "tauri build",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

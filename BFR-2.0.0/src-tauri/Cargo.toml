@@ -1,0 +1,25 @@
+[package]
+name = "bfr-macro-tracking-utility"
+version = "2.0.0"
+description = "BFR Macro & Tracking Utility — game macro recording, playback, and dungeon reward history"
+authors = ["BFR Macro"]
+edition = "2021"
+
+[lib]
+name = "bfr_macro_tauri_edition_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+tungstenite = "0.26"
+url = "2"
+wry = "=0.57.1"
+webview2-com = "=0.39.1"
+windows-core = "=0.62.2"

@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the BFR Macro game window",
+  "windows": [
+    "game"
+  ],
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "allow-game-recording-bridge"
+  ],
+  "remote": {
+    "urls": [
+      "https://rebornbf.com/*"
+    ]
+  }
+}

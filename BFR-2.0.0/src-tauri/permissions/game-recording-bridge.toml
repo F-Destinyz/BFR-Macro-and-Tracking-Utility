@@ -1,0 +1,11 @@
+[[permission]]
+identifier = "allow-game-recording-bridge"
+description = "Allows the trusted Brave Frontier game page to report recording bridge readiness and physical left-click coordinates."
+commands.allow = [
+  "recording_bridge_ready",
+  "record_click",
+  "report_recording_error",
+  "tracker_diagnostic_event",
+  "tracker_dungeon_context",
+  "tracker_reward_event"
+]

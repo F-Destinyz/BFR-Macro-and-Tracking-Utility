@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tracker-diagnostic-event"
+description = "Enables the tracker_diagnostic_event command without any pre-configured scope."
+commands.allow = ["tracker_diagnostic_event"]
+
+[[permission]]
+identifier = "deny-tracker-diagnostic-event"
+description = "Denies the tracker_diagnostic_event command."
+commands.deny = ["tracker_diagnostic_event"]

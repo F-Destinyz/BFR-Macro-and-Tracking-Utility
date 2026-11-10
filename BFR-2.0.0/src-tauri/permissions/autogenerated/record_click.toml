@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-record-click"
+description = "Enables the record_click command without any pre-configured scope."
+commands.allow = ["record_click"]
+
+[[permission]]
+identifier = "deny-record-click"
+description = "Denies the record_click command without any pre-configured scope."
+commands.deny = ["record_click"]

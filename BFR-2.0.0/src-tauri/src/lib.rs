@@ -1,0 +1,2797 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    io::{BufRead, Read, Write},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc,
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use tauri::{
+    image::Image,
+    menu::{IconMenuItem, IsMenuItem, Menu, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
+};
+use tauri_plugin_notification::NotificationExt;
+use tungstenite::{connect, Message, WebSocket};
+use url::Url;
+
+const GAME_URL: &str = "https://rebornbf.com/home";
+const WINDOW_WIDTH: f64 = 900.0;
+const WINDOW_HEIGHT: f64 = 1125.0;
+const LOOP_GAP: Duration = Duration::from_millis(500);
+const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const MODE_IDLE: u8 = 0;
+const MODE_RECORDING: u8 = 1;
+const MODE_PLAYING: u8 = 2;
+
+// Write beside the destination, flush the temporary file, then replace the old
+// file. Keeping the temporary file on the same volume allows replacement to be
+// performed by the operating system without exposing a partially-written JSON.
+fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::AtomicU64;
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = destination.parent().ok_or_else(|| "File destination has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let file_name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("data");
+    let mut temporary = None;
+    for _ in 0..10 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), sequence));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error.to_string());
+                }
+                drop(file);
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let temporary = temporary.ok_or_else(|| "Could not create a temporary save file".to_string())?;
+    let result = replace_file(&temporary, destination);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let success = unsafe {
+        MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    };
+    if success == 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok(()) }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination).map_err(|error| error.to_string())
+}
+
+// This runs in the remote game page. Tauri's remote capability is restricted to
+// rebornbf.com and only the three commands below are exposed to the page.
+// Only trusted physical left-button pointer presses are recorded.
+const INJECTION_SCRIPT: &str = r#"
+(() => {
+  if (window.__bfrMacroCaptureInstalled || window.__bfrMacroCaptureConnecting) return;
+  window.__bfrMacroCaptureConnecting = true;
+
+  const startedAt = Date.now();
+  let lastError = '';
+
+  const connectBridge = () => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke !== 'function') {
+      if (Date.now() - startedAt < 30000) {
+        setTimeout(connectBridge, 150);
+      } else {
+        window.__bfrMacroCaptureConnecting = false;
+        console.error('[BFR Macro] Tauri IPC bridge did not become available within 30 seconds.');
+      }
+      return;
+    }
+
+    invoke('recording_bridge_ready')
+      .then(() => {
+        if (window.__bfrMacroCaptureInstalled) return;
+        window.__bfrMacroCaptureInstalled = true;
+        window.__bfrMacroCaptureConnecting = false;
+        // Serialize IPC calls so rapid physical clicks cannot be stored out of order.
+        let captureQueue = Promise.resolve();
+        let captureFailed = false;
+        document.addEventListener('pointerdown', (event) => {
+          if (!event.isTrusted || event.button !== 0 || captureFailed) return;
+          const width = Math.max(1, window.innerWidth);
+          const height = Math.max(1, window.innerHeight);
+          const x = Math.min(1, Math.max(0, event.clientX / width));
+          const y = Math.min(1, Math.max(0, event.clientY / height));
+          captureQueue = captureQueue.then(() => {
+            if (captureFailed) return;
+            return invoke('record_click', { x, y });
+          }).catch((error) => {
+            if (captureFailed) return;
+            captureFailed = true;
+            console.error('[BFR Macro] Click capture IPC failed:', error);
+            return invoke('report_recording_error', { message: String(error) }).catch((reportError) => {
+              console.error('[BFR Macro] Could not report recording error:', reportError);
+            });
+          });
+        }, true);
+        console.info('[BFR Macro] Physical click capture bridge connected.');
+      })
+      .catch((error) => {
+        lastError = String(error);
+        console.error('[BFR Macro] Recording bridge handshake failed; retrying:', error);
+        if (Date.now() - startedAt < 30000) {
+          setTimeout(connectBridge, 500);
+        } else {
+          window.__bfrMacroCaptureConnecting = false;
+          console.error('[BFR Macro] Recording bridge failed after 30 seconds:', lastError);
+        }
+      });
+  };
+
+  connectBridge();
+
+  // Background reward tracker. It reads only the two known battle reward
+  // responses and the active dungeon heading; unrelated network traffic is ignored.
+  const startTrackerProbe = () => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke !== 'function' || !document.documentElement || window.__bfrTrackerProbeInstalled || window.__bfrTrackerProbeStarting) return false;
+    window.__bfrTrackerProbeStarting = true;
+    try {
+    const pageOrigin = window.location.origin;
+    let diagnosticQueue = Promise.resolve();
+    const report = (event, details) => {
+      diagnosticQueue = diagnosticQueue.then(() => invoke('tracker_diagnostic_event', { event, details }))
+        .catch((error) => {
+          console.error('[BFR Tracker] Diagnostic log IPC failed:', event, String(error));
+        });
+      return diagnosticQueue;
+    };
+
+    report('observer_started', {
+      page_host: window.location.hostname,
+      page_path: window.location.pathname,
+      observer_version: '2.0.0',
+      frame_is_top: window.top === window
+    });
+
+    // Track the most recently visited dungeon route across SPA navigation.
+    // Names are optional labels supplied by the user; unknown dungeon IDs are
+    // still tracked automatically without requiring a per-dungeon code change.
+    // Never infer a quest name from its parent dungeon page. The /start/{id}
+    // route is the authoritative run identifier; unknown IDs remain visible
+    // until the user confirms their names.
+    let activeDungeonRoute = '';
+    let activeDungeonId = '';
+    let activeDungeonName = '';
+    let activeDungeonStartedAt = 0;
+    let activeDungeonStartSource = '';
+    let lastReportedDungeonContext = '';
+    const reportDungeonContext = (source) => {
+      const signature = `${activeDungeonRoute}|${activeDungeonId}|${activeDungeonName}|${activeDungeonStartedAt}|${activeDungeonStartSource}|${activeRun}|${activeRunType}`;
+      if (!activeDungeonRoute || signature === lastReportedDungeonContext) return;
+      lastReportedDungeonContext = signature;
+      const context = {
+        host: window.location.hostname,
+        route: activeDungeonRoute,
+        dungeon_id: activeDungeonId,
+        dungeon_name: activeDungeonName,
+        dungeon_started_at_unix_ms: activeDungeonStartedAt,
+        dungeon_start_source: activeDungeonStartSource,
+        run_active: activeRun,
+        run_type: activeRunType,
+        source
+      };
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke === 'function') {
+        invoke('tracker_dungeon_context', { details: context }).catch((error) => {
+          console.error('[BFR Tracker] Could not save dungeon context:', String(error));
+          report('observer_error', { stage: 'dungeon_context_persistence', message: String(error).slice(0, 180) });
+        });
+      }
+      report('dungeon_context_seen', context);
+    };
+    let activeRun = false;
+    let activeRunType = 'single';
+    let beginQuestClickAt = 0;
+    let beginQuestClickDungeonId = '';
+    // The /begin route is a consequence of starting a quest, not proof that
+    // the player clicked Begin Quest. Capture the actual UI click in the page
+    // before navigation so the timer cannot start on the preview/setup screen.
+    const captureQuestActionClick = (event) => {
+      if (!event.isTrusted || (event.button !== 0 && event.detail !== 0)) return;
+      const pathName = window.location.pathname;
+      const routeMatch = pathName.match(/^\/start\/(\d+)(?:$|\/)/);
+      const dungeonRouteMatch = pathName.match(/^\/dungeons\/(?:vortex|area)\/(\d+)(?:$|\/)/);
+      // Repeat controls can appear on the quest start page or the battle
+      // result page, not only on the dungeon-selection route. On /battle,
+      // reuse the already-confirmed active dungeon ID instead of guessing.
+      const repeatRouteMatch = routeMatch || dungeonRouteMatch;
+      const repeatDungeonId = repeatRouteMatch?.[1]
+        || (/^\/battle(?:$|\/)/.test(pathName) ? activeDungeonId : '');
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      const candidates = path.length ? path : [event.target];
+      for (const node of candidates) {
+        if (!node || node.nodeType !== 1 || typeof node.matches !== 'function') continue;
+        const tag = String(node.tagName || '').toLowerCase();
+        const interactive = node.matches('button, [role="button"], a, input[type="submit"], [tabindex]:not([tabindex="-1"]), [onclick], [data-action]');
+        const ownText = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const label = [
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || '',
+          node.getAttribute('data-action') || '',
+          ownText,
+          node.value || ''
+        ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+        const isBeginQuest = /\bbegin\s+quest\b/i.test(label);
+        // The live game may label this control simply "Repeat" or "Repeat 10".
+        // The batch ID in the API response remains authoritative for run type.
+        const isRepeatAction = /\brepeat\b/i.test(label);
+        const exactActionWrapper = ownText.length <= 100 && /^(?:begin\s+quest|repeat(?:\s+(?:batch|battles?))?(?:\s*(?:x|×)?\s*\(?\d+\)?\s*(?:x|×)?)?|batch\s+repeat)(?:\s*\(?\d+\)?)?$/i.test(ownText);
+        if (!interactive && !exactActionWrapper) continue;
+
+        if (isBeginQuest && routeMatch) {
+          const startedAt = Date.now();
+          beginQuestClickAt = startedAt;
+          beginQuestClickDungeonId = routeMatch[1];
+          activeRun = true;
+          activeRunType = 'single';
+          activeDungeonId = routeMatch[1];
+          activeDungeonName = String(document.querySelector('h1')?.textContent || '').trim();
+          activeDungeonStartedAt = startedAt;
+          activeDungeonStartSource = 'begin_quest_click';
+          activeDungeonRoute = `/start/${routeMatch[1]}/begin`;
+          reportDungeonContext('begin_quest_click');
+          report('begin_quest_click_seen', {
+            dungeon_id: beginQuestClickDungeonId,
+            route: pathName,
+            element_tag: tag,
+            frame_is_top: window.top === window,
+            started_at_unix_ms: startedAt
+          });
+          break;
+        }
+
+        if (isRepeatAction && repeatDungeonId) {
+          const startedAt = Date.now();
+          const dungeonId = repeatDungeonId;
+          const actionKind = /\brepeat\s+batch\b|\bbatch\s+repeat\b/i.test(label)
+            ? 'batch'
+            : /\brepeat\s+battles?\b/i.test(label) ? 'battles' : 'generic';
+          beginQuestClickAt = startedAt;
+          beginQuestClickDungeonId = dungeonId;
+          activeRun = true;
+          activeRunType = actionKind === 'batch' ? 'repeat_batch' : 'repeat';
+          activeDungeonId = dungeonId;
+          // Only replace the quest name when the click happens on a dungeon
+          // or start route. The /battle heading is not necessarily the quest.
+          if (pathName.startsWith('/start/') || pathName.startsWith('/dungeons/')) {
+            const heading = String(document.querySelector('h1')?.textContent || '').trim();
+            if (heading) activeDungeonName = heading;
+          }
+          activeDungeonStartedAt = startedAt;
+          activeDungeonStartSource = 'repeat_action_click';
+          activeDungeonRoute = dungeonRouteMatch
+            ? pathName.split('?')[0].split('#')[0]
+            : `/start/${dungeonId}/begin`;
+          reportDungeonContext('repeat_action_click');
+          report('repeat_action_click_seen', {
+            dungeon_id: dungeonId,
+            route: pathName,
+            action_kind: actionKind,
+            element_tag: tag,
+            frame_is_top: window.top === window,
+            started_at_unix_ms: startedAt
+          });
+          break;
+        }
+      }
+    };
+
+    const updateDungeonContext = (pathValue) => {
+      const path = String(pathValue || '').split('?')[0].split('#')[0];
+      const startMatch = path.match(/^\/start\/(\d+)\/begin(?:$|\/)/);
+      if (startMatch) {
+        // Confirm the route only after the actual Begin Quest click has been
+        // captured. Never start the timer from route observation alone.
+        if (!activeRun || beginQuestClickDungeonId !== startMatch[1] || beginQuestClickAt <= 0) {
+          activeRun = false;
+          activeDungeonStartedAt = 0;
+          activeDungeonStartSource = '';
+          activeDungeonName = '';
+          activeDungeonId = '';
+          activeDungeonRoute = '';
+          activeRunType = 'single';
+          return;
+        }
+        activeDungeonId = startMatch[1];
+        activeDungeonRoute = `/start/${startMatch[1]}/begin`;
+        reportDungeonContext('begin_quest_route_confirmed');
+        return;
+      }
+      // /start/{id} is only the quest preview/setup screen. Do not create a
+      // run, assign a timer, or carry an old quest into this page.
+      if (/^\/start\/\d+(?:$|\/)/.test(path) && !startMatch) {
+        if (!activeRun) {
+          activeDungeonStartedAt = 0;
+          activeDungeonStartSource = '';
+          activeDungeonId = '';
+          activeDungeonName = '';
+          activeDungeonRoute = '';
+          beginQuestClickAt = 0;
+          beginQuestClickDungeonId = '';
+          activeRunType = 'single';
+        }
+        return;
+      }
+      // The battle route is an intermediate screen between quest start and
+      // reward settlement. Preserve the active run context until /finish or
+      // a completed /repeat response arrives; otherwise reward records lose
+      // their ID, name and start timestamp.
+      if (path === '/battle' && activeRun) return;
+
+      const dungeonSelection = path.match(/^\/dungeons\/(?:vortex|area)\/(\d+)(?:$|\/)/);
+      if (dungeonSelection) {
+        // After Begin Quest, the game may navigate from /start/{id} into the
+        // actual dungeon route. Keep that run active and retain its exact ID.
+        if (activeRun) return;
+        activeRun = false;
+        activeDungeonStartedAt = 0;
+        activeDungeonStartSource = '';
+        activeDungeonId = '';
+        activeDungeonName = '';
+        activeDungeonRoute = path;
+        beginQuestClickAt = 0;
+        beginQuestClickDungeonId = '';
+        activeRunType = 'single';
+        reportDungeonContext('dungeon_selection_idle');
+        return;
+      }
+      if (activeRun) {
+        activeRun = false;
+        activeDungeonStartedAt = 0;
+        activeDungeonStartSource = '';
+        activeDungeonId = '';
+        activeDungeonName = '';
+        activeDungeonRoute = path;
+        reportDungeonContext('left_run');
+        activeRunType = 'single';
+        beginQuestClickAt = 0;
+        beginQuestClickDungeonId = '';
+        activeRunType = 'single';
+      }
+    };
+    updateDungeonContext(window.location.pathname);
+    let captureDungeonHeadings = () => {};
+    const notifyRouteChange = () => {
+      updateDungeonContext(window.location.pathname);
+      captureDungeonHeadings();
+    };
+    for (const methodName of ['pushState', 'replaceState']) {
+      const original = history[methodName];
+      history[methodName] = function(...args) {
+        const result = original.apply(this, args);
+        notifyRouteChange();
+        return result;
+      };
+    }
+    window.addEventListener('popstate', notifyRouteChange);
+
+    const numericRewardObject = (value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+      const result = {};
+      for (const [key, amount] of Object.entries(value).slice(0, 200)) {
+        if (!/^[A-Za-z0-9_-]{1,80}$/.test(key)) continue;
+        if (typeof amount === 'number' && Number.isFinite(amount) && amount >= 0) result[key] = amount;
+      }
+      return result;
+    };
+    const numericRewardFields = (value) => {
+      const result = {};
+      if (!value || typeof value !== 'object') return result;
+      for (const key of ['exp', 'zel', 'gems', 'runs', 'wins', 'honor', 'karma', 'level', 'settled_runs', 'auto_sell_zel']) {
+        const amount = value[key];
+        if (typeof amount === 'number' && Number.isFinite(amount) && amount >= 0) result[key] = amount;
+      }
+      return result;
+    };
+
+    const inspectRepeatResponse = (urlValue, method, status, contentType, payload) => {
+      let parsedUrl;
+      try { parsedUrl = new URL(urlValue, pageOrigin); } catch (_) { return; }
+      if (parsedUrl.origin !== pageOrigin || parsedUrl.pathname !== '/api/battles/repeat' || Number(status) < 200 || Number(status) >= 300) return;
+      if (!activeDungeonRoute) {
+        const currentPath = window.location.pathname;
+        if (currentPath.startsWith('/dungeons/') || currentPath.startsWith('/start/')) updateDungeonContext(currentPath);
+      }
+      const settlement = payload?.settlement || {};
+      const totals = payload?.totals || {};
+      const batchId = typeof payload?.batch_id === 'string' ? payload.batch_id : (typeof totals.batch_id === 'string' ? totals.batch_id : (typeof settlement.batch_id === 'string' ? settlement.batch_id : ''));
+      // The repeat endpoint is authoritative. A batch ID identifies a repeat
+      // batch even when the UI click listener missed the game's custom wrapper.
+      const repeatRunType = batchId ? 'repeat_batch' : 'repeat';
+      const currentStartMatch = window.location.pathname.match(/^\/start\/(\d+)\/begin(?:$|\/)/);
+      const currentDungeonMatch = window.location.pathname.match(/^\/dungeons\/(?:vortex|area)\/(\d+)(?:$|\/)/);
+      if (currentStartMatch && (!activeDungeonId || activeDungeonId !== currentStartMatch[1])) {
+        activeDungeonId = currentStartMatch[1];
+        activeDungeonRoute = `/start/${currentStartMatch[1]}/begin`;
+        activeDungeonName = String(document.querySelector('h1')?.textContent || '').trim();
+      } else if (currentDungeonMatch && !activeDungeonId) {
+        // The selection route carries the run ID, but its heading may be a
+        // parent dungeon name. Keep the ID and wait for a quest-specific name.
+        activeDungeonId = currentDungeonMatch[1];
+        activeDungeonRoute = window.location.pathname.split('?')[0].split('#')[0];
+        activeDungeonName = '';
+      }
+      // The Begin Quest click can be captured before the game reveals that
+      // this run is a repeat batch. In that case the click timestamp is still
+      // the correct start of the batch; changing the run type must not reset it
+      // to the time the reward response arrives.
+      const hasValidRunStart = activeRun
+        && activeDungeonStartedAt > 0
+        && (!activeDungeonId || !currentDungeonMatch || activeDungeonId === currentDungeonMatch[1]);
+      if (!hasValidRunStart) {
+        // The custom action click was missed (or belongs to another dungeon).
+        // Use the first successful repeat response as a fallback start point.
+        activeDungeonStartedAt = Date.now();
+        activeDungeonStartSource = 'api_fallback';
+      }
+      activeRun = true;
+      activeRunType = repeatRunType;
+      if (!activeDungeonRoute && activeDungeonId) activeDungeonRoute = `/start/${activeDungeonId}/begin`;
+      reportDungeonContext('repeat_api_confirmed');
+      // settlement.finished describes the current repeat settlement chunk.
+      // Only totals.finished confirms that the overall repeat batch has ended.
+      const batchFinished = totals.finished === true;
+      // Unit arrays are intentionally not counted as drops: discovery showed
+      // they can represent a changing inventory snapshot. We only record their
+      // observed length until their semantics are proven.
+      reportReward({
+        host: parsedUrl.hostname, path: parsedUrl.pathname,
+        dungeon_route: activeDungeonRoute, dungeon_id: activeDungeonId, dungeon_name: activeDungeonName,
+        batch_id: batchId, dungeon_started_at_unix_ms: activeDungeonStartedAt, dungeon_start_source: activeDungeonStartSource, run_type: repeatRunType,
+        settlement: { ...numericRewardFields(settlement), finished: settlement.finished === true },
+        totals: { ...numericRewardFields(totals), finished: totals.finished === true },
+        quest_finished: batchFinished,
+        items: numericRewardObject(settlement.items),
+        totals_items: numericRewardObject(totals.items)
+      });
+      if (batchFinished && activeRun) {
+        activeRun = false;
+        reportDungeonContext('quest_completed');
+        beginQuestClickAt = 0;
+        beginQuestClickDungeonId = '';
+        activeRunType = 'single';
+      }
+    };
+
+    // Normal one-run battles settle through /api/battles/finish. The repeat
+    // endpoint above has a different response shape (settlement + totals), so
+    // normalize the finish response's rewards object into the same safe record.
+    const inspectBattleFinishResponse = (urlValue, method, status, contentType, payload) => {
+      let parsedUrl;
+      try { parsedUrl = new URL(urlValue, pageOrigin); } catch (_) { return; }
+      if (parsedUrl.origin !== pageOrigin || parsedUrl.pathname !== '/api/battles/finish'
+          || Number(status) < 200 || Number(status) >= 300) return;
+      const rewards = payload?.rewards;
+      if (!rewards || typeof rewards !== 'object' || Array.isArray(rewards) || payload?.ok === false) return;
+      const currentPath = window.location.pathname;
+      const finishStartMatch = currentPath.match(/^\/start\/(\d+)\/begin(?:$|\/)/);
+      if (finishStartMatch) {
+        activeDungeonId = finishStartMatch[1];
+        activeDungeonRoute = `/start/${finishStartMatch[1]}/begin`;
+        activeDungeonName = String(document.querySelector('h1')?.textContent || activeDungeonName || '').trim();
+      } else if (!activeDungeonId && beginQuestClickDungeonId) {
+        activeDungeonId = beginQuestClickDungeonId;
+        activeDungeonRoute = `/start/${beginQuestClickDungeonId}/begin`;
+      } else if (!activeDungeonRoute && (currentPath.startsWith('/dungeons/') || currentPath.startsWith('/start/'))) {
+        updateDungeonContext(currentPath);
+      }
+      const currentRewards = payload.rewards;
+      reportReward({
+        host: parsedUrl.hostname, path: parsedUrl.pathname,
+        dungeon_route: activeDungeonRoute, dungeon_id: activeDungeonId, dungeon_name: activeDungeonName,
+        batch_id: '', dungeon_started_at_unix_ms: activeDungeonStartedAt, dungeon_start_source: activeDungeonStartSource, run_type: activeRunType,
+        settlement: { ...numericRewardFields({ ...currentRewards, runs: 1 }), finished: true },
+        totals: {}, quest_finished: true, items: numericRewardObject(currentRewards.items), totals_items: {}
+      });
+      if (activeRun) {
+        activeRun = false;
+        reportDungeonContext('quest_completed');
+        beginQuestClickAt = 0;
+        beginQuestClickDungeonId = '';
+        activeRunType = 'single';
+      }
+    };
+
+    const reportReward = (details) => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== 'function') {
+        console.error('[BFR Tracker] Tauri invoke bridge unavailable; reward was not persisted.');
+        return;
+      }
+      invoke('tracker_reward_event', { details }).then(() => {
+        invoke('tracker_diagnostic_event', { event: 'reward_persisted', details: {
+          dungeon_id: String(details.dungeon_id || '').slice(0, 40),
+          settled_runs: Number(details.settlement?.settled_runs || 0)
+        }}).catch(() => {});
+      }).catch((error) => {
+        console.error('[BFR Tracker] Could not persist reward event:', String(error));
+        invoke('tracker_diagnostic_event', { event: 'reward_persist_failed', details: {
+          stage: 'reward_persistence', message: String(error).slice(0, 180)
+        }}).catch(() => {});
+      });
+    };
+
+    // Read only the visible H1 on dungeon routes to resolve the active quest name.
+    // Do not inspect general page text, forms, or account widgets.
+    captureDungeonHeadings = () => {
+      const path = window.location.pathname;
+      updateDungeonContext(path);
+      if (!(path.startsWith('/dungeons/') || path.startsWith('/start/'))) return;
+      const heading = document.querySelector('h1');
+      const label = String(heading?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+      if (/^\/start\/\d+\/begin(?:$|\/)/.test(path)
+          && label && label.toLowerCase() !== 'reinforcement'
+          && activeRun && activeDungeonName !== label) {
+        activeDungeonName = label;
+        activeDungeonRoute = path.split('/').slice(0, 4).join('/');
+        reportDungeonContext('quest_name_detected');
+      }
+    };
+    captureDungeonHeadings();
+    if (!window.__bfrDungeonHeadingObserver && typeof MutationObserver !== 'undefined') {
+      let headingCaptureScheduled = false;
+      const headingObserver = new MutationObserver(() => {
+        if (headingCaptureScheduled) return;
+        headingCaptureScheduled = true;
+        window.setTimeout(() => {
+          headingCaptureScheduled = false;
+          captureDungeonHeadings();
+        }, 120);
+      });
+      headingObserver.observe(document.documentElement, { childList: true, subtree: true });
+      // Publish the global reference only after observe() succeeds, so a failed
+      // startup retry cannot mistake an unconnected observer for a live one.
+      window.__bfrDungeonHeadingObserver = headingObserver;
+    }
+
+    if (!window.__bfrTrackerFetchWrapped && typeof window.fetch === 'function') {
+      window.__bfrTrackerFetchWrapped = true;
+      const originalFetch = window.fetch;
+      window.fetch = function(...args) {
+        const requestUrl = args[0] instanceof Request ? args[0].url : String(args[0] || '');
+        const requestMethod = (args[1] && args[1].method) || (args[0] instanceof Request ? args[0].method : 'GET');
+        return originalFetch.apply(this, args).then((response) => {
+          try {
+            const parsed = new URL(response.url || requestUrl, pageOrigin);
+            if (parsed.origin !== pageOrigin) return response;
+            if (parsed.pathname.startsWith('/dungeons/') || parsed.pathname.startsWith('/start/')) {
+              updateDungeonContext(parsed.pathname);
+              captureDungeonHeadings();
+            }
+            if (parsed.pathname === '/api/battles/repeat' || parsed.pathname === '/api/battles/finish') {
+              const contentType = response.headers.get('content-type') || '';
+              if (contentType.toLowerCase().includes('json')) {
+                response.clone().json().then((payload) => {
+                  if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, requestMethod, response.status, contentType, payload);
+                  else inspectBattleFinishResponse(parsed.href, requestMethod, response.status, contentType, payload);
+                }).catch(() => {});
+              }
+            }
+          } catch (_) {}
+          return response;
+        });
+      };
+    }
+
+    if (!window.__bfrTrackerXhrWrapped && typeof XMLHttpRequest !== 'undefined') {
+      window.__bfrTrackerXhrWrapped = true;
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__bfrTrackerMethod = method;
+        this.__bfrTrackerUrl = String(url || '');
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(...args) {
+        this.addEventListener('load', function() {
+          try {
+            const parsed = new URL(this.responseURL || this.__bfrTrackerUrl, pageOrigin);
+            if (parsed.origin !== pageOrigin) return;
+            if (parsed.pathname.startsWith('/dungeons/') || parsed.pathname.startsWith('/start/')) {
+              updateDungeonContext(parsed.pathname);
+              captureDungeonHeadings();
+              return;
+            }
+            if (parsed.pathname !== '/api/battles/repeat' && parsed.pathname !== '/api/battles/finish') return;
+            const contentType = this.getResponseHeader('content-type') || '';
+            if (!contentType.toLowerCase().includes('json')) return;
+            let payload = this.responseType === 'json' ? this.response : this.responseText;
+            if (typeof payload === 'string') payload = JSON.parse(payload);
+            if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
+            else inspectBattleFinishResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
+          } catch (_) {}
+        }, { once: true });
+        return originalSend.apply(this, args);
+      };
+    }
+
+    // Only the functional reward observers and the narrowly-scoped dungeon
+    // heading observer remain active. Broad network, WebSocket, resource and
+    // whole-page mutation discovery instrumentation has been retired.
+    // Attach the click listener last. If any earlier setup step fails, the
+    // retry can safely rebuild the tracker without leaving a stale listener
+    // behind. This prevents one physical click from being reported twice.
+    if (!window.__bfrTrackerActionClickListenerInstalled) {
+      document.addEventListener('click', captureQuestActionClick, true);
+      window.__bfrTrackerActionClickListenerInstalled = true;
+    }
+    report('observer_status', { component: 'tracker', status: 'installed', page_path: location.pathname });
+    window.__bfrTrackerProbeInstalled = true;
+    window.__bfrTrackerProbeStarting = false;
+    console.info('[BFR Tracker] Global observer installed successfully.');
+    return true;
+    } catch (error) {
+      window.__bfrTrackerProbeStarting = false;
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke === 'function') {
+        invoke('tracker_diagnostic_event', { event: 'observer_error', details: {
+          stage: 'tracker_initialization',
+          message: String(error).slice(0, 180)
+        }}).catch(() => {});
+      }
+      console.error('[BFR Tracker] Global observer initialization failed; retry will continue:', error);
+      return false;
+    }
+  };
+
+  // Restore the earlier document-start lifecycle: start independently from
+  // macro recording and retry while the Tauri IPC bridge becomes available.
+  if (!startTrackerProbe()) {
+    let attempts = 0;
+    const retry = () => {
+      attempts += 1;
+      if (window.__bfrTrackerProbeInstalled || window.__bfrTrackerProbeStarting) return;
+      if (startTrackerProbe()) return;
+      if (attempts < 200) window.__bfrTrackerProbeRetry = setTimeout(retry, 300);
+      else console.error('[BFR Tracker] Observer could not start: Tauri IPC bridge unavailable after 60 seconds.');
+    };
+    window.__bfrTrackerProbeRetry = setTimeout(retry, 300);
+  }
+})();
+"#;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MacroClick {
+    x: f64,
+    y: f64,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MacroFile {
+    format: String,
+    clicks: Vec<MacroClick>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct AppSettings {
+    width: f64,
+    height: f64,
+    pinned: bool,
+    tracker_pinned: bool,
+    tracker_width: f64,
+    tracker_height: f64,
+    loop_enabled: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            width: WINDOW_WIDTH,
+            height: WINDOW_HEIGHT,
+            pinned: false,
+            tracker_pinned: false,
+            tracker_width: 760.0,
+            tracker_height: 820.0,
+            loop_enabled: true,
+        }
+    }
+}
+
+struct SettingsState {
+    file: PathBuf,
+    settings: Mutex<AppSettings>,
+    save_lock: Mutex<()>,
+    resize_save_tx: mpsc::Sender<()>,
+}
+
+impl SettingsState {
+    fn save(&self) -> Result<(), String> {
+        // Serialize save operations so concurrent tray/resize saves cannot overwrite
+        // a newer snapshot with an older one.
+        let _save_guard = self
+            .save_lock
+            .lock()
+            .map_err(|_| "Settings save operation is unavailable".to_string())?;
+        // Snapshot settings under the data lock, then perform serialization and disk I/O
+        // without holding that lock. This keeps tray and resize interactions responsive.
+        let snapshot = self
+            .settings
+            .lock()
+            .map_err(|_| "Settings are unavailable because their lock was poisoned".to_string())?
+            .clone();
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| error.to_string())?;
+        write_file_atomically(&self.file, &bytes)
+    }
+}
+
+struct MacroState {
+    file: PathBuf,
+    log_file: PathBuf,
+    performance_file: PathBuf,
+    tracker_diagnostics_file: PathBuf,
+    tracker_sessions_file: PathBuf,
+    tracker_data_lock: Mutex<()>,
+    cdp_port: u16,
+    mode: AtomicU8,
+    bridge_ready: AtomicBool,
+    record_started: Mutex<Option<Instant>>,
+    clicks: Mutex<Vec<MacroClick>>,
+    loop_enabled: AtomicBool,
+}
+
+impl MacroState {
+    fn save_macro(&self) -> Result<usize, String> {
+        let clicks = self
+            .clicks
+            .lock()
+            .map_err(|_| "Macro data is unavailable".to_string())?
+            .clone();
+        if clicks.is_empty() {
+            return Ok(0);
+        }
+        let count = clicks.len();
+        let data = MacroFile {
+            format: "BFRMACRO3".to_string(),
+            clicks,
+        };
+        let bytes = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
+        write_file_atomically(&self.file, &bytes)?;
+        Ok(count)
+    }
+
+    fn load_macro(&self) -> Result<usize, String> {
+        let bytes = fs::read(&self.file).map_err(|e| e.to_string())?;
+        let data: MacroFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
+            return Err("This macro file format is not supported".to_string());
+        }
+        if data.clicks.iter().any(|click| {
+            !click.x.is_finite()
+                || !click.y.is_finite()
+                || click.x < 0.0
+                || click.x > 1.0
+                || click.y < 0.0
+                || click.y > 1.0
+        }) {
+            return Err("The macro contains invalid click coordinates".to_string());
+        }
+        if data.clicks.windows(2).any(|pair| pair[1].elapsed_ms < pair[0].elapsed_ms) {
+            return Err("The macro contains click timestamps that are out of order".to_string());
+        }
+        let count = data.clicks.len();
+        *self
+            .clicks
+            .lock()
+            .map_err(|_| "Macro data is unavailable".to_string())? = data.clicks;
+        Ok(count)
+    }
+
+    fn log(&self, message: &str) {
+        if let Some(parent) = self.log_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let line = format!("{}  {}\n", chrono_like_timestamp(), message);
+        use std::io::Write as _;
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_file)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn performance_event(&self, event: &str, details: Value) {
+        let record = json!({
+            "schema_version": 1,
+            "record_type": "event",
+            "timestamp_unix_ms": unix_timestamp_ms(),
+            "event": event,
+            "activity": activity_name(self.mode.load(Ordering::SeqCst)),
+            "details": details
+        });
+        if let Err(error) = append_performance_record(&self.performance_file, &record) {
+            self.log(&format!("Performance log write failed: {error}"));
+        }
+    }
+
+    fn tracker_diagnostic_event(&self, event: &str, details: Value) -> Result<(), String> {
+        let safe_event = match event {
+            "observer_started" | "resource_seen" | "observer_error" | "dungeon_context_seen" | "begin_quest_click_seen" | "repeat_action_click_seen" | "repeat_batch_click_seen" | "repeat_battles_click_seen" | "battle_response_seen" | "battle_response_schema_seen" | "api_response_schema_seen" | "dungeon_metadata_seen" | "reward_persisted" | "reward_persist_failed" | "network_activity" | "websocket_activity" | "dom_activity" | "navigation_activity" | "observer_status" => event,
+            _ => return Err("Unsupported tracker diagnostic event".to_string()),
+        };
+        let safe_details = match safe_event {
+            "observer_started" => json!({
+                "page_host": details.get("page_host").and_then(Value::as_str).unwrap_or("").chars().take(120).collect::<String>(),
+                "page_path": details.get("page_path").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                "frame_is_top": details.get("frame_is_top").and_then(Value::as_bool).unwrap_or(true)
+            }),
+            "observer_status" => json!({
+                "component": details.get("component").and_then(Value::as_str).unwrap_or("unknown").chars().take(40).collect::<String>(),
+                "status": details.get("status").and_then(Value::as_str).unwrap_or("unknown").chars().take(30).collect::<String>(),
+                "page_path": details.get("page_path").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                "diagnostic_sequence": details.get("diagnostic_sequence").and_then(Value::as_u64).unwrap_or(0).min(100000000),
+                "diagnostic_failures": details.get("diagnostic_failures").and_then(Value::as_u64).unwrap_or(0).min(100000000),
+                "fetch": details.get("fetch").and_then(Value::as_bool).unwrap_or(false),
+                "xhr": details.get("xhr").and_then(Value::as_bool).unwrap_or(false),
+                "websocket": details.get("websocket").and_then(Value::as_bool).unwrap_or(false),
+                "dom": details.get("dom").and_then(Value::as_bool).unwrap_or(false),
+                "performance_resource": details.get("performance_resource").and_then(Value::as_bool).unwrap_or(false)
+            }),
+            "begin_quest_click_seen" | "repeat_action_click_seen" | "repeat_batch_click_seen" | "repeat_battles_click_seen" => json!({
+                "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
+                "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                "action_kind": details.get("action_kind").and_then(Value::as_str).filter(|v| ["batch", "battles", "generic"].contains(v)).unwrap_or("begin_quest"),
+                "element_tag": details.get("element_tag").and_then(Value::as_str).unwrap_or("").chars().take(20).collect::<String>(),
+                "frame_is_top": details.get("frame_is_top").and_then(Value::as_bool).unwrap_or(true),
+                "started_at_unix_ms": details.get("started_at_unix_ms").and_then(Value::as_u64).unwrap_or(0)
+            }),
+            "dungeon_context_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" { return Ok(()); }
+                let route = details.get("route").and_then(Value::as_str).unwrap_or("");
+                if !route.starts_with("/dungeons/") && !route.starts_with("/start/") { return Ok(()); }
+                let safe_id = details.get("dungeon_id").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 40 && v.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))).unwrap_or("");
+                let name = details.get("dungeon_name").and_then(Value::as_str).unwrap_or("");
+                json!({
+                    "host": host,
+                    "route": route.chars().take(200).collect::<String>(),
+                    "dungeon_id": safe_id,
+                    "dungeon_name": name.chars().take(100).filter(|c| !c.is_control()).collect::<String>(),
+                    "source": details.get("source").and_then(Value::as_str).unwrap_or("route").chars().take(40).collect::<String>()
+                })
+            },
+            "resource_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" { return Ok(()); }
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') { return Ok(()); }
+                json!({
+                    "host": host,
+                    "path": path.chars().take(300).collect::<String>(),
+                    "initiator_type": details.get("initiator_type").and_then(Value::as_str).unwrap_or("unknown").chars().take(40).collect::<String>(),
+                    "duration_ms": details.get("duration_ms").and_then(Value::as_u64).unwrap_or(0).min(600000),
+                    "transfer_size": details.get("transfer_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000),
+                    "encoded_body_size": details.get("encoded_body_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000)
+                })
+            },
+            "battle_response_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
+                let method = details.get("method").and_then(Value::as_str).unwrap_or("GET");
+                let content_type = details.get("content_type").and_then(Value::as_str).unwrap_or("");
+                let mut safe_fields = Vec::new();
+                if let Some(fields) = details.get("fields").and_then(Value::as_array) {
+                    for field in fields.iter().take(80) {
+                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
+                        let lower = field_path.to_ascii_lowercase();
+                        if field_path.is_empty() || field_path.len() > 180
+                            || lower.contains("token") || lower.contains("auth")
+                            || lower.contains("cookie") || lower.contains("password")
+                            || lower.contains("account") || lower.contains("player")
+                            || lower.contains("session") || lower.contains("email")
+                        { continue; }
+                        let Some(value) = field.get("value") else { continue; };
+                        let safe_value = match value {
+                            Value::String(text) => Value::String(text.chars().take(100).collect()),
+                            Value::Number(number) => Value::Number(number.clone()),
+                            Value::Bool(boolean) => Value::Bool(*boolean),
+                            _ => continue,
+                        };
+                        safe_fields.push(json!({ "path": field_path, "value": safe_value }));
+                    }
+                }
+                json!({
+                    "host": host,
+                    "path": path,
+                    "method": method.chars().take(10).collect::<String>(),
+                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
+                    "content_type": content_type.chars().take(80).collect::<String>(),
+                    "dungeon_route": details.get("dungeon_route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                    "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
+                    "dungeon_name": details.get("dungeon_name").and_then(Value::as_str).unwrap_or("").chars().take(100).collect::<String>(),
+                    "field_count": safe_fields.len(),
+                    "fields": safe_fields
+                })
+            },
+            "battle_response_schema_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
+                let mut schema_fields = Vec::new();
+                if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
+                    for field in fields.iter().take(240) {
+                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
+                        let lower_path = field_path.to_ascii_lowercase();
+                        if field_path.is_empty() || field_path.len() > 180 || !field_path.is_ascii()
+                            || ["token", "auth", "cookie", "password", "email", "account", "username", "player", "character", "session", "csrf", "secret", "credential", "profile", "user", "identity", "uuid"].iter().any(|blocked| lower_path.contains(blocked))
+                            || field_path.chars().any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
+                        { continue; }
+                        let value_type = match field.get("value_type").and_then(Value::as_str).unwrap_or("") {
+                            "object" | "array" | "array_item" | "null" | "number" | "boolean" | "string" => field.get("value_type").and_then(Value::as_str).unwrap_or("unknown"),
+                            _ => continue,
+                        };
+                        let mut safe = json!({ "path": field_path, "value_type": value_type });
+                        if value_type == "array" || value_type == "array_item" {
+                            let length = field.get("array_length").and_then(Value::as_u64).unwrap_or(0).min(10000);
+                            safe["array_length"] = json!(length);
+                        }
+                        schema_fields.push(safe);
+                    }
+                }
+                json!({
+                    "host": host,
+                    "path": path,
+                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
+                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
+                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
+                    "schema_field_count": schema_fields.len(),
+                    "schema_fields": schema_fields
+                })
+            },
+            "api_response_schema_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" || !path.starts_with("/api/") || path.len() > 240 || path.contains('?') || path.contains('#') { return Ok(()); }
+                let mut schema_fields = Vec::new();
+                if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
+                    for field in fields.iter().take(240) {
+                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
+                        let lower_path = field_path.to_ascii_lowercase();
+                        if field_path.is_empty() || field_path.len() > 180 || !field_path.is_ascii()
+                            || ["token", "auth", "cookie", "password", "email", "account", "username", "player", "character", "session", "csrf", "secret", "credential", "profile", "user", "identity", "uuid"].iter().any(|blocked| lower_path.contains(blocked))
+                            || field_path.chars().any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c))) { continue; }
+                        let value_type = match field.get("value_type").and_then(Value::as_str).unwrap_or("") {
+                            "object" | "array" | "array_item" | "null" | "number" | "boolean" | "string" => field.get("value_type").and_then(Value::as_str).unwrap_or("unknown"),
+                            _ => continue,
+                        };
+                        let mut safe = json!({ "path": field_path, "value_type": value_type });
+                        if value_type == "array" || value_type == "array_item" {
+                            safe["array_length"] = json!(field.get("array_length").and_then(Value::as_u64).unwrap_or(0).min(10000));
+                        }
+                        schema_fields.push(safe);
+                    }
+                }
+                json!({
+                    "host": host,
+                    "path": path,
+                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
+                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
+                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
+                    "schema_field_count": schema_fields.len(),
+                    "schema_fields": schema_fields
+                })
+            },
+            "dungeon_metadata_seen" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" || !(path == "/dungeons" || path.starts_with("/dungeons/") || path.starts_with("/start/")) || path.contains('?') || path.contains('#') { return Ok(()); }
+                let mut entries = Vec::new();
+                if let Some(items) = details.get("entries").and_then(Value::as_array) {
+                    for item in items.iter().take(40) {
+                        let mut safe = serde_json::Map::new();
+                        if let Some(source) = item.get("source_path").and_then(Value::as_str) {
+                            let clean = source.chars().take(120).filter(|c| c.is_ascii_alphanumeric() || "._-*[]".contains(*c)).collect::<String>();
+                            if !clean.is_empty() { safe.insert("source_path".into(), json!(clean)); }
+                        }
+                        if let Some(label) = item.get("label").and_then(Value::as_str) {
+                            let label = label.trim();
+                            if !label.is_empty() && label.len() <= 100 && !label.chars().any(|c| c.is_control()) { safe.insert("label".into(), json!(label)); }
+                        }
+                        for key in ["id", "level"] {
+                            if let Some(value) = item.get(key).and_then(Value::as_str) {
+                                if !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || " _.-".contains(c)) { safe.insert(key.into(), json!(value)); }
+                            }
+                        }
+                        if safe.contains_key("label") || safe.contains_key("id") || safe.contains_key("level") { entries.push(Value::Object(safe)); }
+                    }
+                }
+                json!({
+                    "host": host, "path": path,
+                    "method": if details.get("method").and_then(Value::as_str) == Some("DOM") { "DOM" } else { "GET" },
+                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
+                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
+                    "entry_count": entries.len(), "entries": entries
+                })
+            },
+            "reward_persisted" => json!({
+                "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
+                "settled_runs": details.get("settled_runs").and_then(Value::as_u64).unwrap_or(0).min(100000)
+            }),
+            "network_activity" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" { return Ok(()); }
+                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') { return Ok(()); }
+                json!({
+                    "host": host,
+                    "path": path.chars().take(300).collect::<String>(),
+                    "transport": details.get("transport").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
+                    "phase": details.get("phase").and_then(Value::as_str).unwrap_or("response").chars().take(20).collect::<String>(),
+                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
+                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
+                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
+                    "duration_ms": details.get("duration_ms").and_then(Value::as_u64).unwrap_or(0).min(600000),
+                    "body_size": details.get("body_size").and_then(Value::as_u64).unwrap_or(0).min(100000000),
+                    "is_json": details.get("is_json").and_then(Value::as_bool).unwrap_or(false)
+                })
+            },
+            "websocket_activity" => {
+                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com" { return Ok(()); }
+                json!({
+                    "transport": "websocket",
+                    "phase": details.get("phase").and_then(Value::as_str).unwrap_or("message").chars().take(20).collect::<String>(),
+                    "direction": details.get("direction").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
+                    "data_type": details.get("data_type").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
+                    "payload_size": details.get("payload_size").and_then(Value::as_u64).unwrap_or(0).min(100000000)
+                })
+            },
+            "dom_activity" => json!({
+                "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                "mutation_count": details.get("mutation_count").and_then(Value::as_u64).unwrap_or(0).min(100000),
+                "added_nodes": details.get("added_nodes").and_then(Value::as_u64).unwrap_or(0).min(100000),
+                "removed_nodes": details.get("removed_nodes").and_then(Value::as_u64).unwrap_or(0).min(100000)
+            }),
+            "navigation_activity" => json!({
+                "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
+                "source": details.get("source").and_then(Value::as_str).unwrap_or("unknown").chars().take(30).collect::<String>()
+            }),
+            _ => json!({
+                "stage": details.get("stage").and_then(Value::as_str).unwrap_or("unknown").chars().take(80).collect::<String>(),
+                "message": details.get("message").and_then(Value::as_str).unwrap_or("unknown").chars().take(180).collect::<String>()
+            })
+        };
+        let record = json!({
+            "schema_version": 1,
+            "record_type": "tracker_discovery",
+            "timestamp_unix_ms": unix_timestamp_ms(),
+            "event": safe_event,
+            "details": safe_details
+        });
+        append_performance_record(&self.tracker_diagnostics_file, &record)
+    }
+
+    fn tracker_dungeon_context(&self, details: Value) -> Result<(), String> {
+        let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+        let route = details.get("route").and_then(Value::as_str).unwrap_or("");
+        if host != "rebornbf.com" || !route.starts_with('/') || route.starts_with("//") || route.len() > 200 || route.contains('?') || route.contains('#') {
+            return Err("Rejected invalid dungeon context from the game page".to_string());
+        }
+        let safe_id = details.get("dungeon_id").and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)))
+            .map(str::to_string);
+        let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 100 && !value.chars().any(char::is_control));
+        let name = supplied_name.or_else(|| match safe_id.as_deref() {
+            Some("100501") => Some("Gold Valley Lv. 2"),
+            Some("100502") => Some("Gold Valley Lv. 3"),
+            _ => None,
+        });
+        let record = json!({
+            "schema_version": 1,
+            "record_type": "dungeon_context",
+            "timestamp_unix_ms": unix_timestamp_ms(),
+            "dungeon_route": route,
+            "dungeon_id": safe_id,
+            "dungeon_name": name,
+            "dungeon_started_at_unix_ms": details.get("dungeon_started_at_unix_ms").and_then(Value::as_u64).filter(|value| *value > 0),
+            "dungeon_start_source": details.get("dungeon_start_source").and_then(Value::as_str).filter(|v| ["begin_quest_click", "repeat_action_click", "api_fallback"].contains(v)),
+            "run_active": details.get("run_active").and_then(Value::as_bool).unwrap_or(false),
+            "run_type": details.get("run_type").and_then(Value::as_str).filter(|v| ["single", "repeat", "repeat_batch"].contains(v)).unwrap_or("single")
+        });
+        let _history_guard = self.tracker_data_lock.lock()
+            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        append_performance_record(&self.tracker_sessions_file, &record)
+    }
+
+    fn tracker_reward_event(&self, details: Value) -> Result<(), String> {
+        let host = details.get("host").and_then(Value::as_str).unwrap_or("");
+        let path = details.get("path").and_then(Value::as_str).unwrap_or("");
+        if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
+        let _history_guard = self.tracker_data_lock.lock()
+            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+
+        let safe_id = |value: Option<&Value>, max: usize| -> Option<String> {
+            let raw = value?.as_str()?;
+            if raw.is_empty() || raw.len() > max || !raw.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)) { return None; }
+            Some(raw.to_string())
+        };
+        let safe_number = |object: &Value, key: &str| -> Option<u64> {
+            object.get(key)?.as_u64().filter(|n| *n <= 9_000_000_000_000)
+        };
+        let settlement = details.get("settlement").cloned().unwrap_or(Value::Null);
+        let totals = details.get("totals").cloned().unwrap_or(Value::Null);
+        let numeric_keys = ["exp", "zel", "gems", "runs", "wins", "honor", "karma", "level", "settled_runs", "auto_sell_zel"];
+        let mut settlement_safe = serde_json::Map::new();
+        let mut totals_safe = serde_json::Map::new();
+        for key in numeric_keys {
+            if let Some(value) = safe_number(&settlement, key) { settlement_safe.insert(key.into(), json!(value)); }
+            if let Some(value) = safe_number(&totals, key) { totals_safe.insert(key.into(), json!(value)); }
+        }
+        let sanitize_items = |source: Option<&Value>| {
+            let mut safe = serde_json::Map::new();
+            if let Some(items) = source.and_then(Value::as_object) {
+                for (key, value) in items.iter().take(200) {
+                    let valid_key = !key.is_empty() && key.len() <= 80 && key.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
+                    if !valid_key { continue; }
+                    if let Some(amount) = value.as_u64().filter(|n| *n <= 9_000_000_000_000) { safe.insert(key.clone(), json!(amount)); }
+                }
+            }
+            Value::Object(safe)
+        };
+        let settlement_items = sanitize_items(details.get("items"));
+        let totals_items = sanitize_items(details.get("totals_items"));
+        let route = details.get("dungeon_route").and_then(Value::as_str).unwrap_or("");
+        let route = if (route.starts_with("/dungeons/") || route.starts_with("/start/")) && route.len() <= 200 && !route.contains('?') && !route.contains('#') { route } else { "" };
+        let dungeon_id = safe_id(details.get("dungeon_id"), 40);
+        let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control()));
+        // Only use a name explicitly supplied by the current game page.
+        // No ID-to-name guesses: unknown quests are displayed by run ID.
+        let dungeon_name = supplied_name.or_else(|| match dungeon_id.as_deref() {
+            Some("100501") => Some("Gold Valley Lv. 2"),
+            Some("100502") => Some("Gold Valley Lv. 3"),
+            _ => None,
+        });
+        let batch_id = safe_id(details.get("batch_id"), 100).unwrap_or_default();
+        let authoritative_run_type = if path == "/api/battles/repeat" {
+            if batch_id.is_empty() { "repeat" } else { "repeat_batch" }
+        } else { "single" };
+        let mut record = json!({
+            "schema_version": 1,
+            "record_type": "battle_reward",
+            "timestamp_unix_ms": unix_timestamp_ms(),
+            "path": path,
+            "dungeon_route": route,
+            "dungeon_started_at_unix_ms": details.get("dungeon_started_at_unix_ms").and_then(Value::as_u64).filter(|v| *v > 0),
+            "dungeon_start_source": details.get("dungeon_start_source").and_then(Value::as_str).filter(|v| ["begin_quest_click", "repeat_action_click", "api_fallback"].contains(v)),
+            "dungeon_id": dungeon_id.clone(),
+            "dungeon_name": dungeon_name,
+            "batch_id": if batch_id.is_empty() { Value::Null } else { json!(batch_id) },
+            "run_type": authoritative_run_type,
+            "settlement": settlement_safe,
+            "totals": totals_safe,
+            "settlement_finished": settlement.get("finished").and_then(Value::as_bool).unwrap_or(false),
+            "totals_finished": totals.get("finished").and_then(Value::as_bool).unwrap_or(false),
+            "quest_finished": details.get("quest_finished").and_then(Value::as_bool).unwrap_or(path == "/api/battles/finish"),
+            "items": settlement_items,
+            "totals_items": totals_items
+        });
+        // Canonical run accounting is shared by persistence, deduplication and logs.
+        // /finish is exactly one completed run. /repeat reports a cumulative batch
+        // snapshot; prefer explicit settled_runs, then runs/wins in settlement/totals.
+        let batch_id = record.get("batch_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let finish_path = path == "/api/battles/finish";
+        let read_count = |object: &Value| -> Option<u64> {
+            ["settled_runs", "runs", "wins"].iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_u64).filter(|n| *n > 0 && *n <= 1_000_000))
+        };
+        let run_count = if finish_path {
+            1
+        } else {
+            read_count(&settlement)
+                .or_else(|| read_count(&totals))
+                .unwrap_or(0)
+        };
+        if run_count == 0 {
+            self.log("Tracker reward ignored: repeat response did not contain a valid cumulative run count.");
+            return Ok(());
+        }
+        record["run_count"] = json!(run_count);
+        record["run_count_source"] = json!(if finish_path { "single_completion" } else { "repeat_cumulative" });
+
+        // Repeat snapshots are deduplicated by batch ID + cumulative run count.
+        // Later snapshots with a higher count are retained as updates. Single-run
+        // completions are deduplicated by dungeon route + entry timestamp.
+        let finish_start = record.get("dungeon_started_at_unix_ms").and_then(Value::as_u64).unwrap_or(0);
+        let finish_route = record.get("dungeon_route").and_then(Value::as_str).unwrap_or("");
+        let dedupe_key = if !batch_id.is_empty() && !finish_path {
+            Some(format!("{batch_id}:{run_count}"))
+        } else if finish_path && finish_start > 0 && !finish_route.is_empty() {
+            Some(format!("finish:{finish_route}:{finish_start}"))
+        } else { None };
+        if let Some(key) = dedupe_key.as_deref() {
+            if self.tracker_sessions_file.exists() {
+                let file = fs::File::open(&self.tracker_sessions_file).map_err(|error| format!("Could not inspect tracker history: {error}"))?;
+                for line in std::io::BufReader::new(file).lines() {
+                    let line = line.map_err(|error| format!("Could not read tracker history: {error}"))?;
+                    if let Ok(existing) = serde_json::from_str::<Value>(&line) {
+                        if existing.get("dedupe_key").and_then(Value::as_str) == Some(key) {
+                            self.log(&format!("Tracker duplicate ignored (key {key})."));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        let mut record = record;
+        if let Some(key) = dedupe_key { record["dedupe_key"] = json!(key); }
+        match append_performance_record(&self.tracker_sessions_file, &record) {
+            Ok(()) => {
+                self.log(&format!("Tracker reward saved (dungeon {}, path {}, batch {}, runs {}).", dungeon_id.as_deref().unwrap_or("unknown"), path, batch_id, run_count));
+                Ok(())
+            }
+            Err(error) => {
+                self.log(&format!("Tracker reward save failed: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    fn tracker_read_data(&self) -> Result<Vec<Value>, String> {
+        let _history_guard = self.tracker_data_lock.lock()
+            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        if !self.tracker_sessions_file.exists() { return Ok(Vec::new()); }
+        let file = fs::File::open(&self.tracker_sessions_file)
+            .map_err(|error| format!("Could not open tracker data file: {error}"))?;
+        let mut records = Vec::new();
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|error| format!("Could not read tracker data line {}: {error}", index + 1))?;
+            if line.trim().is_empty() { continue; }
+            let record = serde_json::from_str::<Value>(&line)
+                .map_err(|error| format!("Tracker data is invalid at line {}: {error}", index + 1))?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn tracker_clear_history(&self) -> Result<(), String> {
+        let _history_guard = self.tracker_data_lock.lock()
+            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+
+        // Replace the active JSONL file atomically so a failed clear cannot leave
+        // a partially truncated history file. The rotation backup is not read by
+        // Run History, but remove it as part of the user's explicit clear action.
+        write_file_atomically(&self.tracker_sessions_file, b"")?;
+        let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
+        match fs::remove_file(&backup_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Run History was cleared, but its old backup could not be removed: {error}")),
+        }
+        self.log("Run History cleared by the user.");
+        Ok(())
+    }
+}
+
+// A compact local timestamp without another dependency.
+fn chrono_like_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("unix:{secs}")
+}
+
+fn unix_timestamp_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn activity_name(mode: u8) -> &'static str {
+    match mode {
+        MODE_RECORDING => "recording",
+        MODE_PLAYING => "playback",
+        _ => "idle",
+    }
+}
+
+// Keep the diagnostics file bounded. The previous file is retained as a small
+// rollover backup in case a user needs to compare two adjacent periods.
+fn append_performance_record(path: &Path, record: &Value) -> Result<(), String> {
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if fs::metadata(path).map(|metadata| metadata.len() >= MAX_LOG_BYTES).unwrap_or(false) {
+        let previous = path.with_extension("jsonl.1");
+        let _ = fs::remove_file(&previous);
+        fs::rename(path, previous).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut file, record).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct ProcessMetrics {
+    working_set_bytes: Option<u64>,
+    private_bytes: Option<u64>,
+    cpu_percent: Option<f64>,
+    system_memory_load_percent: Option<u32>,
+    system_total_memory_bytes: Option<u64>,
+    system_available_memory_bytes: Option<u64>,
+    process_details: Vec<Value>,
+}
+
+#[cfg(windows)]
+fn collect_process_metrics(
+    previous_cpu: &mut Option<(u64, Instant)>,
+) -> ProcessMetrics {
+    use std::{ffi::c_void, mem::size_of};
+
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[repr(C)]
+    struct FileTime { low: u32, high: u32 }
+    impl FileTime {
+        fn ticks(&self) -> u64 { ((self.high as u64) << 32) | self.low as u64 }
+    }
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        base_priority: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(process: *mut c_void, creation: *mut FileTime, exit: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+    }
+    #[link(name = "psapi")]
+    extern "system" {
+        fn GetProcessMemoryInfo(process: *mut c_void, counters: *mut ProcessMemoryCountersEx, size: u32) -> i32;
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    let mut result = ProcessMetrics::default();
+    let root_pid = unsafe { GetCurrentProcessId() };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let mut process_ids = vec![root_pid];
+    let mut process_names = std::collections::HashMap::<u32, String>::new();
+    if !snapshot.is_null() && snapshot as isize != INVALID_HANDLE_VALUE {
+        let mut entries = Vec::<(u32, u32)>::new();
+        let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+        entry.size = size_of::<ProcessEntry32W>() as u32;
+        if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+            loop {
+                let end = entry.exe_file.iter().position(|unit| *unit == 0).unwrap_or(entry.exe_file.len());
+                let name = String::from_utf16_lossy(&entry.exe_file[..end]);
+                process_names.insert(entry.process_id, name.chars().take(80).collect());
+                entries.push((entry.process_id, entry.parent_process_id));
+                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 { break; }
+            }
+        }
+        unsafe { CloseHandle(snapshot); }
+        // Include WebView2 renderer/GPU/utility descendants launched beneath this app.
+        loop {
+            let before = process_ids.len();
+            for (pid, parent) in &entries {
+                if process_ids.contains(parent) && !process_ids.contains(pid) {
+                    process_ids.push(*pid);
+                }
+            }
+            if process_ids.len() == before { break; }
+        }
+    }
+
+    let mut working_set = 0_u64;
+    let mut private_bytes = 0_u64;
+    let mut cpu_ticks = 0_u64;
+    let mut found_memory = false;
+    let mut found_cpu = false;
+    let mut process_details = Vec::new();
+    for pid in process_ids {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if handle.is_null() { continue; }
+        let mut memory: ProcessMemoryCountersEx = unsafe { std::mem::zeroed() };
+        memory.cb = size_of::<ProcessMemoryCountersEx>() as u32;
+        let memory_size = memory.cb;
+        let mut process_working_set = None;
+        let mut process_private = None;
+        if unsafe { GetProcessMemoryInfo(handle, &mut memory, memory_size) } != 0 {
+            working_set = working_set.saturating_add(memory.working_set_size as u64);
+            private_bytes = private_bytes.saturating_add(memory.private_usage as u64);
+            process_working_set = Some(memory.working_set_size as u64);
+            process_private = Some(memory.private_usage as u64);
+            found_memory = true;
+        }
+        let mut creation: FileTime = unsafe { std::mem::zeroed() };
+        let mut exit: FileTime = unsafe { std::mem::zeroed() };
+        let mut kernel: FileTime = unsafe { std::mem::zeroed() };
+        let mut user: FileTime = unsafe { std::mem::zeroed() };
+        let mut process_cpu_ticks = None;
+        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } != 0 {
+            let ticks = kernel.ticks().saturating_add(user.ticks());
+            cpu_ticks = cpu_ticks.saturating_add(ticks);
+            process_cpu_ticks = Some(ticks);
+            found_cpu = true;
+        }
+        unsafe { CloseHandle(handle); }
+        process_details.push(json!({
+            "pid": pid,
+            "image_name": process_names.get(&pid).cloned().unwrap_or_else(|| "unknown".to_string()),
+            "working_set_mb": process_working_set.map(|v| v as f64 / 1_048_576.0),
+            "private_mb": process_private.map(|v| v as f64 / 1_048_576.0),
+            "cpu_time_ms": process_cpu_ticks.map(|v| v as f64 / 10_000.0)
+        }));
+    }
+    if found_memory {
+        result.working_set_bytes = Some(working_set);
+        result.private_bytes = Some(private_bytes);
+    }
+    result.process_details = process_details;
+    if found_cpu {
+        let now = Instant::now();
+        if let Some((old_ticks, old_time)) = previous_cpu.take() {
+            let elapsed = now.duration_since(old_time).as_secs_f64();
+            let delta = cpu_ticks.saturating_sub(old_ticks) as f64 / 10_000_000.0;
+            let logical_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+            if elapsed > 0.0 {
+                result.cpu_percent = Some((delta / elapsed / logical_cpus * 100.0).clamp(0.0, 100.0));
+            }
+        }
+        *previous_cpu = Some((cpu_ticks, now));
+    }
+
+    let mut system = MemoryStatusEx {
+        length: size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut system) } != 0 {
+        result.system_memory_load_percent = Some(system.memory_load);
+        result.system_total_memory_bytes = Some(system.total_phys);
+        result.system_available_memory_bytes = Some(system.avail_phys);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn collect_process_metrics(_previous_cpu: &mut Option<(u64, Instant)>) -> Value {
+    json!({ "available": false, "reason": "Windows process metrics are only implemented on Windows." })
+}
+
+struct TrayMenuState {
+    record: Arc<IconMenuItem<Wry>>,
+    play: Arc<IconMenuItem<Wry>>,
+    loop_item: Arc<IconMenuItem<Wry>>,
+    pin: Arc<IconMenuItem<Wry>>,
+}
+
+#[derive(Deserialize)]
+struct CdpTarget {
+    #[serde(rename = "type")]
+    target_type: String,
+    url: Option<String>,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    websocket_url: Option<String>,
+}
+
+#[cfg(windows)]
+fn feedback_sound(error: bool) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBeep(kind: u32) -> i32;
+    }
+    const MB_ICONASTERISK: u32 = 0x00000040;
+    const MB_ICONHAND: u32 = 0x00000010;
+    unsafe {
+        let _ = MessageBeep(if error { MB_ICONHAND } else { MB_ICONASTERISK });
+    }
+}
+
+#[cfg(not(windows))]
+fn feedback_sound(_error: bool) {}
+
+fn notify(app: &AppHandle<Wry>, title: &str, body: &str, error: bool) {
+    feedback_sound(error);
+    let result = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+    if let Err(notification_error) = result {
+        if let Some(state) = app.try_state::<MacroState>() {
+            state.log(&format!("Notification failed: {notification_error}; intended message: {title} — {body}"));
+        }
+    }
+    if let Some(state) = app.try_state::<MacroState>() {
+        state.log(&format!("{} — {}", title, body));
+    }
+}
+
+fn refresh_tray_menu(app: &AppHandle<Wry>) {
+    let Some(menu) = app.try_state::<TrayMenuState>() else {
+        return;
+    };
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
+    let mode = state.mode.load(Ordering::SeqCst);
+    let has_macro = state
+        .clicks
+        .lock()
+        .map(|clicks| !clicks.is_empty())
+        .unwrap_or(false);
+
+    let _ = menu.record.set_text(if mode == MODE_RECORDING {
+        "Stop Recording"
+    } else {
+        "Start Recording"
+    });
+    // Recording controls remain clickable regardless of game-window focus or bridge timing.
+    // start_recording reports a clear readiness error if the remote bridge is not connected.
+    let _ = menu.record.set_enabled(mode != MODE_PLAYING);
+
+    let _ = menu.play.set_text(if mode == MODE_PLAYING {
+        "Stop Playback"
+    } else {
+        "Play Macro"
+    });
+    let _ = menu.play.set_enabled(mode != MODE_RECORDING && (mode == MODE_PLAYING || has_macro));
+
+    let loop_text = if state.loop_enabled.load(Ordering::SeqCst) {
+        "Loop Continuously: On"
+    } else {
+        "Loop Continuously: Off"
+    };
+    let _ = menu.loop_item.set_text(loop_text);
+    let pinned = app
+        .try_state::<SettingsState>()
+        .and_then(|settings| settings.settings.lock().ok().map(|value| value.pinned))
+        .unwrap_or(false);
+    let _ = menu.pin.set_text(if pinned { "Unpin Window" } else { "Pin Window" });
+}
+
+#[tauri::command]
+fn recording_bridge_ready(app: AppHandle<Wry>, state: State<'_, MacroState>) {
+    state.bridge_ready.store(true, Ordering::SeqCst);
+    state.log("Game-page recording bridge connected.");
+    refresh_tray_menu(&app);
+}
+
+#[tauri::command]
+fn tracker_diagnostic_event(event: String, details: Value, state: State<'_, MacroState>) -> Result<(), String> {
+    state.tracker_diagnostic_event(&event, details)
+}
+
+#[tauri::command]
+fn tracker_dungeon_context(details: Value, state: State<'_, MacroState>) -> Result<(), String> {
+    state.tracker_dungeon_context(details)
+}
+
+#[tauri::command]
+fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<(), String> {
+    state.tracker_reward_event(details)
+}
+
+#[tauri::command]
+fn tracker_read_data(state: State<'_, MacroState>) -> Result<Vec<Value>, String> {
+    state.tracker_read_data()
+}
+
+#[tauri::command]
+fn tracker_clear_history(state: State<'_, MacroState>) -> Result<(), String> {
+    state.tracker_clear_history()
+}
+
+#[tauri::command]
+fn tracker_get_pinned(settings: State<'_, SettingsState>) -> Result<bool, String> {
+    settings.settings.lock().map(|value| value.tracker_pinned)
+        .map_err(|_| "Settings are unavailable".to_string())
+}
+
+#[tauri::command]
+fn tracker_set_pinned(pinned: bool, app: AppHandle<Wry>, settings: State<'_, SettingsState>) -> Result<(), String> {
+    let window = app.get_webview_window("tracker")
+        .ok_or_else(|| "Run History window is not open".to_string())?;
+    window.set_always_on_top(pinned)
+        .map_err(|error| format!("Could not change tracker pin state: {error}"))?;
+    {
+        let mut value = settings.settings.lock().map_err(|_| "Settings are unavailable".to_string())?;
+        value.tracker_pinned = pinned;
+    }
+    settings.save()
+}
+
+#[tauri::command]
+fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), String> {
+    if state.mode.load(Ordering::SeqCst) != MODE_RECORDING {
+        return Ok(());
+    }
+    if !x.is_finite() || !y.is_finite() {
+        return Err("The game page sent invalid click coordinates".to_string());
+    }
+    let elapsed_ms = state
+        .record_started
+        .lock()
+        .map_err(|_| "Recording timer is unavailable".to_string())?
+        .as_ref()
+        .map(|instant| instant.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let mut clicks = state
+        .clicks
+        .lock()
+        .map_err(|_| "Macro data is unavailable".to_string())?;
+    // Recheck after acquiring the data lock. This prevents a late IPC call from
+    // appending a click after stop_recording has taken its save snapshot.
+    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
+        clicks.push(MacroClick {
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+            elapsed_ms,
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_, MacroState>) {
+    if state.mode.swap(MODE_IDLE, Ordering::SeqCst) == MODE_RECORDING {
+        let recording_duration_ms = state.record_started.lock().ok().and_then(|mut started| {
+            started.take().map(|instant| instant.elapsed().as_millis())
+        });
+        state.performance_event("recording_error", json!({ "message": &message, "recording_duration_ms": recording_duration_ms }));
+        state.log(&format!("Click capture IPC error: {message}"));
+        refresh_tray_menu(&app);
+        let recovery = match state.save_macro() {
+            Ok(0) => "No clicks had been captured; the previous saved macro was preserved.".to_string(),
+            Ok(count) => format!("Recovered and saved the {count} clicks captured before the error."),
+            Err(error) => format!("Could not save the captured clicks: {error}"),
+        };
+        notify(
+            &app,
+            "BFR Macro — Recording error",
+            &format!("Recording stopped because communication with the game failed: {message}\n{recovery}"),
+            true,
+        );
+    }
+}
+
+fn stop_recording(app: &AppHandle<Wry>) {
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
+    if state
+        .mode
+        .compare_exchange(MODE_RECORDING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let recording_duration_ms = state.record_started.lock().ok().and_then(|mut started| {
+        started.take().map(|instant| instant.elapsed().as_millis())
+    });
+    let click_count = state.clicks.lock().map(|clicks| clicks.len()).unwrap_or(0);
+    state.performance_event("recording_stopped", json!({
+        "click_count": click_count,
+        "recording_duration_ms": recording_duration_ms
+    }));
+    refresh_tray_menu(app);
+    match state.save_macro() {
+        Ok(0) => notify(
+            app,
+            "BFR Macro — Recording stopped",
+            "No clicks were captured, so the previous saved macro was left unchanged.",
+            false,
+        ),
+        Ok(count) => notify(
+            app,
+            "BFR Macro — Recording saved",
+            &format!("Recording stopped. Automatically saved {count} clicks."),
+            false,
+        ),
+        Err(error) => notify(app, "BFR Macro — Save failed", &error, true),
+    }
+}
+
+fn start_recording(app: &AppHandle<Wry>) {
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
+    match state.mode.load(Ordering::SeqCst) {
+        MODE_RECORDING => {
+            stop_recording(app);
+            return;
+        }
+        MODE_PLAYING => stop_playback(app),
+        _ => {}
+    }
+    if !state.bridge_ready.load(Ordering::SeqCst) {
+        notify(
+            app,
+            "BFR Macro — Game not ready",
+            "The game click-capture bridge is not connected yet. Wait for the game page to finish loading, then try again.",
+            true,
+        );
+        return;
+    }
+    if let Ok(mut clicks) = state.clicks.lock() {
+        clicks.clear();
+    }
+    if let Ok(mut started) = state.record_started.lock() {
+        *started = Some(Instant::now());
+    }
+    state.mode.store(MODE_RECORDING, Ordering::SeqCst);
+    state.performance_event("recording_started", json!({}));
+    refresh_tray_menu(app);
+    notify(
+        app,
+        "BFR Macro — Recording started",
+        "Recording physical left-clicks inside the game. Select Stop Recording to automatically save.",
+        false,
+    );
+}
+
+fn stop_playback(app: &AppHandle<Wry>) {
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
+    if state
+        .mode
+        .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        state.performance_event("playback_stopped", json!({}));
+        refresh_tray_menu(app);
+        notify(app, "BFR Macro — Playback stopped", "Macro playback has stopped.", false);
+    }
+}
+
+fn wait_while_playing(state: &MacroState, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if state.mode.load(Ordering::SeqCst) != MODE_PLAYING {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return state.mode.load(Ordering::SeqCst) == MODE_PLAYING;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn is_game_page_url(value: &str) -> bool {
+    Url::parse(value)
+        .map(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("rebornbf.com")
+                && url.port_or_known_default() == Some(443)
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+        .unwrap_or(false)
+}
+
+fn validate_cdp_websocket_url(value: &str, expected_port: u16) -> Result<(), String> {
+    let url = Url::parse(value).map_err(|error| format!("Invalid local DevTools WebSocket URL: {error}"))?;
+    let valid = url.scheme() == "ws"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(expected_port)
+        && url.path().starts_with("/devtools/page/")
+        && url.username().is_empty()
+        && url.password().is_none();
+    if valid {
+        Ok(())
+    } else {
+        Err("The DevTools endpoint did not match the expected local WebView2 address".to_string())
+    }
+}
+
+fn discover_cdp_target(port: u16) -> Result<String, String> {
+    let endpoint = format!("http://127.0.0.1:{port}/json/list");
+    let started = Instant::now();
+    let mut last_error = String::from("WebView2 debugging endpoint is not ready yet");
+    while started.elapsed() < CDP_DISCOVERY_TIMEOUT {
+        match ureq::get(&endpoint).call() {
+            Ok(response) => match response.into_string() {
+                Ok(body) => match serde_json::from_str::<Vec<CdpTarget>>(&body) {
+                    Ok(targets) => {
+                        if let Some(target) = targets.into_iter().find(|target| {
+                            target.target_type == "page"
+                                && target.url.as_deref().map(is_game_page_url).unwrap_or(false)
+                        }) {
+                            if let Some(url) = target.websocket_url {
+                                validate_cdp_websocket_url(&url, port)?;
+                                return Ok(url);
+                            }
+                        }
+                    }
+                    Err(error) => last_error = error.to_string(),
+                },
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!("Could not find the Brave Frontier WebView2 page for DevTools playback: {last_error}"))
+}
+
+fn cdp_call<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let id = *next_id;
+    *next_id += 1;
+    let request = json!({ "id": id, "method": method, "params": params });
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .map_err(|error| format!("DevTools send failed: {error}"))?;
+    loop {
+        let message = socket
+            .read()
+            .map_err(|error| format!("DevTools connection failed: {error}"))?;
+        match message {
+            Message::Text(text) => {
+                let response: Value = serde_json::from_str(text.as_ref())
+                    .map_err(|error| format!("Invalid DevTools response: {error}"))?;
+                if response.get("id").and_then(Value::as_u64) == Some(id) {
+                    if let Some(error) = response.get("error") {
+                        return Err(format!("DevTools rejected {method}: {error}"));
+                    }
+                    return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+                }
+            }
+            Message::Close(_) => return Err("WebView2 closed the DevTools connection".to_string()),
+            Message::Ping(data) => {
+                socket.send(Message::Pong(data)).map_err(|error| error.to_string())?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn viewport_size<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    next_id: &mut u64,
+) -> Result<(f64, f64), String> {
+    let result = cdp_call(
+        socket,
+        next_id,
+        "Runtime.evaluate",
+        json!({
+            "expression": "({ width: window.innerWidth, height: window.innerHeight })",
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+    )?;
+    let value = result
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .ok_or_else(|| "Could not read the game viewport dimensions".to_string())?;
+    let width = value.get("width").and_then(Value::as_f64).unwrap_or(0.0);
+    let height = value.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+    if width < 1.0 || height < 1.0 {
+        return Err("The game viewport reported invalid dimensions".to_string());
+    }
+    Ok((width, height))
+}
+
+fn dispatch_click<S: Read + Write>(
+    socket: &mut WebSocket<S>,
+    next_id: &mut u64,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    cdp_call(
+        socket,
+        next_id,
+        "Input.dispatchMouseEvent",
+        json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0, "pointerType": "mouse" }),
+    )?;
+    cdp_call(
+        socket,
+        next_id,
+        "Input.dispatchMouseEvent",
+        json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1, "pointerType": "mouse" }),
+    )?;
+    cdp_call(
+        socket,
+        next_id,
+        "Input.dispatchMouseEvent",
+        json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1, "pointerType": "mouse" }),
+    )?;
+    Ok(())
+}
+
+fn playback_failed(app: &AppHandle<Wry>, message: &str) {
+    if let Some(state) = app.try_state::<MacroState>() {
+        if state
+            .mode
+            .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            state.performance_event("playback_failed", json!({ "message": message }));
+            refresh_tray_menu(app);
+            notify(app, "BFR Macro — Playback failed", message, true);
+        }
+    }
+}
+
+fn start_playback(app: AppHandle<Wry>) {
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
+    if state.mode.load(Ordering::SeqCst) == MODE_PLAYING {
+        stop_playback(&app);
+        return;
+    }
+    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
+        stop_recording(&app);
+    }
+    let clicks = match state.clicks.lock() {
+        Ok(clicks) => clicks.clone(),
+        Err(_) => {
+            notify(&app, "BFR Macro — Playback unavailable", "The recorded macro data is unavailable.", true);
+            return;
+        }
+    };
+    if clicks.is_empty() {
+        notify(&app, "BFR Macro — No recording", "There is no saved macro to play. Record some clicks first.", true);
+        return;
+    }
+    if state
+        .mode
+        .compare_exchange(MODE_IDLE, MODE_PLAYING, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let port = state.cdp_port;
+    state.performance_event("playback_started", json!({ "click_count": clicks.len(), "loop_enabled": state.loop_enabled.load(Ordering::SeqCst) }));
+    refresh_tray_menu(&app);
+    notify(&app, "BFR Macro — Connecting", "Connecting to the game input channel…", false);
+
+    thread::spawn(move || {
+        let websocket_url = match discover_cdp_target(port) {
+            Ok(url) => url,
+            Err(error) => {
+                playback_failed(&app, &error);
+                return;
+            }
+        };
+        let (mut socket, _) = match connect(websocket_url.as_str()) {
+            Ok(connection) => connection,
+            Err(error) => {
+                playback_failed(&app, &format!("Could not connect to WebView2 input: {error}"));
+                return;
+            }
+        };
+        let mut next_id = 1_u64;
+        if let Err(error) = viewport_size(&mut socket, &mut next_id) {
+            playback_failed(&app, &error);
+            return;
+        }
+        let Some(state) = app.try_state::<MacroState>() else {
+            return;
+        };
+        if state.mode.load(Ordering::SeqCst) != MODE_PLAYING {
+            return;
+        }
+        notify(
+            &app,
+            "BFR Macro — Playback started",
+            "The macro is running independently of your physical mouse and keyboard.",
+            false,
+        );
+
+        let mut completed_normally = true;
+        'playback: loop {
+            let mut previous_ms = 0_u64;
+            for click in &clicks {
+                let Some(state) = app.try_state::<MacroState>() else { return; };
+                if !wait_while_playing(&state, Duration::from_millis(click.elapsed_ms.saturating_sub(previous_ms))) {
+                    completed_normally = false;
+                    break 'playback;
+                }
+                let (width, height) = match viewport_size(&mut socket, &mut next_id) {
+                    Ok(size) => size,
+                    Err(error) => {
+                        playback_failed(&app, &error);
+                        return;
+                    }
+                };
+                let x = (click.x * width).clamp(0.0, width - 1.0);
+                let y = (click.y * height).clamp(0.0, height - 1.0);
+                if let Err(error) = dispatch_click(&mut socket, &mut next_id, x, y) {
+                    playback_failed(&app, &error);
+                    return;
+                }
+                previous_ms = click.elapsed_ms;
+            }
+
+            let Some(state) = app.try_state::<MacroState>() else { return; };
+            if state.mode.load(Ordering::SeqCst) != MODE_PLAYING
+                || !state.loop_enabled.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            if !wait_while_playing(&state, LOOP_GAP) {
+                completed_normally = false;
+                break;
+            }
+        }
+
+        if completed_normally {
+            if let Some(state) = app.try_state::<MacroState>() {
+                if state
+                    .mode
+                    .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    state.performance_event("playback_finished", json!({ "click_count": clicks.len() }));
+                    refresh_tray_menu(&app);
+                    notify(&app, "BFR Macro — Playback finished", "The macro completed its playback.", false);
+                }
+            }
+        }
+    });
+}
+
+fn set_webview_memory_target(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>, low: bool) {
+    #[cfg(windows)]
+    {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_19,
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        };
+        // `cast()` is provided by the windows-core Interface trait. It must
+        // be imported explicitly for the locked windows-core 0.62.2 API.
+        use windows_core::Interface;
+
+        let target = if low {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+        } else {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+        };
+        let result = Arc::new(Mutex::new(None::<String>));
+        let result_for_webview = result.clone();
+        let invoke_result = window.with_webview(move |webview| {
+            let change_result = (|| -> Result<(), String> {
+                // Tauri exposes the WebView2 controller on PlatformWebview rather
+                // than Wry's WebViewExtWindows trait. Query ICoreWebView2_19
+                // directly so this works with the project's locked Tauri/Wry APIs.
+                let core = unsafe { webview.controller().CoreWebView2() }
+                    .map_err(|error| error.to_string())?;
+                let core19 = core.cast::<ICoreWebView2_19>()
+                    .map_err(|error| format!("WebView2 memory target API is unavailable: {error}"))?;
+                unsafe { core19.SetMemoryUsageTargetLevel(target) }
+                    .map_err(|error| error.to_string())
+            })();
+            if let Err(error) = change_result {
+                if let Ok(mut slot) = result_for_webview.lock() {
+                    *slot = Some(error);
+                }
+            }
+        });
+        let error = invoke_result.err().map(|error| error.to_string()).or_else(|| {
+            result.lock().ok().and_then(|slot| slot.clone())
+        });
+        if let Some(error) = error {
+            if let Some(state) = app.try_state::<MacroState>() {
+                state.log(&format!("WebView2 memory target change to {} was unavailable: {error}", if low { "Low" } else { "Normal" }));
+                state.performance_event("webview_memory_target_failed", json!({ "target": if low { "low" } else { "normal" }, "error": error }));
+            }
+        } else if let Some(state) = app.try_state::<MacroState>() {
+            state.performance_event("webview_memory_target_changed", json!({ "target": if low { "low" } else { "normal" } }));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (app, window, low);
+}
+
+fn show_game(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>) {
+    set_webview_memory_target(app, window, false);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+fn find_free_local_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn icon_item(
+    app: &AppHandle<Wry>,
+    id: &str,
+    label: &str,
+    png: &'static [u8],
+) -> tauri::Result<IconMenuItem<Wry>> {
+    let icon = Image::from_bytes(png)?;
+    IconMenuItem::with_id(app, id, label, true, Some(icon), None::<&str>)
+}
+
+fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Copy rather than move so the original 0.5.1 data remains as a rollback copy.
+    fs::copy(legacy, destination)?;
+    Ok(())
+}
+
+fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result<()> {
+    if !legacy.exists() { return Ok(()); }
+    if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+    if !destination.exists() {
+        fs::copy(legacy, destination)?;
+    } else {
+        let existing = fs::read_to_string(destination)?;
+        let mut output = fs::OpenOptions::new().append(true).open(destination)?;
+        for line in fs::read_to_string(legacy)?.lines() {
+            if !line.trim().is_empty() && !existing.lines().any(|saved| saved == line) {
+                writeln!(output, "{line}")?;
+            }
+        }
+        output.flush()?;
+    }
+    fs::remove_file(legacy)?;
+    if let Some(parent) = legacy.parent() { let _ = fs::remove_dir(parent); }
+    Ok(())
+}
+
+// Preserve the one-time Run History cleanup marker introduced in dev.3. Its exact
+// path is intentionally retained across releases so upgrading from dev.3 never
+// clears history a second time. The marker lives outside Logs and survives log cleanup.
+fn reset_run_history_once(app_data_dir: &Path, history_file: &Path) -> Result<bool, String> {
+    let marker_file = app_data_dir
+        .join("Settings")
+        .join("run-history-reset-v1.5.1-dev.3.done");
+    if marker_file.exists() {
+        return Ok(false);
+    }
+
+    write_file_atomically(history_file, b"")?;
+
+    // The dashboard reads only the active file. Remove its one-generation
+    // rotation backup too, so the old history is not left behind on disk.
+    let backup_file = history_file.with_extension("jsonl.1");
+    match fs::remove_file(&backup_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Run History was cleared, but its old backup could not be removed: {error}")),
+    }
+
+    write_file_atomically(&marker_file, b"Completed once for the legacy Run History cleanup safeguard.\n")?;
+    Ok(true)
+}
+
+fn open_data_folder(app: &AppHandle<Wry>, folder: PathBuf, label: &str) {
+    if let Err(error) = fs::create_dir_all(&folder) {
+        notify(app, "BFR Macro — Folder unavailable", &format!("Could not create the {label} folder: {error}"), true);
+        return;
+    }
+    match Command::new("explorer.exe").arg(&folder).spawn() {
+        Ok(_) => {}
+        Err(error) => notify(app, "BFR Macro — Could not open folder", &format!("Could not open the {label} folder: {error}"), true),
+    }
+}
+
+fn open_tracker_window(app: &AppHandle<Wry>) {
+    if let Some(existing) = app.get_webview_window("tracker") {
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return;
+    }
+    let (width, height, pinned) = app.try_state::<SettingsState>()
+        .and_then(|state| state.settings.lock().ok().map(|s| (s.tracker_width, s.tracker_height, s.tracker_pinned)))
+        .unwrap_or((760.0, 820.0, false));
+    match WebviewWindowBuilder::new(app, "tracker", WebviewUrl::App("tracker.html".into()))
+        .title("BFR Macro — Run History")
+        .inner_size(width, height)
+        .min_inner_size(560.0, 600.0)
+        .resizable(true)
+        .always_on_top(pinned)
+        .center()
+        .build()
+    {
+        Ok(window) => {
+            let handle = app.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Resized(size) = event {
+                    if size.width == 0 || size.height == 0 { return; }
+                    let scale = handle.get_webview_window("tracker")
+                        .and_then(|w| w.scale_factor().ok())
+                        .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+                    if let Some(state) = handle.try_state::<SettingsState>() {
+                        if let Ok(mut settings) = state.settings.lock() {
+                            settings.tracker_width = size.width as f64 / scale;
+                            settings.tracker_height = size.height as f64 / scale;
+                        }
+                        if let Err(error) = state.save() {
+                            if let Some(macro_state) = handle.try_state::<MacroState>() {
+                                macro_state.log(&format!("Could not save tracker window size: {error}"));
+                            }
+                        }
+                    }
+                }
+            });
+        },
+        Err(error) => notify(app, "BFR Run History — Could not open", &error.to_string(), true),
+    }
+}
+
+fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
+    let open = icon_item(app, "open", "Open Game", include_bytes!("../icons/menu/monitor.png"))?;
+    let tracker = icon_item(app, "open_tracker", "Run History", include_bytes!("../icons/menu/history.png"))?;
+    let minimize = icon_item(app, "minimize", "Minimize to Tray", include_bytes!("../icons/menu/minimize.png"))?;
+    let reset = icon_item(app, "reset_size", "Reset Window Size", include_bytes!("../icons/menu/reset.png"))?;
+    let pin = Arc::new(icon_item(app, "toggle_pin", "Pin Window", include_bytes!("../icons/menu/pin.png"))?);
+    let separator = PredefinedMenuItem::separator(app)?;
+    let record = Arc::new(icon_item(app, "record", "Start Recording", include_bytes!("../icons/menu/record.png"))?);
+    let play = Arc::new(icon_item(app, "play", "Play Macro", include_bytes!("../icons/menu/play.png"))?);
+    let loop_item = Arc::new(icon_item(app, "loop", "Loop Continuously: On", include_bytes!("../icons/menu/loop.png"))?);
+    let load = icon_item(app, "load", "Load Last Saved Macro", include_bytes!("../icons/menu/folder.png"))?;
+    let separator2 = PredefinedMenuItem::separator(app)?;
+    let app_folder = icon_item(app, "open_app_folder", "Open Application Folder", include_bytes!("../icons/menu/folder.png"))?;
+    let settings_folder = icon_item(app, "open_settings_folder", "Open Settings Folder", include_bytes!("../icons/menu/folder.png"))?;
+    let macros_folder = icon_item(app, "open_macros_folder", "Open Saved Macros Folder", include_bytes!("../icons/menu/folder.png"))?;
+    let logs_folder = icon_item(app, "open_logs_folder", "Open Logs Folder", include_bytes!("../icons/menu/folder.png"))?;
+    let separator3 = PredefinedMenuItem::separator(app)?;
+    let exit = icon_item(app, "exit", "Exit BFR Macro & Tracking Utility", include_bytes!("../icons/menu/exit.png"))?;
+
+    let items: [&dyn IsMenuItem<Wry>; 17] = [
+        &open,
+        &reset,
+        &minimize,
+        pin.as_ref(),
+        &tracker,
+        &separator,
+        record.as_ref(),
+        play.as_ref(),
+        loop_item.as_ref(),
+        &load,
+        &separator2,
+        &app_folder,
+        &settings_folder,
+        &macros_folder,
+        &logs_folder,
+        &separator3,
+        &exit,
+    ];
+    let menu = Menu::with_items(app, &items)?;
+    app.manage(TrayMenuState {
+        record: record.clone(),
+        play: play.clone(),
+        loop_item: loop_item.clone(),
+        pin: pin.clone(),
+    });
+
+    TrayIconBuilder::with_id("bfr-macro-tray")
+        .icon(app.default_window_icon().cloned().expect("default app icon is configured"))
+        .tooltip("BFR Macro & Tracking Utility")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            let window = app.get_webview_window("game");
+            match event.id().as_ref() {
+                "open" => {
+                    if let Some(window) = window.as_ref() { show_game(app, window); }
+                }
+                "open_tracker" => { open_tracker_window(app); }
+                "minimize" => {
+                    if let Some(window) = window.as_ref() {
+                        set_webview_memory_target(app, window, true);
+                        let _ = window.hide();
+                    }
+                }
+                "reset_size" => {
+                    if let Some(window) = window.as_ref() {
+                        let _ = window.set_size(tauri::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+                        let _ = window.center();
+                    }
+                    if let Some(state) = app.try_state::<SettingsState>() {
+                        if let Ok(mut settings) = state.settings.lock() {
+                            settings.width = WINDOW_WIDTH;
+                            settings.height = WINDOW_HEIGHT;
+                        }
+                        if let Err(error) = state.save() {
+                            if let Some(macro_state) = app.try_state::<MacroState>() {
+                                macro_state.log(&format!("Could not save reset window size: {error}"));
+                            }
+                            notify(app, "BFR Macro — Settings save failed", &format!("Could not save window settings: {error}"), true);
+                        }
+                    }
+                    notify(app, "BFR Macro", "Window size reset.", false);
+                }
+                "toggle_pin" => {
+                    if let Some(window) = window.as_ref() {
+                        if let Some(state) = app.try_state::<SettingsState>() {
+                            let pinned = if let Ok(mut settings) = state.settings.lock() {
+                                settings.pinned = !settings.pinned;
+                                settings.pinned
+                            } else {
+                                false
+                            };
+                            let _ = window.set_always_on_top(pinned);
+                            if let Err(error) = state.save() {
+                                notify(app, "BFR Macro — Settings save failed", &format!("Could not save window pin setting: {error}"), true);
+                            }
+                            refresh_tray_menu(app);
+                            notify(app, "BFR Macro", if pinned { "Window pin enabled." } else { "Window pin disabled." }, false);
+                        }
+                    }
+                }
+                "record" => start_recording(app),
+                "play" => start_playback(app.clone()),
+                "loop" => {
+                    if let Some(state) = app.try_state::<MacroState>() {
+                        let enabled = !state.loop_enabled.load(Ordering::SeqCst);
+                        state.loop_enabled.store(enabled, Ordering::SeqCst);
+                        if let Some(settings) = app.try_state::<SettingsState>() {
+                            if let Ok(mut value) = settings.settings.lock() {
+                                value.loop_enabled = enabled;
+                            }
+                            if let Err(error) = settings.save() {
+                                notify(app, "BFR Macro — Settings save failed", &format!("Could not save loop setting: {error}"), true);
+                            }
+                        }
+                        refresh_tray_menu(app);
+                        notify(app, "BFR Macro", if enabled { "Continuous looping enabled." } else { "Continuous looping disabled." }, false);
+                    }
+                }
+                "load" => {
+                    if let Some(state) = app.try_state::<MacroState>() {
+                        match state.load_macro() {
+                            Ok(count) => {
+                                refresh_tray_menu(app);
+                                notify(app, "BFR Macro", &format!("Loaded the last saved macro ({count} clicks)."), false);
+                            }
+                            Err(error) => notify(app, "BFR Macro — Load failed", &format!("Could not load a saved macro: {error}"), true),
+                        }
+                    }
+                }
+                "open_app_folder" => {
+                    match std::env::current_exe() {
+                        Ok(executable) => {
+                            if let Some(folder) = executable.parent() {
+                                open_data_folder(app, folder.to_path_buf(), "application");
+                            }
+                        }
+                        Err(error) => notify(app, "BFR Macro — Could not locate application", &error.to_string(), true),
+                    }
+                }
+                "open_settings_folder" => {
+                    if let Ok(app_data) = app.path().app_data_dir() {
+                        open_data_folder(app, app_data.join("Settings"), "settings");
+                    }
+                }
+                "open_macros_folder" => {
+                    if let Ok(app_data) = app.path().app_data_dir() {
+                        open_data_folder(app, app_data.join("Macros"), "saved macros");
+                    }
+                }
+                "open_logs_folder" => {
+                    if let Ok(app_data) = app.path().app_data_dir() {
+                        open_data_folder(app, app_data.join("Logs"), "logs");
+                    }
+                }
+                "exit" => {
+                    stop_recording(app);
+                    stop_playback(app);
+                    save_settings_on_exit(app);
+                    app.exit(0);
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("game") {
+                    show_game(&app, &window);
+                }
+            }
+        })
+        .build(app)?;
+
+    refresh_tray_menu(app);
+    Ok(())
+}
+
+fn save_settings_on_exit(app: &AppHandle<Wry>) {
+    if let Some(state) = app.try_state::<MacroState>() {
+        state.performance_event("application_exit_requested", json!({}));
+    }
+    if let Some(settings) = app.try_state::<SettingsState>() {
+        if let Err(error) = settings.save() {
+            if let Some(state) = app.try_state::<MacroState>() {
+                state.log(&format!("Could not save settings during shutdown: {error}"));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn ensure_single_instance() -> Result<bool, String> {
+    use std::{ffi::c_void, sync::OnceLock};
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    static INSTANCE_MUTEX: OnceLock<isize> = OnceLock::new();
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    let name: Vec<u16> = r"Local\BFRMacroUtility.SingleInstance"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle); }
+        return Ok(false);
+    }
+
+    INSTANCE_MUTEX
+        .set(handle as isize)
+        .map_err(|_| "Could not retain the application instance lock".to_string())?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn ensure_single_instance() -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            recording_bridge_ready,
+            tracker_diagnostic_event,
+            tracker_dungeon_context,
+            tracker_reward_event,
+            tracker_read_data,
+            tracker_clear_history,
+            tracker_get_pinned,
+            tracker_set_pinned,
+            record_click,
+            report_recording_error
+        ])
+        .setup(|app| {
+            if !ensure_single_instance().map_err(std::io::Error::other)? {
+                // The existing instance owns the shared macro/settings files.
+                app.handle().exit(0);
+                return Ok(());
+            }
+
+            let app_data = app.path().app_data_dir()?;
+            let settings_dir = app_data.join("Settings");
+            let macros_dir = app_data.join("Macros");
+            let logs_dir = app_data.join("Logs");
+            fs::create_dir_all(&settings_dir)?;
+            fs::create_dir_all(&macros_dir)?;
+            fs::create_dir_all(&logs_dir)?;
+            migrate_tracker_history(&app_data.join("tracker-data").join("battle-rewards.jsonl"), &logs_dir.join("battle-rewards.jsonl"))?;
+
+            // One-time, non-destructive migration from the original 0.5.1 data layout.
+            migrate_legacy_file(&app_data.join("settings.json"), &settings_dir.join("settings.json"))?;
+            migrate_legacy_file(&app_data.join("recording.bfrmacro"), &macros_dir.join("recording.bfrmacro"))?;
+            migrate_legacy_file(&app_data.join("bfr-macro.log"), &logs_dir.join("bfr-macro.log"))?;
+
+            let settings_file = settings_dir.join("settings.json");
+            let mut settings = fs::read(&settings_file)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
+                .unwrap_or_default();
+            if !settings.width.is_finite() || settings.width < 600.0 {
+                settings.width = WINDOW_WIDTH;
+            }
+            if !settings.height.is_finite() || settings.height < 750.0 {
+                settings.height = WINDOW_HEIGHT;
+            }
+            if !settings.tracker_width.is_finite() || settings.tracker_width < 560.0 { settings.tracker_width = 760.0; }
+            if !settings.tracker_height.is_finite() || settings.tracker_height < 600.0 { settings.tracker_height = 820.0; }
+
+            let profile_dir = app_data.join("webview2-profile");
+            fs::create_dir_all(&profile_dir)?;
+            let macro_file = macros_dir.join("recording.bfrmacro");
+            let log_file = logs_dir.join("bfr-macro.log");
+            let performance_file = logs_dir.join("performance.jsonl");
+            let tracker_diagnostics_file = logs_dir.join("tracker-discovery.jsonl");
+            let tracker_sessions_file = logs_dir.join("battle-rewards.jsonl");
+            let run_history_reset = reset_run_history_once(&app_data, &tracker_sessions_file)
+                .map_err(std::io::Error::other)?;
+            let cdp_port = find_free_local_port().map_err(std::io::Error::other)?;
+            let existing_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+            // The Rust CDP client does not send a browser Origin header, so the
+            // broad --remote-allow-origins=* exception is unnecessary. Keep the
+            // debugging endpoint bound to loopback and validate its returned URL.
+            let debugging_args = format!(
+                "--remote-debugging-address=127.0.0.1 --remote-debugging-port={cdp_port}"
+            );
+            let combined_args = if existing_args.trim().is_empty() {
+                debugging_args
+            } else {
+                format!("{existing_args} {debugging_args}")
+            };
+            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined_args);
+
+            let macro_state = MacroState {
+                file: macro_file,
+                log_file,
+                performance_file: performance_file.clone(),
+                tracker_diagnostics_file,
+                tracker_sessions_file,
+                tracker_data_lock: Mutex::new(()),
+                cdp_port,
+                mode: AtomicU8::new(MODE_IDLE),
+                bridge_ready: AtomicBool::new(false),
+                record_started: Mutex::new(None),
+                clicks: Mutex::new(Vec::new()),
+                loop_enabled: AtomicBool::new(settings.loop_enabled),
+            };
+            if run_history_reset {
+                macro_state.log("The one-time legacy Run History cleanup safeguard ran; settings and saved macros were preserved.");
+            }
+            let _ = macro_state.load_macro();
+            let (resize_save_tx, resize_save_rx) = mpsc::channel::<()>();
+            app.manage(SettingsState {
+                file: settings_file,
+                settings: Mutex::new(settings.clone()),
+                save_lock: Mutex::new(()),
+                resize_save_tx,
+            });
+            app.manage(macro_state);
+
+            // Structured, low-frequency diagnostics. This samples the app and its
+            // WebView2 child-process tree once per minute and records lifecycle events.
+            if let Some(state) = app.try_state::<MacroState>() {
+                state.performance_event("application_started", json!({
+                    "process_id": std::process::id(),
+                    "sample_interval_seconds": 60,
+                    "metrics_scope": "application_and_webview2_child_processes"
+                }));
+            }
+            let metrics_app = app.handle().clone();
+            let metrics_file = performance_file.clone();
+            thread::spawn(move || {
+                let mut previous_cpu: Option<(u64, Instant)> = None;
+                let app_started = Instant::now();
+                loop {
+                    let Some(state) = metrics_app.try_state::<MacroState>() else { break; };
+                    let mode = state.mode.load(Ordering::SeqCst);
+                    let click_count = state.clicks.lock().map(|clicks| clicks.len()).unwrap_or(0);
+                    #[cfg(windows)]
+                    let metrics = {
+                        let sample = collect_process_metrics(&mut previous_cpu);
+                        json!({
+                            "app_webview_working_set_mb": sample.working_set_bytes.map(|v| v as f64 / 1_048_576.0),
+                            "app_webview_private_mb": sample.private_bytes.map(|v| v as f64 / 1_048_576.0),
+                            "app_webview_cpu_percent": sample.cpu_percent,
+                            "system_memory_load_percent": sample.system_memory_load_percent,
+                            "system_total_memory_mb": sample.system_total_memory_bytes.map(|v| v as f64 / 1_048_576.0),
+                            "system_available_memory_mb": sample.system_available_memory_bytes.map(|v| v as f64 / 1_048_576.0),
+                            "process_details": sample.process_details
+                        })
+                    };
+                    #[cfg(not(windows))]
+                    let metrics = collect_process_metrics(&mut previous_cpu);
+                    let record = json!({
+                        "schema_version": 1,
+                        "record_type": "sample",
+                        "timestamp_unix_ms": unix_timestamp_ms(),
+                        "process_id": std::process::id(),
+                        "app_uptime_seconds": app_started.elapsed().as_secs(),
+                        "activity": activity_name(mode),
+                        "loaded_or_recorded_macro_click_count": click_count,
+                        "metrics": metrics
+                    });
+                    if let Err(error) = append_performance_record(&metrics_file, &record) {
+                        state.log(&format!("Performance sample could not be written: {error}"));
+                    }
+                    thread::sleep(Duration::from_secs(60));
+                }
+            });
+
+            // Coalesce the many resize events generated while dragging the window.
+            // Only the final size is written after a short quiet period.
+            let resize_save_app = app.handle().clone();
+            thread::spawn(move || {
+                while resize_save_rx.recv().is_ok() {
+                    loop {
+                        match resize_save_rx.recv_timeout(Duration::from_millis(400)) {
+                            Ok(()) => continue,
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    let Some(settings) = resize_save_app.try_state::<SettingsState>() else {
+                        break;
+                    };
+                    if let Err(error) = settings.save() {
+                        if let Some(state) = resize_save_app.try_state::<MacroState>() {
+                            state.log(&format!("Could not save resized window dimensions: {error}"));
+                        }
+                    }
+                }
+            });
+
+            let game_url = GAME_URL.parse().expect("GAME_URL must be a valid URL");
+            let window = WebviewWindowBuilder::new(app, "game", WebviewUrl::External(game_url))
+                .title("BFR Macro & Tracking Utility")
+                .inner_size(settings.width, settings.height)
+                .min_inner_size(600.0, 750.0)
+                .resizable(true)
+                .center()
+                .always_on_top(settings.pinned)
+                .data_directory(profile_dir)
+                .initialization_script(INJECTION_SCRIPT)
+                .build()?;
+
+            set_webview_memory_target(app.handle(), &window, false);
+            build_tray(app.handle())?;
+            notify(app.handle(), "BFR Macro", "BFR Macro is ready. Wait for the game to finish loading before starting a recording.", false);
+
+            let app_handle = app.handle().clone();
+            window.on_window_event(move |event| match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    stop_recording(&app_handle);
+                    stop_playback(&app_handle);
+                    save_settings_on_exit(&app_handle);
+                    app_handle.exit(0);
+                }
+                tauri::WindowEvent::Resized(size) => {
+                    if let Some(window) = app_handle.get_webview_window("game") {
+                        if window.is_minimized().unwrap_or(false) {
+                            set_webview_memory_target(&app_handle, &window, true);
+                            let _ = window.hide();
+                            return;
+                        }
+                    }
+                    if size.width > 0 && size.height > 0 {
+                        if let Some(state) = app_handle.try_state::<SettingsState>() {
+                            // Tauri resize events provide physical pixels, while
+                            // WebviewWindowBuilder::inner_size expects logical pixels.
+                            // Persisting logical dimensions prevents scaling drift on
+                            // Windows displays configured above or below 100% DPI.
+                            let scale_factor = app_handle
+                                .get_webview_window("game")
+                                .and_then(|window| window.scale_factor().ok())
+                                .filter(|factor| factor.is_finite() && *factor > 0.0)
+                                .unwrap_or(1.0);
+                            if let Ok(mut settings) = state.settings.lock() {
+                                settings.width = size.width as f64 / scale_factor;
+                                settings.height = size.height as f64 / scale_factor;
+                            }
+                            // The background worker saves once resizing has been
+                            // quiet for 400 ms, avoiding repeated disk writes.
+                            if state.resize_save_tx.send(()).is_err() {
+                                if let Some(macro_state) = app_handle.try_state::<MacroState>() {
+                                    macro_state.log("Could not queue the resized window settings for saving.");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            });
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running BFR Macro & Tracking Utility");
+}

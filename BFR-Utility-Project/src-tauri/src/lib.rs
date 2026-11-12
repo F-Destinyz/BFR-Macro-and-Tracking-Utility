@@ -1901,12 +1901,9 @@ fn read_jsonl_records(
         .map_err(|error| format!("Could not open tracker data file: {error}"))?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
-    loop {
-        let Some(line_is_within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
-            .map_err(|error| format!("Could not read tracker data: {error}"))?
-        else {
-            break;
-        };
+    while let Some(line_is_within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
+        .map_err(|error| format!("Could not read tracker data: {error}"))?
+    {
         if !line_is_within_limit {
             *malformed_lines += 1;
             continue;

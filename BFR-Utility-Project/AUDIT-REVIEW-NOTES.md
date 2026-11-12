@@ -28,9 +28,10 @@ Scope: follow-up review of the supplied v2.0.1 audit source. This patch is inten
 - Settings persistence is blocked if a failed settings migration leaves the source uncertain.
 - Fundamental app-data directory creation and primary WebView startup errors remain fatal because the application cannot safely operate without those resources.
 
-### PRB-04 — BFRMACRO2 test coverage
-- Added a synthetic BFRMACRO2 JSON fixture test for the currently supported schema.
-- This is not an authentic file produced by an older release and therefore does not prove historical compatibility. A real BFRMACRO2 file is still needed for that.
+### PRB-04 — BFRMACRO2 historical compatibility
+- **DROPPED / OUT OF SCOPE by product decision.** The user does not intend to use very old BFRMACRO2-style macro files, so obtaining authentic historical fixtures and proving compatibility is no longer a release requirement.
+- The synthetic fixture is not evidence of historical compatibility and should not be treated as such.
+- Existing loader acceptance of BFRMACRO2 has been left unchanged in this audit patch to avoid an unnecessary breaking change. No promise of historical BFRMACRO2 compatibility is made.
 
 ## Preservation checks
 

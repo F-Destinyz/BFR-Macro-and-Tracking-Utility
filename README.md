@@ -144,7 +144,7 @@ The application deliberately retains its existing Tauri identifier so per-user s
 
 ### Build and verify
 
-Open PowerShell in the `BFR-2.0.0` project directory and run:
+Open PowerShell in the `BFR-Project` project directory and run:
 
 ```powershell
 npm ci
@@ -212,7 +212,7 @@ The maintainer directs the project, reviews and integrates changes, runs the bui
 
 ## Changelog
 
-See the project [CHANGELOG](BFR-2.0.0/CHANGELOG.md) for version history and detailed changes.
+See the project [CHANGELOG](BFR-Project/CHANGELOG.md) for version history and detailed changes.
 
 For downloads and release notes, see [GitHub Releases](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases).
 

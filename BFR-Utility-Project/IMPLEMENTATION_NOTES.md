@@ -31,10 +31,10 @@ This source update applies the confirmed and actionable findings from the indepe
 
 - Tauri identifier remains `com.bfrmacro.tauri.dev`.
 - Existing `Settings`, `Macros`, `Logs`, and `webview2-profile` locations remain unchanged.
-- BFRMACRO2 and BFRMACRO3 formats remain supported.
+- The existing loader acceptance for older macro files is unchanged, but historical BFRMACRO2 compatibility is not guaranteed and is not a release requirement. Do not remove existing loader acceptance as part of this release.
 - The Run History JSONL schema and dashboard columns remain compatible.
 - No automatic settings, macro, or history deletion was introduced.
-- Version remains 2.0.0 pending a deliberate release/version decision.
+- Release metadata is versioned deliberately for v2.0.2 across package.json, package-lock.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock, and src-tauri/tauri.conf.json.
 
 ## Validation performed in this environment
 
@@ -52,6 +52,19 @@ This source update applies the confirmed and actionable findings from the indepe
 5. Confirm explicit Clear History clears active, backup, and migration recovery copies, and that a restart does not re-import them.
 6. Test repeat batches with multiple chunks and confirm the displayed run count and rewards are cumulative.
 7. Start playback, stop during connection, and immediately start again; confirm only one worker sends clicks.
-8. Test a normal macro, continuous looping, an empty recording, and loading an older BFRMACRO2 file.
+8. Test a normal macro, continuous looping, an empty recording, and loading a current supported macro file. Historical BFRMACRO2 compatibility is out of release scope.
 9. Open and resize Run History while monitoring WebView2 process count and memory.
 10. Run `.\BUILD_WINDOWS_RELEASE.ps1` on Windows and confirm the NSIS installer is produced.
+
+## v2.0.2 follow-up validation
+
+The user reported successful Windows validation of the post-audit changes:
+
+- Node release-contract tests: 30 passed.
+- Rust unit tests: 14 passed, 0 failed.
+- cargo fmt --check: passed.
+- cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings: passed.
+- BUILD_WINDOWS_RELEASE.ps1 completed and produced the v2.0.1 NSIS installer before the release-version bump.
+- Manual testing passed for recording, saving, playback, macro-load protection while recording, main/tracker coexistence, tracker close/reopen, application restart, and preservation of settings, macros, Run History, and WebView2 profile/session data.
+
+Because the application version is now being advanced to v2.0.2, rebuild the installer after this metadata update and perform a final install/launch smoke test before publishing the release. These are user-reported results; they have not been independently reproduced by this documentation update.

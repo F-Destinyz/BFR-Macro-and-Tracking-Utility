@@ -21,13 +21,13 @@ function scriptBodies(html) {
   return [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
 }
 
-test('all release version metadata is synchronized at 2.0.1', () => {
-  assert.equal(packageJson.version, '2.0.1');
-  assert.equal(packageLock.version, '2.0.1');
-  assert.equal(packageLock.packages[''].version, '2.0.1');
-  assert.equal(tauriConfig.version, '2.0.1');
-  assert.match(cargoToml, /^version = "2\.0\.1"$/m);
-  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\nversion = "2\.0\.1"/);
+test('all release version metadata is synchronized at 2.0.2', () => {
+  assert.equal(packageJson.version, '2.0.2');
+  assert.equal(packageLock.version, '2.0.2');
+  assert.equal(packageLock.packages[''].version, '2.0.2');
+  assert.equal(tauriConfig.version, '2.0.2');
+  assert.match(cargoToml, /^version = "2\.0\.2"$/m);
+  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\nversion = "2\.0\.2"/);
 });
 
 test('Windows process target and product identity are descriptive', () => {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     io::{BufRead, Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -818,29 +818,31 @@ impl SettingsState {
 
 #[derive(Debug)]
 struct TrackerDiagnosticRateLimit {
-    window_started: Instant,
-    accepted: u32,
+    accepted_at: VecDeque<Instant>,
 }
 
 impl Default for TrackerDiagnosticRateLimit {
     fn default() -> Self {
         Self {
-            window_started: Instant::now(),
-            accepted: 0,
+            accepted_at: VecDeque::new(),
         }
     }
 }
 
 impl TrackerDiagnosticRateLimit {
     fn allow(&mut self) -> bool {
-        if self.window_started.elapsed() >= TRACKER_DIAGNOSTIC_WINDOW {
-            self.window_started = Instant::now();
-            self.accepted = 0;
+        let now = Instant::now();
+        while self
+            .accepted_at
+            .front()
+            .map_or(false, |accepted| now.duration_since(*accepted) >= TRACKER_DIAGNOSTIC_WINDOW)
+        {
+            self.accepted_at.pop_front();
         }
-        if self.accepted >= MAX_TRACKER_DIAGNOSTICS_PER_WINDOW {
+        if self.accepted_at.len() >= MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize {
             return false;
         }
-        self.accepted += 1;
+        self.accepted_at.push_back(now);
         true
     }
 }
@@ -3846,9 +3848,13 @@ mod tests {
             assert!(limiter.allow());
         }
         assert!(!limiter.allow());
-        limiter.window_started = Instant::now() - Duration::from_secs(61);
+        limiter.accepted_at = std::iter::repeat_n(
+            Instant::now() - Duration::from_secs(61),
+            MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize,
+        )
+        .collect();
         assert!(limiter.allow());
-        assert_eq!(limiter.accepted, 1);
+        assert_eq!(limiter.accepted_at.len(), 1);
     }
 
     #[test]

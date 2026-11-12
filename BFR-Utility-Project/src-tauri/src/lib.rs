@@ -898,7 +898,7 @@ fn begin_playback_if_idle(
 // This makes a partial staging failure reversible and prevents legacy migration
 // from silently bringing old records back after an incomplete clear operation.
 fn quarantine_history_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    quarantine_history_files_with(paths, fs::rename)
+    quarantine_history_files_with(paths, |source, destination| fs::rename(source, destination))
 }
 
 fn quarantine_history_files_with<F>(

@@ -4146,6 +4146,20 @@ mod tests {
     }
 
     #[test]
+    fn atomic_save_failure_preserves_existing_destination_and_cleans_temporary_file() {
+        let dir = temp_dir("atomic-save-failure");
+        let destination = dir.join("settings.json");
+        fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("keep.txt");
+        fs::write(&sentinel, b"original data").unwrap();
+
+        assert!(write_file_atomically(&destination, b"replacement").is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"original data");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn legacy_reset_marker_never_erases_existing_history_or_backup() {
         let dir = temp_dir("history-reset");
         let history = dir.join("Logs/battle-rewards.jsonl");

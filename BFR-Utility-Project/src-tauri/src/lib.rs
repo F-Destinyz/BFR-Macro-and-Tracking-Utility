@@ -152,14 +152,28 @@ const INJECTION_SCRIPT: &str = r#"
         window.__bfrMacroCaptureInstalled = true;
         window.__bfrMacroCaptureConnecting = false;
         // Serialize IPC calls so rapid physical clicks cannot be stored out of order.
+        // Bound queued work so a stalled WebView2 bridge cannot grow memory indefinitely.
         let captureQueue = Promise.resolve();
+        let captureQueueDepth = 0;
+        const MAX_CAPTURE_QUEUE_DEPTH = 512;
         let captureFailed = false;
         document.addEventListener('pointerdown', (event) => {
           if (!event.isTrusted || event.button !== 0 || captureFailed) return;
+          if (captureQueueDepth >= MAX_CAPTURE_QUEUE_DEPTH) {
+            captureFailed = true;
+            console.error('[BFR Macro] Click capture queue exceeded its safety limit.');
+            invoke('report_recording_error', {
+              message: 'Click capture queue exceeded its safety limit; recording was stopped to protect application memory.'
+            }).catch((reportError) => {
+              console.error('[BFR Macro] Could not report recording queue overflow:', reportError);
+            });
+            return;
+          }
           const width = Math.max(1, window.innerWidth);
           const height = Math.max(1, window.innerHeight);
           const x = Math.min(1, Math.max(0, event.clientX / width));
           const y = Math.min(1, Math.max(0, event.clientY / height));
+          captureQueueDepth += 1;
           captureQueue = captureQueue.then(() => {
             if (captureFailed) return;
             return invoke('record_click', { x, y });
@@ -170,6 +184,8 @@ const INJECTION_SCRIPT: &str = r#"
             return invoke('report_recording_error', { message: String(error) }).catch((reportError) => {
               console.error('[BFR Macro] Could not report recording error:', reportError);
             });
+          }).finally(() => {
+            captureQueueDepth = Math.max(0, captureQueueDepth - 1);
           });
         }, true);
         console.info('[BFR Macro] Physical click capture bridge connected.');

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.2 — Post-audit reliability and preservation fixes
+
+- Prevent late recording-error notifications from changing an active playback state.
+- Serialize macro recording, loading, playback, and stop/save transitions; keep the application in a non-startable Saving state until the recording snapshot has been saved.
+- Preserve JSONL history record boundaries when appending after an incomplete final line, including during tracker-history migration.
+- Protect existing settings when the file cannot be read or parsed; block writes while the original settings data is uncertain.
+- Report reward persistence only when the backend confirms that a record was actually appended.
+- Log non-fatal legacy settings, macro, and application-log migration failures while retaining original legacy files.
+- Add regression coverage for recording lifecycle, torn JSONL lines, settings preservation, and reward-persistence diagnostics.
+- Record successful user-run Windows validation of the release checks, installer build, macro workflows, tracker windows, and retained application/WebView2 data.
 ## 2.0.1 — Reliability and data-preservation fixes
 
 - Remove the startup history wipe; first launch now marks the legacy safeguard without deleting active history or its rotation backup, and marker-write failures no longer prevent startup.

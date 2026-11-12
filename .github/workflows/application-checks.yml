@@ -1,4 +1,5 @@
 name: Application checks
+# Run the complete Windows validation suite for the release candidate.
 
 on:
   pull_request:

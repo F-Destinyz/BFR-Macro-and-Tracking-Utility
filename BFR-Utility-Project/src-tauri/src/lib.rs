@@ -1807,23 +1807,21 @@ impl MacroState {
         }
     }
 
-    fn tracker_read_data(&self) -> Result<Vec<Value>, String> {
+    fn tracker_read_data_page(&self, offset: usize, anchor_total: usize, requested_limit: usize) -> Result<TrackerHistoryPage, String> {
         let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
             "Tracker history is unavailable because its lock was poisoned".to_string()
         })?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
-        let mut records = Vec::new();
-        let mut malformed_lines = 0usize;
-        read_jsonl_records(&backup_file, &mut records, &mut malformed_lines)?;
-        read_jsonl_records(
-            &self.tracker_sessions_file,
-            &mut records,
-            &mut malformed_lines,
+        let (page, malformed_lines) = read_jsonl_page(
+            &[backup_file.as_path(), self.tracker_sessions_file.as_path()],
+            offset,
+            anchor_total,
+            requested_limit,
         )?;
         if malformed_lines > 0 {
             self.log(&format!("Run History skipped {malformed_lines} malformed or oversized JSONL record(s); valid records remain available."));
         }
-        Ok(records)
+        Ok(page)
     }
 
     fn tracker_clear_history(&self) -> Result<(), String> {
@@ -1994,37 +1992,87 @@ fn read_bounded_jsonl_line<R: BufRead>(
     }
 }
 
-fn read_jsonl_records(
-    path: &Path,
-    records: &mut Vec<Value>,
-    malformed_lines: &mut usize,
-) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
+const MAX_HISTORY_PAGE_SIZE: usize = 200;
+
+#[derive(Serialize)]
+struct TrackerHistoryPage {
+    records: Vec<Value>,
+    total_records: usize,
+    next_offset: usize,
+    has_more: bool,
+}
+
+fn scan_jsonl_records<F>(path: &Path, mut visit: F) -> Result<usize, String>
+where
+    F: FnMut(Value),
+{
+    if !path.exists() { return Ok(0); }
     let file = fs::File::open(path)
         .map_err(|error| format!("Could not open tracker data file: {error}"))?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
+    let mut malformed_lines = 0usize;
     while let Some(line_is_within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
         .map_err(|error| format!("Could not read tracker data: {error}"))?
     {
-        if !line_is_within_limit {
-            *malformed_lines += 1;
-            continue;
-        }
-        while line.last().is_some_and(|last| *last == b'\r') {
-            line.pop();
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
+        if !line_is_within_limit { malformed_lines += 1; continue; }
+        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
+        if line.iter().all(u8::is_ascii_whitespace) { continue; }
         match serde_json::from_slice::<Value>(&line) {
-            Ok(record) => records.push(record),
-            Err(_) => *malformed_lines += 1,
+            Ok(record) => visit(record),
+            Err(_) => malformed_lines += 1,
         }
     }
+    Ok(malformed_lines)
+}
+
+fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
+    *malformed_lines += scan_jsonl_records(path, |record| records.push(record))?;
     Ok(())
+}
+
+fn read_jsonl_page(
+    paths: &[&Path],
+    offset: usize,
+    anchor_total: usize,
+    requested_limit: usize,
+) -> Result<(TrackerHistoryPage, usize), String> {
+    let limit = requested_limit.clamp(1, MAX_HISTORY_PAGE_SIZE);
+    let mut total_records = 0usize;
+    let mut malformed_lines = 0usize;
+    for path in paths {
+        malformed_lines += scan_jsonl_records(path, |_| {
+            total_records = total_records.saturating_add(1);
+        })?;
+    }
+
+    // Anchor offsets to the record count from the previous page. New appends
+    // shift the physical tail, so account for them without skipping older rows.
+    let newly_appended = if anchor_total == 0 { 0 } else { total_records.saturating_sub(anchor_total) };
+    let effective_offset = offset.saturating_add(newly_appended);
+    let end = total_records.saturating_sub(effective_offset);
+    let start = end.saturating_sub(limit);
+    let mut records = Vec::with_capacity(end.saturating_sub(start));
+    let mut record_index = 0usize;
+    for path in paths {
+        let _ = scan_jsonl_records(path, |record| {
+            if record_index >= start && record_index < end {
+                records.push(record);
+            }
+            record_index = record_index.saturating_add(1);
+        })?;
+    }
+
+    let next_offset = effective_offset.saturating_add(records.len());
+    Ok((
+        TrackerHistoryPage {
+            records,
+            total_records,
+            next_offset,
+            has_more: start > 0,
+        },
+        malformed_lines,
+    ))
 }
 
 fn load_history_dedupe_keys(backup: &Path, active: &Path) -> Result<HashSet<String>, String> {
@@ -2443,8 +2491,8 @@ fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<
 }
 
 #[tauri::command(async)]
-fn tracker_read_data(state: State<'_, MacroState>) -> Result<Vec<Value>, String> {
-    state.tracker_read_data()
+fn tracker_read_data_page(offset: usize, anchor_total: usize, limit: usize, state: State<'_, MacroState>) -> Result<TrackerHistoryPage, String> {
+    state.tracker_read_data_page(offset, anchor_total, limit)
 }
 
 #[tauri::command(async)]
@@ -3802,7 +3850,7 @@ pub fn run() {
             tracker_diagnostic_event,
             tracker_dungeon_context,
             tracker_reward_event,
-            tracker_read_data,
+            tracker_read_data_page,
             tracker_clear_history,
             tracker_get_pinned,
             tracker_set_pinned,
@@ -4349,6 +4397,40 @@ mod tests {
         assert_eq!(fs::read(&first).unwrap(), b"first history");
         assert_eq!(fs::read(&second).unwrap(), b"second history");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_pages_are_bounded_ordered_and_stable_when_new_records_arrive() {
+        let dir = temp_dir("history-pages");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let active = dir.join("battle-rewards.jsonl");
+        fs::write(&backup, b"{\"n\":1}\n{bad-json}\n{\"n\":2}\n").unwrap();
+        fs::write(&active, b"{\"n\":3}\n{\"n\":4}\n{\"n\":5}\n").unwrap();
+        let paths = [backup.as_path(), active.as_path()];
+
+        let (first, malformed) = read_jsonl_page(&paths, 0, 0, 2).unwrap();
+        assert_eq!(malformed, 1);
+        assert_eq!(first.total_records, 5);
+        assert_eq!(first.records.iter().map(|r| r["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(first.next_offset, 2);
+        assert!(first.has_more);
+
+        // A new completion arrives after the first page. The anchored cursor
+        // must still return the two previously older records without a gap.
+        append_history_record(&active, &json!({"n": 6})).unwrap();
+        let (second, _) = read_jsonl_page(&paths, first.next_offset, first.total_records, 2).unwrap();
+        assert_eq!(second.records.iter().map(|r| r["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(second.next_offset, 5);
+        assert!(second.has_more);
+
+        let (third, _) = read_jsonl_page(&paths, second.next_offset, second.total_records, 2).unwrap();
+        assert_eq!(third.records.iter().map(|r| r["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![1]);
+        assert!(!third.has_more);
+
+        // Requests cannot force an unbounded response.
+        let (bounded, _) = read_jsonl_page(&paths, 0, 0, usize::MAX).unwrap();
+        assert!(bounded.records.len() <= MAX_HISTORY_PAGE_SIZE);
         fs::remove_dir_all(dir).unwrap();
     }
 

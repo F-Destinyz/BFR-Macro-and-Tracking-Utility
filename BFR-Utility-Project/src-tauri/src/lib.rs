@@ -3848,11 +3848,9 @@ mod tests {
             assert!(limiter.allow());
         }
         assert!(!limiter.allow());
-        limiter.accepted_at = std::iter::repeat_n(
-            Instant::now() - Duration::from_secs(61),
-            MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize,
-        )
-        .collect();
+        limiter.accepted_at = std::iter::repeat(Instant::now() - Duration::from_secs(61))
+            .take(MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize)
+            .collect();
         assert!(limiter.allow());
         assert_eq!(limiter.accepted_at.len(), 1);
     }

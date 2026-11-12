@@ -20,7 +20,7 @@ Scope: follow-up review of the supplied v2.0.1 audit source. This patch is inten
 
 ### BUG-05 — reward persistence diagnostics
 - The Rust reward command now returns `true` only after a record is appended and `false` for ignored or duplicate events.
-- The frontend emits `reward_persisted` only when the command returns `true`.
+- The frontend emits `reward_persisted` only when the Rust command confirms that a record was appended.
 
 ### BUG-06 — legacy migration failures
 - Settings, macro, and application-log migration errors are now logged instead of aborting startup.
@@ -37,22 +37,35 @@ Scope: follow-up review of the supplied v2.0.1 audit source. This patch is inten
 
 The patch does not change the Tauri identifier, app-data paths, WebView2 profile path, macro file format, playback timing, click coordinates, reward calculations, Run History schema, history retention, or tray item order. No cleanup, reset, or deletion is introduced.
 
-## Tests and limitations
+## Tests and build verification
 
-- Node release-contract suite: 30 tests expected after the four new contract checks; run result recorded in the accompanying delivery message.
-- Rust tests and Clippy were not executable in the patch-generation environment because `cargo`, `rustc`, and `rustfmt` are not installed. They must be run on the user's Windows development machine before committing.
-- The Node suite used `dist/index.html` and `dist/tracker.html` from the previously supplied v2.0.1 audit archive because the new source archive intentionally omitted `dist`. No generated `dist` files are included in this patch.
-- PRB-05 requires manual Windows/WebView2 testing. See the checklist below.
+The following checks were run successfully on the user's Windows development machine:
 
-## PRB-05 — Windows manual verification checklist
+- Node release-contract suite: **30 passed**.
+- Rust test suite: **14 passed, 0 failed**.
+- `cargo fmt --check`: passed.
+- `cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`: passed.
+- `BUILD_WINDOWS_RELEASE.ps1`: completed successfully and produced the NSIS installer:
+  `src-tauri\\target\\release\\bundle\\nsis\\BFR Macro & Tracking Utility_2.0.1_x64-setup.exe` (approximately 3.33 MiB).
 
-1. Launch the app normally; confirm the main game window opens without a WebView2 profile error.
-2. Open Run History; confirm the tracker window opens while the main window remains usable.
-3. Navigate in both windows and confirm each retains its expected page/session state.
-4. Close only the tracker window, reopen it, and verify its session/local storage remains available.
-5. Close and restart the application; verify the existing game login/session and tracker state are still available.
-6. Confirm the app continues using the existing `%APPDATA%` application data location and `webview2-profile` directory. Do not delete, rename, or reset that directory during the test.
-7. Check diagnostics for WebView2 profile lock, environment, or initialization errors.
-8. Repeat with the tracker opened before navigating the main window, then reverse the order.
+The Node suite used `dist/index.html` and `dist/tracker.html` from the previously supplied v2.0.1 audit archive because the new source archive intentionally omitted `dist`. No generated `dist` files are included in this patch.
 
-Record the exact result and any error text. Do not treat successful creation of both windows alone as proof that all shared profile data is preserved.
+## PRB-05 — Windows/WebView2 profile sharing
+
+**MANUALLY VERIFIED ON WINDOWS — user-reported pass.**
+
+The user confirmed that the manual application testing passed, including:
+- Main application and Run History tracker windows operating together.
+- Closing and reopening the tracker window.
+- Restarting the application.
+- Existing application data and WebView2 profile/session state remaining available.
+
+This is a user-reported manual verification, not an independent reproduction by the audit author. No profile directory was reset or deleted as part of the test.
+
+## Remaining audit scope
+
+The changes above do not claim that every item in the original Claude audit has been fixed. BUG-01, BUG-03, and BUG-07 were handled separately or reviewed and rejected as described in the development history. PRB-04 was explicitly dropped by product decision. PRB-05 passed the user's manual Windows verification. Other potential issues and test gaps from the original audit remain outside this patch unless separately documented and addressed.
+
+## Review note
+
+The `src-tauri/src/lib.rs` diff is large in part because of Rust formatting changes. Review the semantic changes separately from formatting churn before merging. The audit branch must remain separate from `main` until the pull request has been reviewed and explicitly approved.

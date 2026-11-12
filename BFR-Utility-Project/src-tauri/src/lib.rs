@@ -4207,7 +4207,7 @@ mod tests {
         let history = dir.join("battle-rewards.jsonl");
         let mut line = br#"{"record_type":"battle_reward","n":7}"#.to_vec();
         line.resize(MAX_JSONL_LINE_BYTES, b' ');
-        line.push(b'\\n');
+        line.push(b'\n');
         fs::write(&history, line).unwrap();
 
         let mut records = Vec::new();

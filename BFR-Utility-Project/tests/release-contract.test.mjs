@@ -140,12 +140,10 @@ test('Run History normalizes single completions and repeat snapshots without dou
 });
 
 test('Run History duration display rejects API fallback timestamps', () => {
-  const durationSource = trackerHtml.match(/const durationText=.*?\n/);
-  const elapsedStart = trackerHtml.indexOf('function elapsedTimeText(');
-  const elapsedEnd = trackerHtml.indexOf('function render(', elapsedStart);
-  assert.ok(durationSource && elapsedStart >= 0 && elapsedEnd > elapsedStart);
-  const elapsedSource = trackerHtml.slice(elapsedStart, elapsedEnd);
-  const elapsedTimeText = vm.runInNewContext(`${durationSource[0]}${elapsedSource}\nelapsedTimeText;`);
+  const durationSource = trackerHtml.match(/const durationText=ms=>\\{[^\\n]*\\};/);
+  const elapsedSource = trackerHtml.match(/function elapsedTimeText\\(record\\)\\{[^\\n]*\\}/);
+  assert.ok(durationSource && elapsedSource, 'Run History duration functions were not found');
+  const elapsedTimeText = vm.runInNewContext(`${durationSource[0]}\n${elapsedSource[0]}\nelapsedTimeText;`);
   assert.equal(elapsedTimeText({ dungeon_started_at_unix_ms: 1000, timestamp_unix_ms: 19208 }), '18s');
   assert.equal(elapsedTimeText({ dungeon_start_source: 'api_fallback', dungeon_started_at_unix_ms: 1000, timestamp_unix_ms: 19208 }), '—');
   assert.equal(elapsedTimeText({ dungeon_started_at_unix_ms: 0, timestamp_unix_ms: 19208 }), '—');
@@ -334,7 +332,7 @@ test('macro click IPC queue is bounded and stops capture when the bridge stalls'
 
   const click = { isTrusted: true, button: 0, clientX: 250, clientY: 400 };
   pointerHandler(click);
-  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
   for (let index = 1; index < 512; index += 1) pointerHandler(click);
   pointerHandler(click);
 

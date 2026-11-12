@@ -34,7 +34,7 @@ try {
     Write-Host 'Running Rust Clippy...' -ForegroundColor Cyan
     Invoke-Cargo @('clippy', '--locked', '--manifest-path', 'src-tauri\Cargo.toml', '--all-targets', '--', '-D', 'warnings') 'Rust Clippy reported warnings or errors.'
 
-    Write-Host 'Building the BFR Macro & Tracking Utility 2.0.0 Windows installer...' -ForegroundColor Cyan
+    Write-Host 'Building the BFR Macro & Tracking Utility 2.0.1 Windows installer...' -ForegroundColor Cyan
     Invoke-Npm @('run', 'build:windows') 'The Tauri Windows build failed. Review the compiler output above.'
 
     $installerDirectory = Join-Path $PSScriptRoot 'src-tauri\target\release\bundle\nsis'
@@ -44,7 +44,7 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'BFR Macro & Tracking Utility 2.0.0 installer(s):' -ForegroundColor Green
+    Write-Host 'BFR Macro & Tracking Utility 2.0.1 installer(s):' -ForegroundColor Green
     $installers | ForEach-Object { Write-Host $_.FullName }
     Write-Host ''
     Write-Host 'The stable application identifier is retained so the existing per-user data remains available.' -ForegroundColor Yellow

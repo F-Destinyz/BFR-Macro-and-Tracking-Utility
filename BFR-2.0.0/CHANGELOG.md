@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — Reliability and data-preservation fixes
+## 2.0.1 — Reliability and data-preservation fixes
 
 - Remove the startup history wipe; first launch now marks the legacy safeguard without deleting active history or its rotation backup, and marker-write failures no longer prevent startup.
 - Stop automatic rotation of user-facing battle history, read legacy `.jsonl.1` backups, isolate dungeon-context diagnostics in `tracker-context.jsonl`, and skip malformed history lines while retaining valid records.

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, Read, Write},
+    io::{BufRead, Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
@@ -1401,6 +1401,26 @@ fn activity_name(mode: u8) -> &'static str {
 
 // Serialize each JSONL record into one buffer before appending. Diagnostics may
 // rotate; user-facing Run History must never rotate away records automatically.
+// Ensure a new JSONL record starts on its own line without changing any
+// existing bytes. A malformed/incomplete final record remains available for
+// diagnosis; the separator only prevents it from swallowing the next record.
+fn ensure_jsonl_line_boundary(file: &mut fs::File) -> std::io::Result<()> {
+    let length = file.seek(SeekFrom::End(0))?;
+    if length == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte)?;
+    file.seek(SeekFrom::End(0))?;
+
+    if last_byte[0] != b'\n' {
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 fn append_jsonl_record(path: &Path, record: &Value, rotate: bool) -> Result<(), String> {
     const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
     if let Some(parent) = path.parent() {
@@ -1415,9 +1435,11 @@ fn append_jsonl_record(path: &Path, record: &Value, rotate: bool) -> Result<(), 
     bytes.push(b'\n');
     let mut file = fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|error| error.to_string())?;
+    ensure_jsonl_line_boundary(&mut file).map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())
 }
 
@@ -2412,11 +2434,22 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
         if !line.is_empty() { existing_lines.insert(line); }
     }
     let legacy_file = fs::File::open(legacy)?;
-    let mut output = fs::OpenOptions::new().create(true).append(true).open(destination)?;
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(destination)?;
+    let mut appended_any = false;
     for line in std::io::BufReader::new(legacy_file).split(b'\n') {
         let mut line = line?;
         while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
         if line.is_empty() || !existing_lines.insert(line.clone()) { continue; }
+        if !appended_any {
+            // Separate imported records from a pre-existing torn final line,
+            // preserving that line's bytes rather than concatenating records.
+            ensure_jsonl_line_boundary(&mut output)?;
+            appended_any = true;
+        }
         output.write_all(&line)?;
         output.write_all(b"\n")?;
     }
@@ -3126,6 +3159,60 @@ mod tests {
         assert!(fs::read_to_string(&backup).unwrap().contains("\"n\":1"));
         assert!(fs::metadata(&history).unwrap().len() > 5 * 1024 * 1024);
         assert_eq!(fs::read_to_string(&history).unwrap().lines().count(), 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn appending_after_torn_history_preserves_bytes_and_separates_new_record() {
+        let dir = temp_dir("history-torn-append");
+        let history = dir.join("battle-rewards.jsonl");
+        let torn = b"{\"record_type\":\"incomplete\"";
+        fs::write(&history, torn).unwrap();
+        let record = json!({"record_type": "battle_reward", "run_id": "new-record"});
+
+        append_history_record(&history, &record).unwrap();
+
+        let mut expected = torn.to_vec();
+        expected.push(b'\n');
+        expected.extend(serde_json::to_vec(&record).unwrap());
+        expected.push(b'\n');
+        assert_eq!(fs::read(&history).unwrap(), expected);
+
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&history, &mut records, &mut malformed).unwrap();
+        assert_eq!(malformed, 1);
+        assert_eq!(records, vec![record]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tracker_migration_separates_imports_from_torn_destination_line() {
+        let dir = temp_dir("history-migration-torn-destination");
+        let legacy = dir.join("legacy.jsonl");
+        let destination = dir.join("Logs/battle-rewards.jsonl");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let torn = b"{\"record_type\":\"incomplete\"";
+        let imported = json!({"record_type": "battle_reward", "run_id": "legacy-import"});
+        fs::write(&destination, torn).unwrap();
+        let mut legacy_bytes = serde_json::to_vec(&imported).unwrap();
+        legacy_bytes.push(b'\n');
+        fs::write(&legacy, legacy_bytes).unwrap();
+
+        migrate_tracker_history(&legacy, &destination).unwrap();
+
+        let mut expected = torn.to_vec();
+        expected.push(b'\n');
+        expected.extend(serde_json::to_vec(&imported).unwrap());
+        expected.push(b'\n');
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&destination, &mut records, &mut malformed).unwrap();
+        assert_eq!(malformed, 1);
+        assert_eq!(records, vec![imported]);
+        assert!(legacy.with_extension("jsonl.migrated").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

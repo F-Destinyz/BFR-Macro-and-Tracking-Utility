@@ -2016,7 +2016,7 @@ where
         .map_err(|error| format!("Could not read tracker data: {error}"))?
     {
         if !line_is_within_limit { malformed_lines += 1; continue; }
-        while line.last().is_some_and(|last| *last == b'\\r') { line.pop(); }
+        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
         if line.iter().all(u8::is_ascii_whitespace) { continue; }
         match serde_json::from_slice::<Value>(&line) {
             Ok(record) => visit(record),
@@ -4404,8 +4404,8 @@ mod tests {
         let dir = temp_dir("history-pages");
         let backup = dir.join("battle-rewards.jsonl.1");
         let active = dir.join("battle-rewards.jsonl");
-        fs::write(&backup, b"{\"n\":1}\\n{bad-json}\\n{\"n\":2}\\n").unwrap();
-        fs::write(&active, b"{\"n\":3}\\n{\"n\":4}\\n{\"n\":5}\\n").unwrap();
+        fs::write(&backup, b"{\"n\":1}\n{bad-json}\n{\"n\":2}\n").unwrap();
+        fs::write(&active, b"{\"n\":3}\n{\"n\":4}\n{\"n\":5}\n").unwrap();
         let paths = [backup.as_path(), active.as_path()];
 
         let (first, malformed) = read_jsonl_page(&paths, 0, 0, 2).unwrap();

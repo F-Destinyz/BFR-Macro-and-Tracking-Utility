@@ -23,11 +23,11 @@ BFR Macro & Tracking Utility is a Windows desktop application for **Brave Fronti
 - [Download and install](#download-and-install)
 - [Using the application](#using-the-application)
 - [Data, privacy, and compatibility](#data-privacy-and-compatibility)
+- [Technology](#technology)
 - [Build from source](#build-from-source)
 - [Testing and release checks](#testing-and-release-checks)
-- [Technology](#technology)
-- [Development assistance and acknowledgement](#development-assistance-and-acknowledgement)
 - [Changelog](#changelog)
+- [Development assistance and acknowledgement](#development-assistance-and-acknowledgement)
 - [Disclaimer](#disclaimer)
 
 ## Highlights

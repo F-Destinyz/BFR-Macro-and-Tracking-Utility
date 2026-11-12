@@ -27,7 +27,7 @@ test('all release version metadata is synchronized at 2.0.2', () => {
   assert.equal(packageLock.packages[''].version, '2.0.2');
   assert.equal(tauriConfig.version, '2.0.2');
   assert.match(cargoToml, /^version = "2\.0\.2"$/m);
-  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\nversion = "2\.0\.2"/);
+  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0\.2"/);
 });
 
 test('Windows process target and product identity are descriptive', () => {
@@ -140,15 +140,14 @@ test('Run History normalizes single completions and repeat snapshots without dou
 });
 
 test('Run History duration display rejects API fallback timestamps', () => {
-  const durationSource = trackerHtml.match(/const durationText=ms=>\\{[\\s\\S]*?\\};/);
-  const elapsedSource = trackerHtml.match(/function elapsedTimeText\\(record\\)\\{[\\s\\S]*?\\}/);
+  const durationSource = trackerHtml.match(/const durationText=ms=>\{[\s\S]*?\};/);
+  const elapsedSource = trackerHtml.match(/function elapsedTimeText\(record\)\{[\s\S]*?\}/);
   assert.ok(durationSource && elapsedSource, 'Run History duration functions were not found');
-  const elapsedTimeText = vm.runInNewContext(`${durationSource[0]}\n${elapsedSource[0]}\nelapsedTimeText;`);
+  const elapsedTimeText = vm.runInNewContext(durationSource[0] + '\n' + elapsedSource[0] + '\nelapsedTimeText;');
   assert.equal(elapsedTimeText({ dungeon_started_at_unix_ms: 1000, timestamp_unix_ms: 19208 }), '18s');
   assert.equal(elapsedTimeText({ dungeon_start_source: 'api_fallback', dungeon_started_at_unix_ms: 1000, timestamp_unix_ms: 19208 }), '—');
   assert.equal(elapsedTimeText({ dungeon_started_at_unix_ms: 0, timestamp_unix_ms: 19208 }), '—');
 });
-
 test('frontend and injected JavaScript parse successfully', () => {
   let parsed = 0;
   for (const [file, html] of [['dist/tracker.html', trackerHtml], ['dist/index.html', read('dist/index.html')]]) {

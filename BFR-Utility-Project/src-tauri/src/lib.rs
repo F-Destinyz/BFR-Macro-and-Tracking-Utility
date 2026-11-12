@@ -1807,23 +1807,37 @@ impl MacroState {
         }
     }
 
-    fn tracker_read_data(&self) -> Result<Vec<Value>, String> {
+    fn tracker_read_data_page(&self, offset: usize, requested_limit: usize) -> Result<TrackerHistoryPage, String> {
         let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
             "Tracker history is unavailable because its lock was poisoned".to_string()
         })?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
-        let mut records = Vec::new();
+        let paths = [&backup_file, &self.tracker_sessions_file];
+        let limit = requested_limit.clamp(1, MAX_HISTORY_PAGE_SIZE);
+        let mut total_records = 0usize;
         let mut malformed_lines = 0usize;
-        read_jsonl_records(&backup_file, &mut records, &mut malformed_lines)?;
-        read_jsonl_records(
-            &self.tracker_sessions_file,
-            &mut records,
-            &mut malformed_lines,
-        )?;
+        for path in paths {
+            malformed_lines += scan_jsonl_records(path, |_| {
+                total_records = total_records.saturating_add(1);
+            })?;
+        }
+        let end = total_records.saturating_sub(offset);
+        let start = end.saturating_sub(limit);
+        let mut records = Vec::with_capacity(end.saturating_sub(start));
+        let mut record_index = 0usize;
+        for path in paths {
+            let _ = scan_jsonl_records(path, |record| {
+                if record_index >= start && record_index < end {
+                    records.push(record);
+                }
+                record_index = record_index.saturating_add(1);
+            })?;
+        }
         if malformed_lines > 0 {
             self.log(&format!("Run History skipped {malformed_lines} malformed or oversized JSONL record(s); valid records remain available."));
         }
-        Ok(records)
+        let next_offset = offset.saturating_add(records.len());
+        Ok(TrackerHistoryPage { records, total_records, next_offset, has_more: start > 0 })
     }
 
     fn tracker_clear_history(&self) -> Result<(), String> {
@@ -1994,36 +2008,42 @@ fn read_bounded_jsonl_line<R: BufRead>(
     }
 }
 
-fn read_jsonl_records(
-    path: &Path,
-    records: &mut Vec<Value>,
-    malformed_lines: &mut usize,
-) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
+const MAX_HISTORY_PAGE_SIZE: usize = 200;
+
+#[derive(Serialize)]
+struct TrackerHistoryPage {
+    records: Vec<Value>,
+    total_records: usize,
+    next_offset: usize,
+    has_more: bool,
+}
+
+fn scan_jsonl_records<F>(path: &Path, mut visit: F) -> Result<usize, String>
+where
+    F: FnMut(Value),
+{
+    if !path.exists() { return Ok(0); }
     let file = fs::File::open(path)
         .map_err(|error| format!("Could not open tracker data file: {error}"))?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
+    let mut malformed_lines = 0usize;
     while let Some(line_is_within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
         .map_err(|error| format!("Could not read tracker data: {error}"))?
     {
-        if !line_is_within_limit {
-            *malformed_lines += 1;
-            continue;
-        }
-        while line.last().is_some_and(|last| *last == b'\r') {
-            line.pop();
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
+        if !line_is_within_limit { malformed_lines += 1; continue; }
+        while line.last().is_some_and(|last| *last == b'\\r') { line.pop(); }
+        if line.iter().all(u8::is_ascii_whitespace) { continue; }
         match serde_json::from_slice::<Value>(&line) {
-            Ok(record) => records.push(record),
-            Err(_) => *malformed_lines += 1,
+            Ok(record) => visit(record),
+            Err(_) => malformed_lines += 1,
         }
     }
+    Ok(malformed_lines)
+}
+
+fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
+    *malformed_lines += scan_jsonl_records(path, |record| records.push(record))?;
     Ok(())
 }
 
@@ -2443,8 +2463,8 @@ fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<
 }
 
 #[tauri::command(async)]
-fn tracker_read_data(state: State<'_, MacroState>) -> Result<Vec<Value>, String> {
-    state.tracker_read_data()
+fn tracker_read_data_page(offset: usize, limit: usize, state: State<'_, MacroState>) -> Result<TrackerHistoryPage, String> {
+    state.tracker_read_data_page(offset, limit)
 }
 
 #[tauri::command(async)]
@@ -3802,7 +3822,7 @@ pub fn run() {
             tracker_diagnostic_event,
             tracker_dungeon_context,
             tracker_reward_event,
-            tracker_read_data,
+            tracker_read_data_page,
             tracker_clear_history,
             tracker_get_pinned,
             tracker_set_pinned,

@@ -1717,7 +1717,7 @@ impl MacroState {
             &mut malformed_lines,
         )?;
         if malformed_lines > 0 {
-            self.log(&format!("Run History skipped {malformed_lines} malformed JSONL record(s); valid records remain available."));
+            self.log(&format!("Run History skipped {malformed_lines} malformed or oversized JSONL record(s); valid records remain available."));
         }
         Ok(records)
     }
@@ -1845,6 +1845,50 @@ fn append_history_record(path: &Path, record: &Value) -> Result<(), String> {
     append_jsonl_record(path, record, false)
 }
 
+const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
+
+// Read one JSONL line without allowing a corrupt or hostile line to allocate
+// unbounded memory. Oversized lines are drained through the next newline so
+// subsequent valid history records remain readable.
+fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let mut oversized = false;
+    let mut read_any = false;
+
+    loop {
+        let (consumed, has_newline) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if read_any { Some(!oversized) } else { None });
+            }
+
+            let newline_index = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline_index.map_or(available.len(), |index| index + 1);
+            let content_length = newline_index.unwrap_or(consumed);
+
+            if !oversized {
+                let remaining = MAX_JSONL_LINE_BYTES.saturating_sub(line.len());
+                let to_copy = content_length.min(remaining);
+                line.extend_from_slice(&available[..to_copy]);
+                if to_copy < content_length {
+                    oversized = true;
+                }
+            }
+
+            (consumed, newline_index.is_some())
+        };
+
+        reader.consume(consumed);
+        read_any = true;
+        if has_newline {
+            return Ok(Some(!oversized));
+        }
+    }
+}
+
 fn read_jsonl_records(
     path: &Path,
     records: &mut Vec<Value>,
@@ -1858,17 +1902,16 @@ fn read_jsonl_records(
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("Could not read tracker data: {error}"))?;
-        if bytes_read == 0 {
+        let Some(line_is_within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
+            .map_err(|error| format!("Could not read tracker data: {error}"))?
+        else {
             break;
+        };
+        if !line_is_within_limit {
+            *malformed_lines += 1;
+            continue;
         }
-        while line
-            .last()
-            .is_some_and(|last| *last == b'\n' || *last == b'\r')
-        {
+        while line.last().is_some_and(|last| *last == b'\r') {
             line.pop();
         }
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -4139,6 +4182,23 @@ mod tests {
         assert!(playback_session_is_current(MODE_PLAYING, 7, 7));
         assert!(!playback_session_is_current(MODE_PLAYING, 7, 8));
         assert!(!playback_session_is_current(MODE_IDLE, 7, 7));
+    }
+
+    #[test]
+    fn oversized_history_line_is_skipped_without_hiding_later_records() {
+        let dir = temp_dir("history-oversized-line");
+        let history = dir.join("battle-rewards.jsonl");
+        let mut contents = vec![b'x'; MAX_JSONL_LINE_BYTES + 128];
+        contents.extend_from_slice(b"\n{\"record_type\":\"battle_reward\",\"n\":7}\n");
+        fs::write(&history, contents).unwrap();
+
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&history, &mut records, &mut malformed).unwrap();
+
+        assert_eq!(malformed, 1, "the oversized line must be counted and skipped");
+        assert_eq!(records.len(), 1, "the valid record after it must still load");
+        assert_eq!(records[0].get("n").and_then(Value::as_u64), Some(7));
     }
 
     #[test]

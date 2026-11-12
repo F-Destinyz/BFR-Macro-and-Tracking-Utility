@@ -894,6 +894,110 @@ fn begin_playback_if_idle(
     Ok(Some(snapshot))
 }
 
+// Move every history source out of the live paths before deleting any file.
+// This makes a partial staging failure reversible and prevents legacy migration
+// from silently bringing old records back after an incomplete clear operation.
+fn quarantine_history_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    quarantine_history_files_with(paths, fs::rename)
+}
+
+fn quarantine_history_files_with<F>(
+    paths: &[PathBuf],
+    mut rename_file: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    static CLEAR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let rollback_errors = restore_quarantined_history_files(&staged);
+                return Err(history_clear_stage_error(&error.to_string(), &rollback_errors));
+            }
+        }
+
+        let Some(parent) = path.parent() else {
+            let rollback_errors = restore_quarantined_history_files(&staged);
+            return Err(history_clear_stage_error(
+                "A Run History path has no parent directory",
+                &rollback_errors,
+            ));
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            let rollback_errors = restore_quarantined_history_files(&staged);
+            return Err(history_clear_stage_error(
+                "A Run History filename could not be represented safely",
+                &rollback_errors,
+            ));
+        };
+
+        let mut quarantine = None;
+        for _ in 0..10 {
+            let sequence = CLEAR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                "{file_name}.clear-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::symlink_metadata(&candidate) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    quarantine = Some(candidate);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(error) => {
+                    let rollback_errors = restore_quarantined_history_files(&staged);
+                    return Err(history_clear_stage_error(&error.to_string(), &rollback_errors));
+                }
+            }
+        }
+        let Some(quarantine) = quarantine else {
+            let rollback_errors = restore_quarantined_history_files(&staged);
+            return Err(history_clear_stage_error(
+                "Could not reserve a unique Run History quarantine filename",
+                &rollback_errors,
+            ));
+        };
+
+        if let Err(error) = rename_file(path, &quarantine) {
+            let rollback_errors = restore_quarantined_history_files(&staged);
+            return Err(history_clear_stage_error(&error.to_string(), &rollback_errors));
+        }
+        staged.push((path.clone(), quarantine));
+    }
+
+    Ok(staged.into_iter().map(|(_, quarantine)| quarantine).collect())
+}
+
+fn restore_quarantined_history_files(staged: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (original, quarantine) in staged.iter().rev() {
+        if let Err(error) = fs::rename(quarantine, original) {
+            errors.push(format!(
+                "{} could not be restored from {}: {error}",
+                original.display(),
+                quarantine.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn history_clear_stage_error(reason: &str, rollback_errors: &[String]) -> String {
+    if rollback_errors.is_empty() {
+        format!("Run History was not cleared; original files were restored: {reason}")
+    } else {
+        format!(
+            "Run History clear staging failed: {reason}. Some files may remain in quarantine and need recovery: {}",
+            rollback_errors.join("; ")
+        )
+    }
+}
+
 impl MacroState {
     fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
         if clicks.is_empty() {
@@ -1727,37 +1831,38 @@ impl MacroState {
             "Tracker history is unavailable because its lock was poisoned".to_string()
         })?;
 
-        // A user-requested clear also removes legacy migration copies, otherwise
-        // an old source file could be imported again on the next application start.
+        // Stage every source under a unique sibling name before deleting any of
+        // them. If a rename fails, previously staged files are restored in reverse
+        // order so the original history remains readable and migration-safe.
         let migrated_legacy_file = self.tracker_legacy_file.with_extension("jsonl.migrated");
-        for legacy_copy in [&self.tracker_legacy_file, &migrated_legacy_file] {
-            match fs::remove_file(legacy_copy) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "Could not remove a legacy Run History recovery copy: {error}"
-                    ))
-                }
-            }
-        }
-        // Replace the active JSONL file atomically. Run History also reads the
-        // legacy rotation backup, so an explicit user clear removes both files.
-        write_file_atomically(&self.tracker_sessions_file, b"")?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
-        match fs::remove_file(&backup_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "Run History was cleared, but its old backup could not be removed: {error}"
-                ))
+        let staged_files = quarantine_history_files(&[
+            self.tracker_sessions_file.clone(),
+            backup_file,
+            self.tracker_legacy_file.clone(),
+            migrated_legacy_file,
+        ])?;
+
+        // All active/recovery paths are now detached, so no old records can be
+        // re-imported. A cleanup failure leaves a clearly named quarantine file
+        // rather than restoring data into the live history; report it in the log.
+        let mut undeleted = Vec::new();
+        for quarantined in staged_files {
+            if let Err(error) = fs::remove_file(&quarantined) {
+                undeleted.push(format!("{} ({error})", quarantined.display()));
             }
         }
         if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
             keys.clear();
         }
-        self.log("Run History cleared by the user.");
+        if undeleted.is_empty() {
+            self.log("Run History cleared by the user.");
+        } else {
+            self.log(&format!(
+                "Run History was detached successfully, but quarantined files could not be permanently deleted: {}",
+                undeleted.join("; ")
+            ));
+        }
         Ok(())
     }
 }

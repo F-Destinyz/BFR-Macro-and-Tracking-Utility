@@ -14,7 +14,7 @@ const cargoToml = read('src-tauri/Cargo.toml');
 const cargoLock = read('src-tauri/Cargo.lock');
 const rust = read('src-tauri/src/lib.rs');
 const trackerHtml = read('dist/tracker.html');
-const readme = read('README.md');
+const readme = read('../README.md');
 const changelog = read('CHANGELOG.md');
 
 function scriptBodies(html) {
@@ -54,7 +54,7 @@ test('one-time history cleanup guard is retained without creating a new release 
   assert.match(rust, /Non-destructive safeguard retained existing Run History/);
   assert.match(rust, /existing history, settings and saved macros were preserved/);
   assert.doesNotMatch(rust.slice(rust.indexOf('fn reset_run_history_once'), rust.indexOf('fn open_data_folder')), /write_file_atomically\(history_file, b\"\"\)/);
-  assert.match(readme, /Do not change it without adding and testing an explicit data migration/);
+  assert.match(readme, /Do not change this identifier without implementing and testing an explicit data migration/);
 });
 
 test('game reward endpoints and canonical Run History fields remain present', () => {
@@ -179,7 +179,7 @@ test('stable documentation contains no development-only release notes or retired
   assert.doesNotMatch(readme, /1\.5\.1-dev\.[123]|BUILD_FIRST|OPTIMIZATION_TEST_NOTES/i);
   assert.doesNotMatch(changelog, /1\.5\.1-dev\.[123]/);
   assert.doesNotMatch(`${readme}\n${changelog}`, /F8|F9|F10/);
-  assert.match(readme, /Macro controls are operated through the tray menu/);
+  assert.match(readme, /Macro controls are available from the tray; keyboard shortcuts are not required/);
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
@@ -299,9 +299,55 @@ test('legacy macro compatibility fixture is explicitly synthetic', () => {
   assert.match(rust, /Synthetic compatibility fixture only/);
 });
 
-test('macro click IPC queue is bounded and reports overflow without unbounded memory growth', () => {
-  assert.match(rust, /MAX_CAPTURE_QUEUE_DEPTH = 512/);
-  assert.match(rust, /captureQueueDepth >= MAX_CAPTURE_QUEUE_DEPTH/);
-  assert.match(rust, /captureQueueDepth = Math\.max\(0, captureQueueDepth - 1\)/);
-  assert.match(rust, /Click capture queue exceeded its safety limit/);
+test('macro click IPC queue is bounded and stops capture when the bridge stalls', async () => {
+  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
+  assert.ok(injectionMatch, 'Rust game-page injection script was not found');
+  const source = injectionMatch[1];
+  const start = source.indexOf('// Serialize IPC calls so rapid physical clicks cannot be stored out of order.');
+  const end = source.indexOf('        }, true);', start);
+  assert.ok(start >= 0 && end > start, 'Physical click queue implementation was not found');
+  const queueSource = source.slice(start, end + '        }, true);'.length);
+
+  let pointerHandler;
+  const pendingClicks = [];
+  const calls = [];
+  const context = {
+    window: { innerWidth: 1000, innerHeight: 800 },
+    document: {
+      addEventListener(name, handler) {
+        assert.equal(name, 'pointerdown');
+        pointerHandler = handler;
+      }
+    },
+    console: { error() {}, info() {} },
+    invoke(command, payload) {
+      calls.push({ command, payload });
+      if (command === 'record_click') {
+        return new Promise((resolve) => pendingClicks.push(resolve));
+      }
+      return Promise.resolve();
+    }
+  };
+
+  vm.runInNewContext(queueSource, context);
+  assert.equal(typeof pointerHandler, 'function', 'Queue must register its physical-click handler');
+
+  const click = { isTrusted: true, button: 0, clientX: 250, clientY: 400 };
+  for (let index = 0; index < 512; index += 1) pointerHandler(click);
+  pointerHandler(click);
+
+  const overflowReports = calls.filter((call) => call.command === 'report_recording_error');
+  assert.equal(overflowReports.length, 1, 'Overflow must report one recording error');
+  assert.match(overflowReports[0].payload.message, /safety limit/);
+  assert.ok(calls.length <= 2, 'A stalled bridge must not start an unbounded number of IPC calls');
+  assert.equal(pendingClicks.length, 1, 'Only the first serialized click should be in flight');
+
+  pendingClicks[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
+  assert.equal(calls.filter((call) => call.command === 'record_click').length, 1,
+    'Queued clicks must not be sent after overflow has failed capture');
+  pointerHandler(click);
+  assert.equal(calls.filter((call) => call.command === 'record_click').length, 1,
+    'Further physical clicks must be ignored after overflow');
 });

@@ -816,17 +816,9 @@ impl SettingsState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TrackerDiagnosticRateLimit {
     accepted_at: VecDeque<Instant>,
-}
-
-impl Default for TrackerDiagnosticRateLimit {
-    fn default() -> Self {
-        Self {
-            accepted_at: VecDeque::new(),
-        }
-    }
 }
 
 impl TrackerDiagnosticRateLimit {
@@ -835,7 +827,7 @@ impl TrackerDiagnosticRateLimit {
         while self
             .accepted_at
             .front()
-            .map_or(false, |accepted| now.duration_since(*accepted) >= TRACKER_DIAGNOSTIC_WINDOW)
+            .is_some_and(|accepted| now.duration_since(*accepted) >= TRACKER_DIAGNOSTIC_WINDOW)
         {
             self.accepted_at.pop_front();
         }
@@ -3848,9 +3840,11 @@ mod tests {
             assert!(limiter.allow());
         }
         assert!(!limiter.allow());
-        limiter.accepted_at = std::iter::repeat(Instant::now() - Duration::from_secs(61))
-            .take(MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize)
-            .collect();
+        limiter.accepted_at = vec![
+            Instant::now() - Duration::from_secs(61);
+            MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize
+        ]
+        .into();
         assert!(limiter.allow());
         assert_eq!(limiter.accepted_at.len(), 1);
     }

@@ -4512,4 +4512,35 @@ mod tests {
         assert_eq!(fs::read_to_string(&destination).unwrap().lines().count(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn tracker_migration_with_existing_recovery_copy_is_idempotent() {
+        let dir = temp_dir("history-migration-existing-recovery");
+        let legacy = dir.join("legacy.jsonl");
+        let destination = dir.join("Logs/battle-rewards.jsonl");
+        let recovery_copy = legacy.with_extension("jsonl.migrated");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        let legacy_bytes = b"same\nnew\n";
+        let recovery_bytes = b"older recovery snapshot\n";
+        fs::write(&legacy, legacy_bytes).unwrap();
+        fs::write(&destination, b"same\n").unwrap();
+        fs::write(&recovery_copy, recovery_bytes).unwrap();
+
+        migrate_tracker_history(&legacy, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"same\nnew\n");
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(&recovery_copy).unwrap(), recovery_bytes);
+
+        // A retry must neither duplicate imported lines nor replace either
+        // recovery source when the migration marker already exists.
+        migrate_tracker_history(&legacy, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"same\nnew\n");
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(&recovery_copy).unwrap(), recovery_bytes);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
 }

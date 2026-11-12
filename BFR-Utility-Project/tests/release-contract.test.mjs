@@ -187,8 +187,12 @@ test('stable documentation contains no development-only release notes or retired
 test('Run History preserves old backups, does not rotate, and skips malformed lines', () => {
   assert.match(rust, /fn append_history_record\(path: &Path, record: &Value\)/);
   assert.match(rust, /append_history_record\(&self\.tracker_sessions_file, &record\)/);
-  assert.match(rust, /read_jsonl_records\(&backup_file, &mut records, &mut malformed_lines\)/);
+  assert.match(rust, /fn read_jsonl_page\(/);
+  assert.match(rust, /MAX_HISTORY_PAGE_SIZE: usize = 200/);
+  assert.match(rust, /scan_jsonl_records\(path, \|record\| records\.push\(record\)\)/);
   assert.match(rust, /malformed(?: or oversized)? JSONL record/);
+  assert.match(rust, /tracker_read_data_page/);
+  assert.doesNotMatch(rust, /fn tracker_read_data\(/);
   assert.match(rust, /tracker_context_file/);
 });
 

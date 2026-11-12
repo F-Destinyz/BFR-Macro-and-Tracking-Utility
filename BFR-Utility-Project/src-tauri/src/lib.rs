@@ -1187,8 +1187,7 @@ impl MacroState {
                 "performance_resource": details.get("performance_resource").and_then(Value::as_bool).unwrap_or(false)
             }),
             "begin_quest_click_seen"
-            | "repeat_action_click_seen"
-            => json!({
+            | "repeat_action_click_seen" => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
                 "action_kind": details.get("action_kind").and_then(Value::as_str).filter(|v| ["batch", "battles", "generic"].contains(v)).unwrap_or("begin_quest"),

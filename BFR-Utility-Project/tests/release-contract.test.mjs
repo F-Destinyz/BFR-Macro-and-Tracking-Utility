@@ -93,7 +93,11 @@ test('Run History clear remains confirmation-protected and does not target setti
   assert.match(rust, /fn tracker_clear_history/);
   assert.match(rust, /battle-rewards\.jsonl/);
   assert.match(rust, /tracker_legacy_file\.with_extension\(\"jsonl\.migrated\"\)/);
-  assert.match(rust, /for legacy_copy in \[&self\.tracker_legacy_file, &migrated_legacy_file\]/);
+  assert.match(rust, /fn quarantine_history_files\(/);
+  assert.match(rust, /fn restore_quarantined_history_files\(/);
+  assert.match(rust, /quarantine_history_files\(&\[/);
+  assert.match(rust, /history_clear_stage_error/);
+  assert.match(rust, /original files were restored/);
 });
 
 test('minimize-to-tray still hides the game window and requests background memory target', () => {

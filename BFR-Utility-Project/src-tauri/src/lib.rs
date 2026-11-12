@@ -1188,8 +1188,7 @@ impl MacroState {
             }),
             "begin_quest_click_seen"
             | "repeat_action_click_seen"
-            | "repeat_batch_click_seen"
-            | "repeat_battles_click_seen" => json!({
+            => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
                 "action_kind": details.get("action_kind").and_then(Value::as_str).filter(|v| ["batch", "battles", "generic"].contains(v)).unwrap_or("begin_quest"),
@@ -2311,7 +2310,7 @@ fn finish_stopping_recording(mode: &AtomicU8) -> bool {
 
 #[tauri::command]
 fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_, MacroState>) {
-    let safe_message = sanitize_recording_error_message(&safe_message);
+    let safe_message = sanitize_recording_error_message(&message);
     let snapshot = match begin_stopping_recording(&state.mode, &state.record_started, &state.clicks)
     {
         Ok(Some(snapshot)) => snapshot,

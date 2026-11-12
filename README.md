@@ -1,50 +1,139 @@
 # BFR Macro & Tracking Utility
 
-**Stable release: 2.0.0**
+<p align="center">
+  <strong>A Windows desktop companion for Brave Frontier: Reborn</strong><br>
+  Macro recording and playback · Dungeon reward tracking · Searchable Run History
+</p>
 
-A Windows desktop utility for Brave Frontier: Reborn. It embeds the game in a Tauri/WebView2 window, provides tray-controlled macro recording and playback, and records completed dungeon rewards in a searchable Run History window.
+<p align="center">
+  <a href="https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/latest">
+    <img src="https://img.shields.io/github/v/release/F-Destinyz/BFR-Macro-and-Tracking-Utility?display_name=tag&sort=semver" alt="Latest release">
+  </a>
+  <a href="https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases">
+    <img src="https://img.shields.io/github/downloads/F-Destinyz/BFR-Macro-and-Tracking-Utility/total" alt="GitHub release downloads">
+  </a>
+</p>
 
-## Features
+**Current stable release: [v2.0.1](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/tag/v2.0.1)**
 
-### Tray-controlled macro utility
+BFR Macro & Tracking Utility is a Windows desktop application for **Brave Frontier: Reborn**. It hosts the game in a Tauri/WebView2 window, provides tray-controlled macro recording and playback, and collects completed dungeon rewards into a searchable Run History.
 
-- Record trusted physical left-clicks inside the game with normalized coordinates and elapsed timing.
+---
+
+## Contents
+
+- [Highlights](#highlights)
+- [Download and install](#download-and-install)
+- [Using the application](#using-the-application)
+- [Data, privacy, and compatibility](#data-privacy-and-compatibility)
+- [Build from source](#build-from-source)
+- [Testing and release checks](#testing-and-release-checks)
+- [Technology](#technology)
+- [Development assistance and acknowledgement](#development-assistance-and-acknowledgement)
+- [Changelog](#changelog)
+- [Disclaimer](#disclaimer)
+
+## Highlights
+
+### Macro recording and playback
+
+- Record trusted physical left-clicks inside the embedded game window.
+- Save click positions as normalized coordinates with their recorded timing.
 - Stop recording from the system tray; the recording is saved automatically.
-- Start playback, stop playback, and toggle continuous looping from the system tray.
-- Reload the last saved macro from the system tray.
-- Macro controls are operated through the tray menu; keyboard shortcuts are not required.
-- Playback dispatches input through the embedded WebView2 DevTools Protocol without moving the physical mouse.
+- Start, stop, and loop playback from the system tray.
+- Reload the last saved macro from the tray menu.
+- Playback sends input through the embedded WebView2 DevTools Protocol and does not move the physical mouse.
+- Macro controls are available from the tray; keyboard shortcuts are not required.
 
-### Dungeon Run History
+### Dungeon reward tracking
 
-- Capture completed reward responses from `/api/battles/finish` and `/api/battles/repeat`.
-- Start quest timing from the actual Begin Quest or Repeat action click when it is captured; API fallback timing is shown as unavailable rather than as a misleading near-zero duration.
-- Treat a single `/api/battles/finish` completion as exactly one run.
-- Use cumulative settled-run counts for repeat batches and deduplicate snapshots by batch ID and cumulative run count.
-- Keep Zel, Karma, Honor, and EXP as separate reward values.
-- Search saved history by dungeon or run type. The table shows Completed, Time Taken, Dungeon, Type, Runs, Zel, Karma, Honor, and EXP.
-- Clear Run History from the dashboard with a confirmation prompt. This does not clear settings or saved macros.
+- Capture completed reward information from the game's `/api/battles/finish` and `/api/battles/repeat` endpoints.
+- Track Zel, Karma, Honor, and EXP separately.
+- Count a single battle completion as one run.
+- Use cumulative settled-run counters for repeat batches and deduplicate repeat snapshots.
+- Start quest timing from the captured Begin Quest or Repeat action click where available. When only API fallback timing is available, the utility avoids presenting a misleading near-zero duration.
 
-### Background operation and saved data
+### Searchable Run History
+
+The Run History window stores completed dungeon results and supports searching by dungeon or run type. Its table includes:
+
+| Field | Description |
+|---|---|
+| Completed | Completion date and time |
+| Time Taken | Recorded run duration, when available |
+| Dungeon | Dungeon or quest name |
+| Type | Run type |
+| Runs | Number of completed runs represented |
+| Zel, Karma, Honor, EXP | Separate reward totals |
+
+Run History can be cleared from the dashboard after a confirmation prompt. Clearing history does not clear settings or saved macros.
+
+### Background operation and system tray
 
 - The game and tracker continue running when the main window is minimized to the system tray.
-- WebView2's low-memory target is requested while hidden; this is a runtime hint and does not guarantee a specific memory reduction.
-- Settings, saved macros, logs, and the WebView2 profile are stored outside the installation directory.
+- The tray menu provides window controls, pinning, Run History, macro controls, folder shortcuts, and Exit.
 - Window size, pin state, and loop setting are persisted.
-- A single-instance guard prevents a second application instance from sharing the same files.
+- A single-instance guard prevents multiple application instances from sharing the same files.
+- While hidden, the app requests WebView2's low-memory target. This is a runtime hint, not a guarantee of a specific memory reduction.
 
-## System tray
+---
 
-The tray menu provides the game window, window sizing and minimization, pinning, Run History, macro recording/playback/loop controls, macro loading, application/data-folder shortcuts, and Exit. Recording and playback menu labels change with the current macro state.
+## Download and install
 
-## Installation
+**Get the latest version:** [GitHub Releases](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/latest)
 
-1. Run the **BFR Macro & Tracking Utility** Windows setup installer.
-2. If the Microsoft WebView2 Evergreen Runtime is missing, the installer downloads its bootstrapper; an internet connection is required.
-3. Launch **BFR Macro & Tracking Utility** from the Windows Start Menu or its installed shortcut.
-4. Use the application icon in the system tray to control the game window and macro functions.
+1. Download the Windows 64-bit setup installer from the latest release.
+2. Run the installer.
+3. If the Microsoft Edge WebView2 Evergreen Runtime is missing, the installer downloads its bootstrapper. An internet connection is required for that installation.
+4. Launch **BFR Macro & Tracking Utility** from the Windows Start Menu or its installed shortcut.
+5. Use the application icon in the system tray to control the game window and macro functions.
 
-The installer is configured for the current Windows user. Use the installer produced by the release build rather than copying the executable alone.
+The installer is configured for the current Windows user. Use the release setup installer rather than copying the application executable by itself.
+
+> **Upgrade note:** The application retains its existing Tauri identifier and per-user data locations. Existing settings, saved macros, logs, and the WebView2 profile are intended to remain available across upgrades.
+
+---
+
+## Using the application
+
+### Macro workflow
+
+1. Open the game through the utility.
+2. Use the system tray menu to start recording.
+3. Perform the desired in-game clicks.
+4. Stop recording from the tray menu. The macro is saved automatically.
+5. Use the tray menu to start playback, stop playback, enable looping, or reload the saved macro.
+
+### Run History workflow
+
+1. Complete a dungeon run or repeat batch in the embedded game.
+2. The tracker observes the supported battle reward responses.
+3. Open **Run History** from the application or tray menu.
+4. Search by dungeon or run type and review the recorded rewards.
+
+The collector stores allowlisted reward values and identifiers. It does not write complete response bodies, cookies, or authorization headers to the reward history.
+
+---
+
+## Data, privacy, and compatibility
+
+Application data is stored outside the installation directory. Use the tray menu's folder shortcuts to open the application, Settings, Macros, and Logs locations.
+
+| Location / file | Purpose |
+|---|---|
+| `Settings\\settings.json` | Window dimensions, pin state, and loop setting |
+| `Macros\\recording.bfrmacro` | Last saved macro |
+| `Logs\\bfr-macro.log` | Macro and application messages |
+| `Logs\\performance.jsonl` | Application and WebView2 process-tree performance samples |
+| `Logs\\tracker-discovery.jsonl` | Tracker lifecycle and safe diagnostic events |
+| `Logs\\battle-rewards.jsonl` | Persistent sanitized reward records |
+| `Logs\\tracker-context.jsonl` | Separate dungeon-context diagnostics |
+
+Run History is retained across upgrades. Startup does not clear existing records, and automatic rotation is disabled for user-facing reward history. Legacy rotation backups remain readable. Legacy migration preserves a recovery copy, and malformed JSONL lines are skipped without suppressing valid neighboring records.
+
+The application deliberately retains its existing Tauri identifier so per-user settings, macros, logs, and WebView2 profile data remain in the same location. Do not change this identifier without implementing and testing an explicit data migration.
+
+---
 
 ## Build from source
 
@@ -54,54 +143,84 @@ The installer is configured for the current Windows user. Use the installer prod
 - Node.js LTS and npm.
 - Rust stable with the MSVC target/toolchain.
 - Visual Studio Build Tools with the C++ workload and Windows SDK.
-- WebView2 Evergreen Runtime for running the application.
+- Microsoft Edge WebView2 Evergreen Runtime to run the application.
 
-### Build steps
+### Build and verify
 
-Open PowerShell in the project directory and run:
+Open PowerShell in the `BFR-2.0.0` project directory and run:
 
 ```powershell
 npm ci
 npm test
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run build:windows
 ```
 
-Or run the release helper script:
+For the complete Windows release workflow, use the included helper:
 
 ```powershell
 .\BUILD_WINDOWS_RELEASE.ps1
 ```
 
-The release checks use Node.js built-in test tools and do not require a separate test framework. The NSIS setup installer is generated under `src-tauri\target\release\bundle\nsis\`.
+The helper runs the JavaScript contract tests, Rust unit tests, Clippy with warnings treated as errors, and the Windows bundle build. The NSIS setup installer is generated under:
 
-## Application data and logs
+```text
+src-tauri\target\release\bundle\nsis\
+```
 
-Use the tray menu's folder shortcuts to open the application, Settings, Macros, and Logs locations.
+---
 
-| File | Purpose |
-|---|---|
-| `Settings\settings.json` | Window dimensions, pin state, and loop setting |
-| `Macros\recording.bfrmacro` | Last saved macro |
-| `Logs\bfr-macro.log` | Macro and application messages |
-| `Logs\performance.jsonl` | Application and WebView2 process-tree performance samples |
-| `Logs\tracker-discovery.jsonl` | Tracker lifecycle and safe diagnostic events |
-| `Logs\battle-rewards.jsonl` | Persistent sanitized reward records |
+## Testing and release checks
 
-The reward collector stores allowlisted reward values and identifiers. It does not write complete response bodies, cookies, or authorization headers to the reward history.
+The repository includes automated Node.js release-contract tests and Rust unit tests. The Windows release helper runs these checks before creating the installer.
 
-**Upgrade compatibility:** the Tauri application identifier is intentionally retained from the development build so existing settings, macros, logs, and WebView2 profile data remain in the same per-user data location. Do not change it without adding and testing an explicit data migration.
+To run the checks individually:
 
-## Development Acknowledgement
+```powershell
+npm test
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+```
 
-AI-assisted development tools, including OpenAI ChatGPT (GPT-6), were used to assist with code development, debugging, code review, testing and documentation.
+Passing automated tests is useful evidence, but it does not replace manual testing of installation, macro recording and playback, Run History, upgrades, and saved-data preservation on Windows.
 
-All implementation decisions, testing, validation and release approval are overseen by the project maintainer.
+---
 
 ## Technology
 
-- Tauri 2 desktop shell and Rust backend.
-- Microsoft Edge WebView2 runtime.
-- WebView2 DevTools Protocol for macro playback.
-- Serde/JSON for settings, macro, diagnostic, performance, and reward-history data.
+- **Tauri 2** — Windows desktop application shell.
+- **Rust** — native application logic and backend.
+- **Microsoft Edge WebView2** — embedded game web content.
+- **WebView2 DevTools Protocol** — macro playback input.
+- **Serde and JSON** — settings, macro, diagnostic, performance, and reward-history data.
 
-This is a personal utility for Brave Frontier: Reborn and is not affiliated with the game's developers.
+---
+
+## Development assistance and acknowledgement
+
+This project was developed by its maintainer with assistance from **OpenAI ChatGPT (GPT-6)**.
+
+AI assistance was used as a development aid for tasks such as:
+
+- Explaining Rust, JavaScript, Tauri, and Windows build concepts.
+- Exploring implementation approaches and helping draft code changes.
+- Debugging build errors and interpreting compiler and test output.
+- Reviewing code for potential reliability, data-preservation, and maintainability issues.
+- Preparing regression checks, release documentation, and user-facing instructions.
+
+The maintainer directs the project, reviews and integrates changes, runs the builds and tests, performs Windows application checks, and makes final implementation and release decisions. AI assistance does not replace maintainer review or independent testing.
+
+---
+
+## Changelog
+
+See the project [CHANGELOG](BFR-2.0.0/CHANGELOG.md) for version history and detailed changes.
+
+For downloads and release notes, see [GitHub Releases](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases).
+
+---
+
+## Disclaimer
+
+This is an independent community utility for Brave Frontier: Reborn. It is not affiliated with, endorsed by, or officially supported by the game's developers or publishers. Use the application and macro features in accordance with the game's rules and your own account's requirements.

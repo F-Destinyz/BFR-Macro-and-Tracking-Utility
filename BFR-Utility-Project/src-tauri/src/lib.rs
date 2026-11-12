@@ -4287,6 +4287,72 @@ mod tests {
     }
 
     #[test]
+    fn history_clear_stages_every_existing_source_before_cleanup() {
+        let dir = temp_dir("history-clear-stage");
+        let active = dir.join("battle-rewards.jsonl");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let legacy_dir = dir.join("tracker-data");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join("battle-rewards.jsonl");
+        let migrated = legacy_dir.join("battle-rewards.jsonl.migrated");
+        for (path, contents) in [
+            (&active, b"active history".as_slice()),
+            (&backup, b"backup history".as_slice()),
+            (&legacy, b"legacy history".as_slice()),
+            (&migrated, b"migrated history".as_slice()),
+        ] {
+            fs::write(path, contents).unwrap();
+        }
+
+        let quarantined = quarantine_history_files(&[
+            active.clone(),
+            backup.clone(),
+            legacy.clone(),
+            migrated.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(quarantined.len(), 4);
+        assert!(!active.exists());
+        assert!(!backup.exists());
+        assert!(!legacy.exists());
+        assert!(!migrated.exists());
+        for path in quarantined {
+            assert!(path.exists());
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_clear_restores_staged_files_when_a_later_rename_fails() {
+        let dir = temp_dir("history-clear-rollback");
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
+        fs::write(&first, b"first history").unwrap();
+        fs::write(&second, b"second history").unwrap();
+        let mut rename_calls = 0;
+
+        let result = quarantine_history_files_with(
+            &[first.clone(), second.clone()],
+            |source, destination| {
+                rename_calls += 1;
+                if rename_calls == 2 {
+                    return Err(std::io::Error::other("simulated rename failure"));
+                }
+                fs::rename(source, destination)
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("original files were restored"));
+        assert_eq!(fs::read(&first).unwrap(), b"first history");
+        assert_eq!(fs::read(&second).unwrap(), b"second history");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn oversized_history_line_is_skipped_without_hiding_later_records() {
         let dir = temp_dir("history-oversized-line");
         let history = dir.join("battle-rewards.jsonl");

@@ -1727,39 +1727,48 @@ impl MacroState {
             "Tracker history is unavailable because its lock was poisoned".to_string()
         })?;
 
-        // A user-requested clear also removes legacy migration copies, otherwise
-        // an old source file could be imported again on the next application start.
-        let migrated_legacy_file = self.tracker_legacy_file.with_extension("jsonl.migrated");
-        for legacy_copy in [&self.tracker_legacy_file, &migrated_legacy_file] {
-            match fs::remove_file(legacy_copy) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "Could not remove a legacy Run History recovery copy: {error}"
-                    ))
-                }
-            }
-        }
-        // Replace the active JSONL file atomically. Run History also reads the
-        // legacy rotation backup, so an explicit user clear removes both files.
-        write_file_atomically(&self.tracker_sessions_file, b"")?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
-        match fs::remove_file(&backup_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "Run History was cleared, but its old backup could not be removed: {error}"
-                ))
-            }
-        }
+        let migrated_legacy_file = self.tracker_legacy_file.with_extension("jsonl.migrated");
+        clear_tracker_history_files(
+            &self.tracker_sessions_file,
+            &backup_file,
+            &self.tracker_legacy_file,
+            &migrated_legacy_file,
+        )?;
         if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
             keys.clear();
         }
         self.log("Run History cleared by the user.");
         Ok(())
     }
+}
+
+// Clear Run History in an order that never deletes a recovery source before
+// the active file has been safely replaced. If a later deletion fails, at least
+// one unprocessed backup/legacy source remains available for retry or recovery.
+fn clear_tracker_history_files(
+    active_file: &Path,
+    backup_file: &Path,
+    legacy_file: &Path,
+    migrated_legacy_file: &Path,
+) -> Result<(), String> {
+    write_file_atomically(active_file, b"")
+        .map_err(|error| format!("Could not clear the active Run History file: {error}"))?;
+
+    for (path, description) in [
+        (backup_file, "Run History backup"),
+        (legacy_file, "legacy Run History file"),
+        (migrated_legacy_file, "legacy Run History recovery copy"),
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("Could not remove {description}: {error}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // A compact local timestamp without another dependency.
@@ -4139,6 +4148,47 @@ mod tests {
         assert!(playback_session_is_current(MODE_PLAYING, 7, 7));
         assert!(!playback_session_is_current(MODE_PLAYING, 7, 8));
         assert!(!playback_session_is_current(MODE_IDLE, 7, 7));
+    }
+
+    #[test]
+    fn failed_active_history_clear_preserves_all_recovery_files() {
+        let dir = temp_dir("history-clear-active-failure");
+        let blocked_parent = dir.join("not-a-directory");
+        fs::write(&blocked_parent, b"keep").unwrap();
+        let active = blocked_parent.join("battle-rewards.jsonl");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let legacy = dir.join("legacy.jsonl");
+        let migrated = dir.join("legacy.jsonl.migrated");
+        fs::write(&backup, b"backup history").unwrap();
+        fs::write(&legacy, b"legacy history").unwrap();
+        fs::write(&migrated, b"recovery history").unwrap();
+
+        assert!(clear_tracker_history_files(&active, &backup, &legacy, &migrated).is_err());
+        assert_eq!(fs::read(&backup).unwrap(), b"backup history");
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy history");
+        assert_eq!(fs::read(&migrated).unwrap(), b"recovery history");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_backup_removal_keeps_legacy_history_sources() {
+        let dir = temp_dir("history-clear-backup-failure");
+        let active = dir.join("battle-rewards.jsonl");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let legacy = dir.join("legacy.jsonl");
+        let migrated = dir.join("legacy.jsonl.migrated");
+        fs::write(&active, b"active history").unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("preserved.txt"), b"backup recovery").unwrap();
+        fs::write(&legacy, b"legacy history").unwrap();
+        fs::write(&migrated, b"recovery history").unwrap();
+
+        assert!(clear_tracker_history_files(&active, &backup, &legacy, &migrated).is_err());
+        assert!(fs::read(&active).unwrap().is_empty());
+        assert_eq!(fs::read(backup.join("preserved.txt")).unwrap(), b"backup recovery");
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy history");
+        assert_eq!(fs::read(&migrated).unwrap(), b"recovery history");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

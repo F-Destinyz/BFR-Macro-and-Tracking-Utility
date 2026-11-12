@@ -1,6 +1,6 @@
 # BFR Macro & Tracking Utility — Audit patch notes
 
-Scope: follow-up review of the supplied v2.0.1 audit source. This patch is intended for the existing `audit/v2.0.1-code-review` branch only. It does not change the stable `main` branch.
+Scope: record the v2.0.1 post-audit fixes and validation. This work was merged into main by PR #7 (fefaede761dea67b2dbcfaf510ad1b9132ee9778). The follow-up release metadata is prepared separately as v2.0.2.
 
 ## Changes in this patch
 
@@ -68,4 +68,4 @@ The changes above do not claim that every item in the original Claude audit has 
 
 ## Review note
 
-The `src-tauri/src/lib.rs` diff is large in part because of Rust formatting changes. Review the semantic changes separately from formatting churn before merging. The audit branch must remain separate from `main` until the pull request has been reviewed and explicitly approved.
+The `src-tauri/src/lib.rs` diff is large in part because of Rust formatting changes. Review the semantic changes separately from formatting churn before merging. PR #7 has been merged into main. The v2.0.2 version bump and release documentation are prepared on the separate release/v2.0.2 branch for review before publication.

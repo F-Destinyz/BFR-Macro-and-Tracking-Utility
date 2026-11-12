@@ -298,3 +298,10 @@ test('legacy macro compatibility fixture is explicitly synthetic', () => {
   assert.match(rust, /synthetic_bfrmacro2_fixture_remains_deserializable/);
   assert.match(rust, /Synthetic compatibility fixture only/);
 });
+
+test('macro click IPC queue is bounded and reports overflow without unbounded memory growth', () => {
+  assert.match(rust, /MAX_CAPTURE_QUEUE_DEPTH = 512/);
+  assert.match(rust, /captureQueueDepth >= MAX_CAPTURE_QUEUE_DEPTH/);
+  assert.match(rust, /captureQueueDepth = Math\.max\(0, captureQueueDepth - 1\)/);
+  assert.match(rust, /Click capture queue exceeded its safety limit/);
+});

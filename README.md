@@ -6,12 +6,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.0.1-6f42c1?style=for-the-badge" alt="Version 2.0.1">
+  <img src="https://img.shields.io/badge/Version-2.0.2-6f42c1?style=for-the-badge" alt="Version 2.0.2">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/Status-Stable-2ea44f?style=for-the-badge" alt="Stable release">
 </p>
 
-**Current stable release: [v2.0.1](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/tag/v2.0.1)**
+**Current stable release: [v2.0.2](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/tag/v2.0.2)**
 
 BFR Macro & Tracking Utility is a Windows desktop application for **Brave Frontier: Reborn**. It hosts the game in a Tauri/WebView2 window, provides tray-controlled macro recording and playback, and collects completed dungeon rewards into a searchable Run History.
 

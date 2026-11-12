@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tracker-read-data"
+description = "Enables the tracker_read_data command without any pre-configured scope."
+commands.allow = ["tracker_read_data"]
+
+[[permission]]
+identifier = "deny-tracker-read-data"
+description = "Denies the tracker_read_data command without any pre-configured scope."
+commands.deny = ["tracker_read_data"]

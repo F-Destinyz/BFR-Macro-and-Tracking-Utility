@@ -6,8 +6,6 @@
     "game"
   ],
   "permissions": [
-    "core:default",
-    "notification:default",
     "allow-game-recording-bridge"
   ],
   "remote": {

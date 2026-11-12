@@ -781,6 +781,63 @@ struct MacroState {
     loop_enabled: AtomicBool,
 }
 
+fn can_load_macro(mode: u8) -> bool {
+    mode == MODE_IDLE
+}
+
+// Serialize macro-buffer replacement with recording startup. Keep the lock
+// order consistent with record_click: recording timer first, click buffer second.
+fn begin_recording_if_idle(
+    mode: &AtomicU8,
+    record_started: &Mutex<Option<Instant>>,
+    clicks: &Mutex<Vec<MacroClick>>,
+) -> Result<bool, String> {
+    let mut started = record_started
+        .lock()
+        .map_err(|_| "Recording timer is unavailable".to_string())?;
+    let mut clicks = clicks
+        .lock()
+        .map_err(|_| "Macro data is unavailable".to_string())?;
+
+    if mode
+        .compare_exchange(MODE_IDLE, MODE_RECORDING, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    clicks.clear();
+    *started = Some(Instant::now());
+    Ok(true)
+}
+
+// Hold the click-buffer lock until playback owns the mode. This prevents a
+// concurrent load from replacing the buffer between snapshotting and playback.
+fn begin_playback_if_idle(
+    mode: &AtomicU8,
+    clicks: &Mutex<Vec<MacroClick>>,
+) -> Result<Option<Vec<MacroClick>>, String> {
+    let clicks = clicks
+        .lock()
+        .map_err(|_| "Macro data is unavailable".to_string())?;
+    if mode.load(Ordering::SeqCst) != MODE_IDLE {
+        return Ok(None);
+    }
+
+    let snapshot = clicks.clone();
+    if snapshot.is_empty() {
+        return Ok(Some(snapshot));
+    }
+
+    if mode
+        .compare_exchange(MODE_IDLE, MODE_PLAYING, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
+}
+
 impl MacroState {
     fn save_macro(&self) -> Result<usize, String> {
         let clicks = self
@@ -803,6 +860,9 @@ impl MacroState {
     }
 
     fn load_macro(&self) -> Result<usize, String> {
+        if !can_load_macro(self.mode.load(Ordering::SeqCst)) {
+            return Err("Stop recording or playback before loading a saved macro".to_string());
+        }
         let metadata = fs::metadata(&self.file).map_err(|e| e.to_string())?;
         if metadata.len() > MAX_MACRO_FILE_BYTES {
             return Err("The macro file is too large to load safely (16 MB maximum)".to_string());
@@ -814,10 +874,16 @@ impl MacroState {
         }
         validate_macro_clicks(&data.clicks)?;
         let count = data.clicks.len();
-        *self
+        let mut clicks = self
             .clicks
             .lock()
-            .map_err(|_| "Macro data is unavailable".to_string())? = data.clicks;
+            .map_err(|_| "Macro data is unavailable".to_string())?;
+        // Recheck while holding the click buffer lock so a recording cannot begin
+        // between the initial mode check and replacing the in-memory macro.
+        if !can_load_macro(self.mode.load(Ordering::SeqCst)) {
+            return Err("Stop recording or playback before loading a saved macro".to_string());
+        }
+        *clicks = data.clicks;
         Ok(count)
     }
 
@@ -1899,13 +1965,14 @@ fn start_recording(app: &AppHandle<Wry>) {
         );
         return;
     }
-    if let Ok(mut clicks) = state.clicks.lock() {
-        clicks.clear();
+    match begin_recording_if_idle(&state.mode, &state.record_started, &state.clicks) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            notify(app, "BFR Macro — Recording unavailable", &error, true);
+            return;
+        }
     }
-    if let Ok(mut started) = state.record_started.lock() {
-        *started = Some(Instant::now());
-    }
-    state.mode.store(MODE_RECORDING, Ordering::SeqCst);
     state.performance_event("recording_started", json!({}));
     refresh_tray_menu(app);
     notify(
@@ -2128,10 +2195,11 @@ fn start_playback(app: AppHandle<Wry>) {
         return;
     }
     if state.mode.load(Ordering::SeqCst) == MODE_RECORDING { stop_recording(&app); }
-    let clicks = match state.clicks.lock() {
-        Ok(clicks) => clicks.clone(),
-        Err(_) => {
-            notify(&app, "BFR Macro — Playback unavailable", "The recorded macro data is unavailable.", true);
+    let clicks = match begin_playback_if_idle(&state.mode, &state.clicks) {
+        Ok(Some(clicks)) => clicks,
+        Ok(None) => return,
+        Err(error) => {
+            notify(&app, "BFR Macro — Playback unavailable", &error, true);
             return;
         }
     };
@@ -2139,7 +2207,6 @@ fn start_playback(app: AppHandle<Wry>) {
         notify(&app, "BFR Macro — No recording", "There is no saved macro to play. Record some clicks first.", true);
         return;
     }
-    if state.mode.compare_exchange(MODE_IDLE, MODE_PLAYING, Ordering::SeqCst, Ordering::SeqCst).is_err() { return; }
     let generation = state.playback_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     let port = state.cdp_port;
     state.performance_event("playback_started", json!({ "click_count": clicks.len(), "loop_enabled": state.loop_enabled.load(Ordering::SeqCst) }));
@@ -2979,6 +3046,39 @@ mod tests {
         assert!(validate_macro_clicks(&absurd).is_err());
         let too_many = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 0 }; MAX_MACRO_CLICKS + 1];
         assert!(validate_macro_clicks(&too_many).is_err());
+    }
+
+    #[test]
+    fn macro_loading_is_allowed_only_when_idle() {
+        assert!(can_load_macro(MODE_IDLE));
+        assert!(!can_load_macro(MODE_RECORDING));
+        assert!(!can_load_macro(MODE_PLAYING));
+    }
+
+    #[test]
+    fn macro_buffer_transitions_are_serialized_with_mode_changes() {
+        let mode = AtomicU8::new(MODE_IDLE);
+        let record_started = Mutex::new(None);
+        let clicks = Mutex::new(vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 10 }]);
+
+        assert!(begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_RECORDING);
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(record_started.lock().unwrap().is_some());
+        assert!(!can_load_macro(mode.load(Ordering::SeqCst)));
+
+        mode.store(MODE_IDLE, Ordering::SeqCst);
+        clicks.lock().unwrap().push(MacroClick { x: 0.25, y: 0.75, elapsed_ms: 20 });
+        let snapshot = begin_playback_if_idle(&mode, &clicks).unwrap().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_PLAYING);
+        assert!(!can_load_macro(mode.load(Ordering::SeqCst)));
+
+        let before = clicks.lock().unwrap().clone();
+        assert!(!begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        let after = clicks.lock().unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].elapsed_ms, before[0].elapsed_ms);
     }
 
     #[test]

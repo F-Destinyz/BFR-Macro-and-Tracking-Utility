@@ -6,12 +6,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/latest">
-    <img src="https://img.shields.io/github/v/release/F-Destinyz/BFR-Macro-and-Tracking-Utility?display_name=tag&sort=semver" alt="Latest release">
-  </a>
-  <a href="https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases">
-    <img src="https://img.shields.io/github/downloads/F-Destinyz/BFR-Macro-and-Tracking-Utility/total" alt="GitHub release downloads">
-  </a>
+  <img src="https://img.shields.io/badge/Version-2.0.1-6f42c1?style=for-the-badge" alt="Version 2.0.1">
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/Status-Stable-2ea44f?style=for-the-badge" alt="Stable release">
 </p>
 
 **Current stable release: [v2.0.1](https://github.com/F-Destinyz/BFR-Macro-and-Tracking-Utility/releases/tag/v2.0.1)**

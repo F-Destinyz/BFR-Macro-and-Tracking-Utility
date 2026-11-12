@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tracker-set-pinned"
+description = "Enables the tracker_set_pinned command without any pre-configured scope."
+commands.allow = ["tracker_set_pinned"]
+
+[[permission]]
+identifier = "deny-tracker-set-pinned"
+description = "Denies the tracker_set_pinned command without any pre-configured scope."
+commands.deny = ["tracker_set_pinned"]

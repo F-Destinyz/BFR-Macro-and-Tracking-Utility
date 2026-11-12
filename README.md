@@ -27,7 +27,6 @@ BFR Macro & Tracking Utility is a Windows desktop application for **Brave Fronti
 - [Build from source](#build-from-source)
 - [Testing and release checks](#testing-and-release-checks)
 - [Changelog](#changelog)
-- [Development assistance and acknowledgement](#development-assistance-and-acknowledgement)
 - [Disclaimer](#disclaimer)
 
 ## Highlights
@@ -191,22 +190,6 @@ Passing automated tests is useful evidence, but it does not replace manual testi
 - **Microsoft Edge WebView2** — embedded game web content.
 - **WebView2 DevTools Protocol** — macro playback input.
 - **Serde and JSON** — settings, macro, diagnostic, performance, and reward-history data.
-
----
-
-## Development assistance and acknowledgement
-
-This project was developed by its maintainer with assistance from **OpenAI ChatGPT (GPT-6)**.
-
-AI assistance was used as a development aid for tasks such as:
-
-- Explaining Rust, JavaScript, Tauri, and Windows build concepts.
-- Exploring implementation approaches and helping draft code changes.
-- Debugging build errors and interpreting compiler and test output.
-- Reviewing code for potential reliability, data-preservation, and maintainability issues.
-- Preparing regression checks, release documentation, and user-facing instructions.
-
-The maintainer directs the project, reviews and integrates changes, runs the builds and tests, performs Windows application checks, and makes final implementation and release decisions. AI assistance does not replace maintainer review or independent testing.
 
 ---
 

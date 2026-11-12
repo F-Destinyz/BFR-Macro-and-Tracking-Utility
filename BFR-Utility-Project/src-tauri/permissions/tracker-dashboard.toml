@@ -1,12 +1,12 @@
 [[permission]]
 identifier = "allow-tracker-dashboard-controls"
 description = "Allows the local tracker dashboard to read, clear, and manage its saved reward history."
-commands.allow = ["tracker_read_data", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"]
+commands.allow = ["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"]
 
 [[permission]]
 identifier = "deny-tracker-dashboard-controls"
-description = "Denies reading saved reward records."
-commands.deny = ["tracker_read_data"]
+description = "Denies reading saved Run History records."
+commands.deny = ["tracker_read_data_page"]
 
 [[permission]]
 identifier = "deny-tracker-set-pinned"
@@ -15,4 +15,5 @@ commands.deny = ["tracker_set_pinned"]
 
 [[permission]]
 identifier = "deny-tracker-clear-history"
+description = "Denies clearing saved Run History records."
 commands.deny = ["tracker_clear_history"]

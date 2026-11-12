@@ -12,6 +12,7 @@ const packageLock = JSON.parse(read('package-lock.json'));
 const tauriConfig = JSON.parse(read('src-tauri/tauri.conf.json'));
 const cargoToml = read('src-tauri/Cargo.toml');
 const cargoLock = read('src-tauri/Cargo.lock');
+const buildRs = read('src-tauri/build.rs');
 const rust = read('src-tauri/src/lib.rs');
 const trackerHtml = read('dist/tracker.html');
 const readme = read('../README.md');
@@ -212,6 +213,20 @@ test('remote game capability grants only the custom game bridge commands', () =>
   assert.deepEqual(capability.remote.urls, ['https://rebornbf.com/*']);
 });
 
+test('Tauri app command manifest matches every registered IPC command and dashboard permission', () => {
+  const handler = rust.match(/invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)/)?.[1];
+  const manifest = buildRs.match(/commands\(&\[([\s\S]*?)\]\)/)?.[1];
+  assert.ok(handler, 'Missing Tauri invoke handler command list');
+  assert.ok(manifest, 'Missing Tauri AppManifest command list');
+  const registered = [...handler.matchAll(/^\s*([a-z][a-z0-9_]*)\s*,?\s*$/gm)].map((match) => match[1]).sort();
+  const declared = [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]).sort();
+  assert.deepEqual(declared, registered, 'Every registered command must be included in AppManifest');
+  const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
+  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"\]/);
+  assert.match(dashboard, /commands\.deny = \["tracker_read_data_page"\]/);
+  assert.doesNotMatch(dashboard, /\btracker_read_data\b/);
+});
+
 test('playback sessions are generation-scoped and CDP I/O is time-bounded', () => {
   assert.match(rust, /playback_generation: AtomicU64/);
   assert.match(rust, /playback_session_is_current/);
@@ -246,7 +261,7 @@ test('macro playback follows the original absolute click timeline', () => {
 });
 
 test('disk-heavy tracker IPC commands run away from the UI thread', () => {
-  for (const name of ['tracker_diagnostic_event', 'tracker_dungeon_context', 'tracker_reward_event', 'tracker_read_data', 'tracker_clear_history']) {
+  for (const name of ['tracker_diagnostic_event', 'tracker_dungeon_context', 'tracker_reward_event', 'tracker_read_data_page', 'tracker_clear_history']) {
     assert.match(rust, new RegExp(`#\\[tauri::command\\(async\\)\\]\\s*fn ${name}`));
   }
   assert.match(rust, /tracker_dedupe_keys: Mutex<HashSet<String>>/);

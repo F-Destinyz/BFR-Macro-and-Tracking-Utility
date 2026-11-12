@@ -333,7 +333,9 @@ test('macro click IPC queue is bounded and stops capture when the bridge stalls'
   assert.equal(typeof pointerHandler, 'function', 'Queue must register its physical-click handler');
 
   const click = { isTrusted: true, button: 0, clientX: 250, clientY: 400 };
-  for (let index = 0; index < 512; index += 1) pointerHandler(click);
+  pointerHandler(click);
+  await Promise.resolve();
+  for (let index = 1; index < 512; index += 1) pointerHandler(click);
   pointerHandler(click);
 
   const overflowReports = calls.filter((call) => call.command === 'report_recording_error');

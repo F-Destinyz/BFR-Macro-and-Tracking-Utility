@@ -214,17 +214,17 @@ test('remote game capability grants only the custom game bridge commands', () =>
 });
 
 test('Tauri app command manifest matches every registered IPC command and dashboard permission', () => {
-  const handler = rust.match(/\\.invoke_handler\\(tauri::generate_handler!\\[([\\s\\S]*?)\\]\\)/)?.[1];
-  const manifest = buildRs.match(/\\.commands\\(&\\[([\\s\\S]*?)\\]\\)/)?.[1];
+  const handler = rust.match(/invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)/)?.[1];
+  const manifest = buildRs.match(/commands\(&\[([\s\S]*?)\]\)/)?.[1];
   assert.ok(handler, 'Missing Tauri invoke handler command list');
   assert.ok(manifest, 'Missing Tauri AppManifest command list');
-  const registered = [...handler.matchAll(/^\\s*([a-z][a-z0-9_]*)\\s*,?\\s*$/gm)].map((match) => match[1]).sort();
+  const registered = [...handler.matchAll(/^\s*([a-z][a-z0-9_]*)\s*,?\s*$/gm)].map((match) => match[1]).sort();
   const declared = [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]).sort();
   assert.deepEqual(declared, registered, 'Every registered command must be included in AppManifest');
   const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
-  assert.match(dashboard, /commands\\.allow = \\["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"\\]/);
-  assert.match(dashboard, /commands\\.deny = \\["tracker_read_data_page"\\]/);
-  assert.doesNotMatch(dashboard, /\\btracker_read_data\\b/);
+  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"\]/);
+  assert.match(dashboard, /commands\.deny = \["tracker_read_data_page"\]/);
+  assert.doesNotMatch(dashboard, /\btracker_read_data\b/);
 });
 
 test('playback sessions are generation-scoped and CDP I/O is time-bounded', () => {

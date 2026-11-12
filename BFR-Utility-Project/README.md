@@ -1,6 +1,8 @@
 # BFR Macro & Tracking Utility
 
-**Stable release: 2.0.1**
+**Release target: 2.0.2**
+
+This maintenance release includes the post-audit recording-state, history-integrity, settings-preservation, and diagnostic fixes. Final publication follows the Windows release build and installer verification.
 
 A Windows desktop utility for Brave Frontier: Reborn. It embeds the game in a Tauri/WebView2 window, provides tray-controlled macro recording and playback, and records completed dungeon rewards in a searchable Run History window.
 

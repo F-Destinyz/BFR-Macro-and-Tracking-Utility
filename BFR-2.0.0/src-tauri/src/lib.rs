@@ -1119,7 +1119,7 @@ impl MacroState {
             .map(str::to_string);
         let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim)
             .filter(|value| !value.is_empty() && value.len() <= 100 && !value.chars().any(char::is_control));
-        let name = supplied_name.or_else(|| match safe_id.as_deref() {
+        let name = supplied_name.or(match safe_id.as_deref() {
             Some("100501") => Some("Gold Valley Lv. 2"),
             Some("100502") => Some("Gold Valley Lv. 3"),
             _ => None,
@@ -1184,7 +1184,7 @@ impl MacroState {
         let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control()));
         // Only use a name explicitly supplied by the current game page.
         // No ID-to-name guesses: unknown quests are displayed by run ID.
-        let dungeon_name = supplied_name.or_else(|| match dungeon_id.as_deref() {
+        let dungeon_name = supplied_name.or(match dungeon_id.as_deref() {
             Some("100501") => Some("Gold Valley Lv. 2"),
             Some("100502") => Some("Gold Valley Lv. 3"),
             _ => None,
@@ -1248,7 +1248,6 @@ impl MacroState {
                 return Ok(());
             }
         }
-        let mut record = record;
         if let Some(key) = dedupe_key { record["dedupe_key"] = json!(key); }
         match append_history_record(&self.tracker_sessions_file, &record) {
             Ok(()) => {
@@ -2603,7 +2602,7 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
             {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("game") {
-                    show_game(&app, &window);
+                    show_game(app, &window);
                 }
             }
         })
@@ -2806,8 +2805,7 @@ pub fn run() {
             thread::spawn(move || {
                 let mut previous_cpu: Option<(u64, Instant)> = None;
                 let app_started = Instant::now();
-                loop {
-                    let Some(state) = metrics_app.try_state::<MacroState>() else { break; };
+                while let Some(state) = metrics_app.try_state::<MacroState>() {
                     let mode = state.mode.load(Ordering::SeqCst);
                     let click_count = state.clicks.lock().map(|clicks| clicks.len()).unwrap_or(0);
                     #[cfg(windows)]

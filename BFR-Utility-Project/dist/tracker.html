@@ -44,8 +44,8 @@ async function load(append=false){
  try{
   const invoke=window.__TAURI_INTERNALS__?.invoke;
   if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');
-  const requestedOffset=append?nextOffset+Math.max(0,totalRecords-lastKnownTotal):0;
-  const page=await invoke('tracker_read_data_page',{offset:requestedOffset,limit:PAGE_SIZE});
+  const requestedOffset=append?nextOffset:0;
+  const page=await invoke('tracker_read_data_page',{offset:requestedOffset,anchorTotal:append?lastKnownTotal:0,limit:PAGE_SIZE});
   if(!page||!Array.isArray(page.records))throw new Error('Unexpected saved history page.');
   if(append)rawRewards=[...page.records,...rawRewards];else rawRewards=page.records;
   totalRecords=Number(page.total_records||0);lastKnownTotal=totalRecords;

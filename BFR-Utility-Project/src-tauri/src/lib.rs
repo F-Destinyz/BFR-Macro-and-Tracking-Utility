@@ -4202,6 +4202,42 @@ mod tests {
     }
 
     #[test]
+    fn history_line_at_exact_limit_is_accepted() {
+        let dir = temp_dir("history-line-at-limit");
+        let history = dir.join("battle-rewards.jsonl");
+        let mut line = br#"{"record_type":"battle_reward","n":7}"#.to_vec();
+        line.resize(MAX_JSONL_LINE_BYTES, b' ');
+        line.push(b'\\n');
+        fs::write(&history, line).unwrap();
+
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&history, &mut records, &mut malformed).unwrap();
+
+        assert_eq!(malformed, 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("n").and_then(Value::as_u64), Some(7));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_unterminated_history_line_is_skipped() {
+        let dir = temp_dir("history-oversized-unterminated");
+        let history = dir.join("battle-rewards.jsonl");
+        let mut line = br#"{"record_type":"battle_reward","n":7}"#.to_vec();
+        line.resize(MAX_JSONL_LINE_BYTES + 1, b' ');
+        fs::write(&history, line).unwrap();
+
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&history, &mut records, &mut malformed).unwrap();
+
+        assert_eq!(malformed, 1);
+        assert!(records.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn history_records_do_not_rotate_and_corrupt_lines_are_skipped() {
         let dir = temp_dir("history-jsonl");
         let history = dir.join("battle-rewards.jsonl");

@@ -15,6 +15,7 @@ const cargoLock = read('src-tauri/Cargo.lock');
 const buildRs = read('src-tauri/build.rs');
 const rust = read('src-tauri/src/lib.rs');
 const trackerHtml = read('dist/tracker.html');
+const trackerCapability = JSON.parse(read('src-tauri/capabilities/tracker.json'));
 const readme = read('../README.md');
 const changelog = read('CHANGELOG.md');
 
@@ -211,6 +212,29 @@ test('remote game capability grants only the custom game bridge commands', () =>
   const capability = JSON.parse(read('src-tauri/capabilities/default.json'));
   assert.deepEqual(capability.permissions, ['allow-game-recording-bridge']);
   assert.deepEqual(capability.remote.urls, ['https://rebornbf.com/*']);
+});
+
+test('tracker window grants only its custom IPC permissions and active diagnostics are bounded', () => {
+  assert.deepEqual(trackerCapability.permissions, ['allow-tracker-dashboard-controls']);
+  const allowlist = rust.match(/let safe_event = match event \{([\s\S]*?)\n\s*_ => return Err/);
+  assert.ok(allowlist, 'Missing tracker diagnostic event allowlist');
+  const events = [...allowlist[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]).sort();
+  assert.deepEqual(events, [
+    'begin_quest_click_seen',
+    'dungeon_context_seen',
+    'observer_error',
+    'observer_started',
+    'observer_status',
+    'repeat_action_click_seen',
+    'reward_persist_failed',
+    'reward_persisted'
+  ]);
+  assert.match(rust, /MAX_TRACKER_DIAGNOSTICS_PER_WINDOW: u32 = 120/);
+  assert.match(rust, /tracker_diagnostic_rate_limit: Mutex<TrackerDiagnosticRateLimit>/);
+  assert.match(rust, /fn sanitize_recording_error_message\(message: &str\)/);
+  assert.match(rust, /\.take\(MAX_RECORDING_ERROR_MESSAGE_CHARS\)/);
+  assert.match(rust, /MAX_RECORDING_ERROR_MESSAGE_CHARS: usize = 500/);
+  assert.doesNotMatch(rust, /"network_activity" =>| "websocket_activity" =>| "dom_activity" =>| "navigation_activity" =>/);
 });
 
 test('Tauri app command manifest matches every registered IPC command and dashboard permission', () => {

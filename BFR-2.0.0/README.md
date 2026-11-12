@@ -20,7 +20,7 @@ A Windows desktop utility for Brave Frontier: Reborn. It embeds the game in a Ta
 - Capture completed reward responses from `/api/battles/finish` and `/api/battles/repeat`.
 - Start quest timing from the actual Begin Quest or Repeat action click when it is captured; API fallback timing is shown as unavailable rather than as a misleading near-zero duration.
 - Treat a single `/api/battles/finish` completion as exactly one run.
-- Use cumulative settled-run counts for repeat batches and deduplicate snapshots by batch ID and cumulative run count.
+- Use cumulative settled-run counts for repeat batches and deduplicate snapshots by batch ID and cumulative run count. The counter selection prefers explicit cumulative fields over per-chunk settlement counts.
 - Keep Zel, Karma, Honor, and EXP as separate reward values.
 - Search saved history by dungeon or run type. The table shows Completed, Time Taken, Dungeon, Type, Runs, Zel, Karma, Honor, and EXP.
 - Clear Run History from the dashboard with a confirmation prompt. This does not clear settings or saved macros.
@@ -30,6 +30,9 @@ A Windows desktop utility for Brave Frontier: Reborn. It embeds the game in a Ta
 - The game and tracker continue running when the main window is minimized to the system tray.
 - WebView2's low-memory target is requested while hidden; this is a runtime hint and does not guarantee a specific memory reduction.
 - Settings, saved macros, logs, and the WebView2 profile are stored outside the installation directory.
+- Run History is retained across upgrades: startup does not clear existing records, automatic log rotation is disabled for reward history, and legacy rotation backups are still readable.
+- Legacy history migration keeps the original source bytes as a `.migrated` recovery copy; an explicit Run History clear removes that copy so it cannot be re-imported. Malformed JSONL lines are skipped without hiding valid neighboring records.
+- The tracker window reuses the configured WebView2 profile and debounces resize saves to reduce extra process and disk overhead.
 - Window size, pin state, and loop setting are persisted.
 - A single-instance guard prevents a second application instance from sharing the same files.
 
@@ -63,6 +66,8 @@ Open PowerShell in the project directory and run:
 ```powershell
 npm ci
 npm test
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run build:windows
 ```
 
@@ -72,7 +77,7 @@ Or run the release helper script:
 .\BUILD_WINDOWS_RELEASE.ps1
 ```
 
-The release checks use Node.js built-in test tools and do not require a separate test framework. The NSIS setup installer is generated under `src-tauri\target\release\bundle\nsis\`.
+The release checks include Node.js contract/JavaScript tests, Rust unit tests, and Clippy; they do not require a separate JavaScript test framework. The NSIS setup installer is generated under `src-tauri\target\release\bundle\nsis\`.
 
 ## Application data and logs
 
@@ -85,11 +90,14 @@ Use the tray menu's folder shortcuts to open the application, Settings, Macros, 
 | `Logs\bfr-macro.log` | Macro and application messages |
 | `Logs\performance.jsonl` | Application and WebView2 process-tree performance samples |
 | `Logs\tracker-discovery.jsonl` | Tracker lifecycle and safe diagnostic events |
-| `Logs\battle-rewards.jsonl` | Persistent sanitized reward records |
+| `Logs\battle-rewards.jsonl` | Persistent sanitized reward records; not automatically rotated |
+| `Logs\battle-rewards.jsonl.1` | Legacy rotation backup read during upgrades; removed only when the user explicitly clears Run History |
+| `tracker-data\battle-rewards.jsonl.migrated` | Preserved legacy history migration copy; removed only when the user explicitly clears Run History |
+| `Logs\tracker-context.jsonl` | Separate bounded dungeon-context diagnostics |
 
 The reward collector stores allowlisted reward values and identifiers. It does not write complete response bodies, cookies, or authorization headers to the reward history.
 
-**Upgrade compatibility:** the Tauri application identifier is intentionally retained from the development build so existing settings, macros, logs, and WebView2 profile data remain in the same per-user data location. Do not change it without adding and testing an explicit data migration.
+**Upgrade compatibility:** the Tauri application identifier is intentionally retained from the development build so existing settings, macros, logs, and WebView2 profile data remain in the same per-user data location. The one-time development history cleanup marker is retained for compatibility, but startup no longer truncates Run History. Do not change it without adding and testing an explicit data migration.
 
 ## Technology
 

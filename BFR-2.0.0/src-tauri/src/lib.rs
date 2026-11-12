@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     fs,
     io::{BufRead, Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
         Arc, Mutex,
     },
@@ -21,7 +22,7 @@ use tauri::{
     AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
 };
 use tauri_plugin_notification::NotificationExt;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{Message, WebSocket};
 use url::Url;
 
 const GAME_URL: &str = "https://rebornbf.com/home";
@@ -29,6 +30,11 @@ const WINDOW_WIDTH: f64 = 900.0;
 const WINDOW_HEIGHT: f64 = 1125.0;
 const LOOP_GAP: Duration = Duration::from_millis(500);
 const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CDP_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_MACRO_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MACRO_CLICKS: usize = 100_000;
+const MAX_MACRO_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
 const MODE_IDLE: u8 = 0;
 const MODE_RECORDING: u8 = 1;
 const MODE_PLAYING: u8 = 2;
@@ -92,7 +98,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 // This runs in the remote game page. Tauri's remote capability is restricted to
-// rebornbf.com and only the three commands below are exposed to the page.
+// rebornbf.com and exposes only the explicitly listed game-bridge commands.
 // Only trusted physical left-button pointer presses are recorded.
 const INJECTION_SCRIPT: &str = r#"
 (() => {
@@ -239,8 +245,11 @@ const INJECTION_SCRIPT: &str = r#"
       for (const node of candidates) {
         if (!node || node.nodeType !== 1 || typeof node.matches !== 'function') continue;
         const tag = String(node.tagName || '').toLowerCase();
+        if (tag === 'html' || tag === 'body') continue;
         const interactive = node.matches('button, [role="button"], a, input[type="submit"], [tabindex]:not([tabindex="-1"]), [onclick], [data-action]');
-        const ownText = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        // Use textContent for non-interactive wrappers: innerText can force a
+        // layout/reflow on large game containers during every trusted click.
+        const ownText = String(interactive ? (node.innerText || node.textContent || '') : (node.textContent || '')).replace(/\s+/g, ' ').trim().slice(0, 120);
         const label = [
           node.getAttribute('aria-label') || '',
           node.getAttribute('title') || '',
@@ -759,9 +768,13 @@ struct MacroState {
     performance_file: PathBuf,
     tracker_diagnostics_file: PathBuf,
     tracker_sessions_file: PathBuf,
+    tracker_context_file: PathBuf,
+    tracker_legacy_file: PathBuf,
     tracker_data_lock: Mutex<()>,
+    tracker_dedupe_keys: Mutex<HashSet<String>>,
     cdp_port: u16,
     mode: AtomicU8,
+    playback_generation: AtomicU64,
     bridge_ready: AtomicBool,
     record_started: Mutex<Option<Instant>>,
     clicks: Mutex<Vec<MacroClick>>,
@@ -778,6 +791,7 @@ impl MacroState {
         if clicks.is_empty() {
             return Ok(0);
         }
+        validate_macro_clicks(&clicks)?;
         let count = clicks.len();
         let data = MacroFile {
             format: "BFRMACRO3".to_string(),
@@ -789,24 +803,16 @@ impl MacroState {
     }
 
     fn load_macro(&self) -> Result<usize, String> {
+        let metadata = fs::metadata(&self.file).map_err(|e| e.to_string())?;
+        if metadata.len() > MAX_MACRO_FILE_BYTES {
+            return Err("The macro file is too large to load safely (16 MB maximum)".to_string());
+        }
         let bytes = fs::read(&self.file).map_err(|e| e.to_string())?;
         let data: MacroFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
             return Err("This macro file format is not supported".to_string());
         }
-        if data.clicks.iter().any(|click| {
-            !click.x.is_finite()
-                || !click.y.is_finite()
-                || click.x < 0.0
-                || click.x > 1.0
-                || click.y < 0.0
-                || click.y > 1.0
-        }) {
-            return Err("The macro contains invalid click coordinates".to_string());
-        }
-        if data.clicks.windows(2).any(|pair| pair[1].elapsed_ms < pair[0].elapsed_ms) {
-            return Err("The macro contains click timestamps that are out of order".to_string());
-        }
+        validate_macro_clicks(&data.clicks)?;
         let count = data.clicks.len();
         *self
             .clicks
@@ -1132,7 +1138,7 @@ impl MacroState {
         });
         let _history_guard = self.tracker_data_lock.lock()
             .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
-        append_performance_record(&self.tracker_sessions_file, &record)
+        append_performance_record(&self.tracker_context_file, &record)
     }
 
     fn tracker_reward_event(&self, details: Value) -> Result<(), String> {
@@ -1212,16 +1218,10 @@ impl MacroState {
         // snapshot; prefer explicit settled_runs, then runs/wins in settlement/totals.
         let batch_id = record.get("batch_id").and_then(Value::as_str).unwrap_or("").to_string();
         let finish_path = path == "/api/battles/finish";
-        let read_count = |object: &Value| -> Option<u64> {
-            ["settled_runs", "runs", "wins"].iter()
-                .find_map(|key| object.get(*key).and_then(Value::as_u64).filter(|n| *n > 0 && *n <= 1_000_000))
-        };
         let run_count = if finish_path {
             1
         } else {
-            read_count(&settlement)
-                .or_else(|| read_count(&totals))
-                .unwrap_or(0)
+            repeat_cumulative_run_count(&settlement, &totals).unwrap_or(0)
         };
         if run_count == 0 {
             self.log("Tracker reward ignored: repeat response did not contain a valid cumulative run count.");
@@ -1241,23 +1241,20 @@ impl MacroState {
             Some(format!("finish:{finish_route}:{finish_start}"))
         } else { None };
         if let Some(key) = dedupe_key.as_deref() {
-            if self.tracker_sessions_file.exists() {
-                let file = fs::File::open(&self.tracker_sessions_file).map_err(|error| format!("Could not inspect tracker history: {error}"))?;
-                for line in std::io::BufReader::new(file).lines() {
-                    let line = line.map_err(|error| format!("Could not read tracker history: {error}"))?;
-                    if let Ok(existing) = serde_json::from_str::<Value>(&line) {
-                        if existing.get("dedupe_key").and_then(Value::as_str) == Some(key) {
-                            self.log(&format!("Tracker duplicate ignored (key {key})."));
-                            return Ok(());
-                        }
-                    }
-                }
+            let keys = self.tracker_dedupe_keys.lock()
+                .map_err(|_| "Tracker deduplication cache is unavailable".to_string())?;
+            if keys.contains(key) {
+                self.log(&format!("Tracker duplicate ignored (key {key})."));
+                return Ok(());
             }
         }
         let mut record = record;
         if let Some(key) = dedupe_key { record["dedupe_key"] = json!(key); }
-        match append_performance_record(&self.tracker_sessions_file, &record) {
+        match append_history_record(&self.tracker_sessions_file, &record) {
             Ok(()) => {
+                if let Some(key) = record.get("dedupe_key").and_then(Value::as_str) {
+                    if let Ok(mut keys) = self.tracker_dedupe_keys.lock() { keys.insert(key.to_string()); }
+                }
                 self.log(&format!("Tracker reward saved (dungeon {}, path {}, batch {}, runs {}).", dungeon_id.as_deref().unwrap_or("unknown"), path, batch_id, run_count));
                 Ok(())
             }
@@ -1271,16 +1268,13 @@ impl MacroState {
     fn tracker_read_data(&self) -> Result<Vec<Value>, String> {
         let _history_guard = self.tracker_data_lock.lock()
             .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
-        if !self.tracker_sessions_file.exists() { return Ok(Vec::new()); }
-        let file = fs::File::open(&self.tracker_sessions_file)
-            .map_err(|error| format!("Could not open tracker data file: {error}"))?;
+        let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
         let mut records = Vec::new();
-        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|error| format!("Could not read tracker data line {}: {error}", index + 1))?;
-            if line.trim().is_empty() { continue; }
-            let record = serde_json::from_str::<Value>(&line)
-                .map_err(|error| format!("Tracker data is invalid at line {}: {error}", index + 1))?;
-            records.push(record);
+        let mut malformed_lines = 0usize;
+        read_jsonl_records(&backup_file, &mut records, &mut malformed_lines)?;
+        read_jsonl_records(&self.tracker_sessions_file, &mut records, &mut malformed_lines)?;
+        if malformed_lines > 0 {
+            self.log(&format!("Run History skipped {malformed_lines} malformed JSONL record(s); valid records remain available."));
         }
         Ok(records)
     }
@@ -1289,9 +1283,18 @@ impl MacroState {
         let _history_guard = self.tracker_data_lock.lock()
             .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
 
-        // Replace the active JSONL file atomically so a failed clear cannot leave
-        // a partially truncated history file. The rotation backup is not read by
-        // Run History, but remove it as part of the user's explicit clear action.
+        // A user-requested clear also removes legacy migration copies, otherwise
+        // an old source file could be imported again on the next application start.
+        let migrated_legacy_file = self.tracker_legacy_file.with_extension("jsonl.migrated");
+        for legacy_copy in [&self.tracker_legacy_file, &migrated_legacy_file] {
+            match fs::remove_file(legacy_copy) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("Could not remove a legacy Run History recovery copy: {error}")),
+            }
+        }
+        // Replace the active JSONL file atomically. Run History also reads the
+        // legacy rotation backup, so an explicit user clear removes both files.
         write_file_atomically(&self.tracker_sessions_file, b"")?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
         match fs::remove_file(&backup_file) {
@@ -1299,6 +1302,7 @@ impl MacroState {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("Run History was cleared, but its old backup could not be removed: {error}")),
         }
+        if let Ok(mut keys) = self.tracker_dedupe_keys.lock() { keys.clear(); }
         self.log("Run History cleared by the user.");
         Ok(())
     }
@@ -1330,25 +1334,94 @@ fn activity_name(mode: u8) -> &'static str {
     }
 }
 
-// Keep the diagnostics file bounded. The previous file is retained as a small
-// rollover backup in case a user needs to compare two adjacent periods.
-fn append_performance_record(path: &Path, record: &Value) -> Result<(), String> {
+// Serialize each JSONL record into one buffer before appending. Diagnostics may
+// rotate; user-facing Run History must never rotate away records automatically.
+fn append_jsonl_record(path: &Path, record: &Value, rotate: bool) -> Result<(), String> {
     const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    if fs::metadata(path).map(|metadata| metadata.len() >= MAX_LOG_BYTES).unwrap_or(false) {
+    if rotate && fs::metadata(path).map(|metadata| metadata.len() >= MAX_LOG_BYTES).unwrap_or(false) {
         let previous = path.with_extension("jsonl.1");
         let _ = fs::remove_file(&previous);
         fs::rename(path, previous).map_err(|error| error.to_string())?;
     }
+    let mut bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut file, record).map_err(|error| error.to_string())?;
-    file.write_all(b"\n").map_err(|error| error.to_string())
+    file.write_all(&bytes).map_err(|error| error.to_string())
+}
+
+fn append_performance_record(path: &Path, record: &Value) -> Result<(), String> {
+    append_jsonl_record(path, record, true)
+}
+
+fn append_history_record(path: &Path, record: &Value) -> Result<(), String> {
+    append_jsonl_record(path, record, false)
+}
+
+fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
+    if !path.exists() { return Ok(()); }
+    let file = fs::File::open(path).map_err(|error| format!("Could not open tracker data file: {error}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)
+            .map_err(|error| format!("Could not read tracker data: {error}"))?;
+        if bytes_read == 0 { break; }
+        while line.last().is_some_and(|last| *last == b'\n' || *last == b'\r') { line.pop(); }
+        if line.iter().all(u8::is_ascii_whitespace) { continue; }
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(record) => records.push(record),
+            Err(_) => *malformed_lines += 1,
+        }
+    }
+    Ok(())
+}
+
+fn load_history_dedupe_keys(backup: &Path, active: &Path) -> Result<HashSet<String>, String> {
+    let mut records = Vec::new();
+    let mut malformed_lines = 0usize;
+    read_jsonl_records(backup, &mut records, &mut malformed_lines)?;
+    read_jsonl_records(active, &mut records, &mut malformed_lines)?;
+    Ok(records.into_iter().filter_map(|record| {
+        record.get("dedupe_key").and_then(Value::as_str).map(str::to_string)
+    }).collect())
+}
+
+fn repeat_cumulative_run_count(settlement: &Value, totals: &Value) -> Option<u64> {
+    let valid = |object: &Value, key: &str| object.get(key).and_then(Value::as_u64)
+        .filter(|count| *count > 0 && *count <= 1_000_000);
+    // Observed game responses show settlement.runs is the current chunk (e.g. 10),
+    // while settlement.settled_runs and totals.* are cumulative batch totals.
+    valid(settlement, "settled_runs")
+        .or_else(|| valid(totals, "settled_runs"))
+        .or_else(|| valid(totals, "runs"))
+        .or_else(|| valid(totals, "wins"))
+}
+
+fn validate_macro_clicks(clicks: &[MacroClick]) -> Result<(), String> {
+    if clicks.len() > MAX_MACRO_CLICKS {
+        return Err(format!("The macro contains too many clicks (maximum {MAX_MACRO_CLICKS})"));
+    }
+    if clicks.iter().any(|click| {
+        !click.x.is_finite() || !click.y.is_finite()
+            || click.x < 0.0 || click.x > 1.0 || click.y < 0.0 || click.y > 1.0
+    }) {
+        return Err("The macro contains invalid click coordinates".to_string());
+    }
+    if clicks.iter().any(|click| click.elapsed_ms > MAX_MACRO_DURATION_MS) {
+        return Err("The macro contains a delay longer than the 24-hour safety limit".to_string());
+    }
+    if clicks.windows(2).any(|pair| pair[1].elapsed_ms < pair[0].elapsed_ms) {
+        return Err("The macro contains click timestamps that are out of order".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1649,27 +1722,27 @@ fn recording_bridge_ready(app: AppHandle<Wry>, state: State<'_, MacroState>) {
     refresh_tray_menu(&app);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tracker_diagnostic_event(event: String, details: Value, state: State<'_, MacroState>) -> Result<(), String> {
     state.tracker_diagnostic_event(&event, details)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tracker_dungeon_context(details: Value, state: State<'_, MacroState>) -> Result<(), String> {
     state.tracker_dungeon_context(details)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<(), String> {
     state.tracker_reward_event(details)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tracker_read_data(state: State<'_, MacroState>) -> Result<Vec<Value>, String> {
     state.tracker_read_data()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tracker_clear_history(state: State<'_, MacroState>) -> Result<(), String> {
     state.tracker_clear_history()
 }
@@ -1708,6 +1781,9 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
         .as_ref()
         .map(|instant| instant.elapsed().as_millis() as u64)
         .unwrap_or(0);
+    if elapsed_ms > MAX_MACRO_DURATION_MS {
+        return Err("Recording reached the 24-hour safety limit".to_string());
+    }
     let mut clicks = state
         .clicks
         .lock()
@@ -1715,6 +1791,9 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
     // Recheck after acquiring the data lock. This prevents a late IPC call from
     // appending a click after stop_recording has taken its save snapshot.
     if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
+        if clicks.len() >= MAX_MACRO_CLICKS {
+            return Err(format!("Recording reached the {MAX_MACRO_CLICKS}-click safety limit"));
+        }
         clicks.push(MacroClick {
             x: x.clamp(0.0, 1.0),
             y: y.clamp(0.0, 1.0),
@@ -1768,12 +1847,21 @@ fn stop_recording(app: &AppHandle<Wry>) {
     }));
     refresh_tray_menu(app);
     match state.save_macro() {
-        Ok(0) => notify(
-            app,
-            "BFR Macro — Recording stopped",
-            "No clicks were captured, so the previous saved macro was left unchanged.",
-            false,
-        ),
+        Ok(0) => {
+            // start_recording clears the in-memory buffer. Restore the last saved
+            // macro when this recording captured nothing, matching the file on disk.
+            if state.file.exists() {
+                if let Err(error) = state.load_macro() {
+                    state.log(&format!("Could not restore the previous saved macro after an empty recording: {error}"));
+                }
+            }
+            notify(
+                app,
+                "BFR Macro — Recording stopped",
+                "No clicks were captured, so the previous saved macro was kept.",
+                false,
+            );
+        },
         Ok(count) => notify(
             app,
             "BFR Macro — Recording saved",
@@ -1823,30 +1911,48 @@ fn start_recording(app: &AppHandle<Wry>) {
 }
 
 fn stop_playback(app: &AppHandle<Wry>) {
-    let Some(state) = app.try_state::<MacroState>() else {
-        return;
-    };
-    if state
-        .mode
-        .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        state.performance_event("playback_stopped", json!({}));
-        refresh_tray_menu(app);
-        notify(app, "BFR Macro — Playback stopped", "Macro playback has stopped.", false);
+    let Some(state) = app.try_state::<MacroState>() else { return; };
+    if state.mode.load(Ordering::SeqCst) == MODE_PLAYING {
+        // Invalidate the old worker before making the state available to a new one.
+        state.playback_generation.fetch_add(1, Ordering::SeqCst);
+        if state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            state.performance_event("playback_stopped", json!({}));
+            refresh_tray_menu(app);
+            notify(app, "BFR Macro — Playback stopped", "Macro playback has stopped.", false);
+        }
     }
 }
 
-fn wait_while_playing(state: &MacroState, duration: Duration) -> bool {
-    let deadline = Instant::now() + duration;
+fn playback_session_is_current(mode: u8, generation: u64, current_generation: u64) -> bool {
+    mode == MODE_PLAYING && generation == current_generation
+}
+
+struct PlaybackSessionGuard {
+    app: AppHandle<Wry>,
+    generation: u64,
+}
+
+impl Drop for PlaybackSessionGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app.try_state::<MacroState>() {
+            if state.playback_generation.load(Ordering::SeqCst) == self.generation
+                && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            {
+                state.performance_event("playback_worker_exited_unexpectedly", json!({}));
+                refresh_tray_menu(&self.app);
+            }
+        }
+    }
+}
+
+fn wait_while_playing_until(state: &MacroState, generation: u64, deadline: Instant) -> bool {
     loop {
-        if state.mode.load(Ordering::SeqCst) != MODE_PLAYING {
-            return false;
-        }
+        if !playback_session_is_current(
+            state.mode.load(Ordering::SeqCst), generation,
+            state.playback_generation.load(Ordering::SeqCst),
+        ) { return false; }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return state.mode.load(Ordering::SeqCst) == MODE_PLAYING;
-        }
+        if remaining.is_zero() { return true; }
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
@@ -1883,7 +1989,7 @@ fn discover_cdp_target(port: u16) -> Result<String, String> {
     let started = Instant::now();
     let mut last_error = String::from("WebView2 debugging endpoint is not ready yet");
     while started.elapsed() < CDP_DISCOVERY_TIMEOUT {
-        match ureq::get(&endpoint).call() {
+        match ureq::get(&endpoint).timeout(CDP_IO_TIMEOUT).call() {
             Ok(response) => match response.into_string() {
                 Ok(body) => match serde_json::from_str::<Vec<CdpTarget>>(&body) {
                     Ok(targets) => {
@@ -1997,12 +2103,10 @@ fn dispatch_click<S: Read + Write>(
     Ok(())
 }
 
-fn playback_failed(app: &AppHandle<Wry>, message: &str) {
+fn playback_failed(app: &AppHandle<Wry>, generation: u64, message: &str) {
     if let Some(state) = app.try_state::<MacroState>() {
-        if state
-            .mode
-            .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        if state.playback_generation.load(Ordering::SeqCst) == generation
+            && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
             state.performance_event("playback_failed", json!({ "message": message }));
             refresh_tray_menu(app);
@@ -2012,16 +2116,12 @@ fn playback_failed(app: &AppHandle<Wry>, message: &str) {
 }
 
 fn start_playback(app: AppHandle<Wry>) {
-    let Some(state) = app.try_state::<MacroState>() else {
-        return;
-    };
+    let Some(state) = app.try_state::<MacroState>() else { return; };
     if state.mode.load(Ordering::SeqCst) == MODE_PLAYING {
         stop_playback(&app);
         return;
     }
-    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
-        stop_recording(&app);
-    }
+    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING { stop_recording(&app); }
     let clicks = match state.clicks.lock() {
         Ok(clicks) => clicks.clone(),
         Err(_) => {
@@ -2033,83 +2133,84 @@ fn start_playback(app: AppHandle<Wry>) {
         notify(&app, "BFR Macro — No recording", "There is no saved macro to play. Record some clicks first.", true);
         return;
     }
-    if state
-        .mode
-        .compare_exchange(MODE_IDLE, MODE_PLAYING, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
+    if state.mode.compare_exchange(MODE_IDLE, MODE_PLAYING, Ordering::SeqCst, Ordering::SeqCst).is_err() { return; }
+    let generation = state.playback_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     let port = state.cdp_port;
     state.performance_event("playback_started", json!({ "click_count": clicks.len(), "loop_enabled": state.loop_enabled.load(Ordering::SeqCst) }));
     refresh_tray_menu(&app);
     notify(&app, "BFR Macro — Connecting", "Connecting to the game input channel…", false);
 
     thread::spawn(move || {
+        let Some(state) = app.try_state::<MacroState>() else { return; };
+        if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) { return; }
+        let _session_guard = PlaybackSessionGuard { app: app.clone(), generation };
+
         let websocket_url = match discover_cdp_target(port) {
             Ok(url) => url,
-            Err(error) => {
-                playback_failed(&app, &error);
-                return;
-            }
+            Err(error) => { playback_failed(&app, generation, &error); return; }
         };
-        let (mut socket, _) = match connect(websocket_url.as_str()) {
+        // The validated WebSocket URL is loopback-only. Connect with an explicit
+        // TCP timeout and bound all subsequent reads/writes so Stop can recover.
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let stream = match TcpStream::connect_timeout(&address, CDP_CONNECT_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(error) => { playback_failed(&app, generation, &format!("Could not connect to WebView2 input: {error}")); return; }
+        };
+        if let Err(error) = stream.set_read_timeout(Some(CDP_IO_TIMEOUT)).and_then(|_| stream.set_write_timeout(Some(CDP_IO_TIMEOUT))) {
+            playback_failed(&app, generation, &format!("Could not configure WebView2 input timeouts: {error}"));
+            return;
+        }
+        let (mut socket, _) = match tungstenite::client(websocket_url.as_str(), stream) {
             Ok(connection) => connection,
-            Err(error) => {
-                playback_failed(&app, &format!("Could not connect to WebView2 input: {error}"));
-                return;
-            }
+            Err(error) => { playback_failed(&app, generation, &format!("Could not complete WebView2 input handshake: {error}")); return; }
         };
         let mut next_id = 1_u64;
         if let Err(error) = viewport_size(&mut socket, &mut next_id) {
-            playback_failed(&app, &error);
+            playback_failed(&app, generation, &error);
             return;
         }
-        let Some(state) = app.try_state::<MacroState>() else {
-            return;
-        };
-        if state.mode.load(Ordering::SeqCst) != MODE_PLAYING {
-            return;
-        }
-        notify(
-            &app,
-            "BFR Macro — Playback started",
-            "The macro is running independently of your physical mouse and keyboard.",
-            false,
-        );
+        let Some(state) = app.try_state::<MacroState>() else { return; };
+        if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) { return; }
+        notify(&app, "BFR Macro — Playback started", "The macro is running independently of your physical mouse and keyboard.", false);
 
         let mut completed_normally = true;
         'playback: loop {
-            let mut previous_ms = 0_u64;
+            let loop_started = Instant::now();
             for click in &clicks {
                 let Some(state) = app.try_state::<MacroState>() else { return; };
-                if !wait_while_playing(&state, Duration::from_millis(click.elapsed_ms.saturating_sub(previous_ms))) {
+                let Some(deadline) = loop_started.checked_add(Duration::from_millis(click.elapsed_ms)) else {
+                    playback_failed(&app, generation, "The macro timing exceeded the supported duration.");
+                    return;
+                };
+                if !wait_while_playing_until(&state, generation, deadline) {
+                    completed_normally = false;
+                    break 'playback;
+                }
+                if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) {
                     completed_normally = false;
                     break 'playback;
                 }
                 let (width, height) = match viewport_size(&mut socket, &mut next_id) {
                     Ok(size) => size,
-                    Err(error) => {
-                        playback_failed(&app, &error);
-                        return;
-                    }
+                    Err(error) => { playback_failed(&app, generation, &error); return; }
                 };
                 let x = (click.x * width).clamp(0.0, width - 1.0);
                 let y = (click.y * height).clamp(0.0, height - 1.0);
                 if let Err(error) = dispatch_click(&mut socket, &mut next_id, x, y) {
-                    playback_failed(&app, &error);
+                    playback_failed(&app, generation, &error);
                     return;
                 }
-                previous_ms = click.elapsed_ms;
             }
 
             let Some(state) = app.try_state::<MacroState>() else { return; };
-            if state.mode.load(Ordering::SeqCst) != MODE_PLAYING
-                || !state.loop_enabled.load(Ordering::SeqCst)
-            {
-                break;
-            }
-            if !wait_while_playing(&state, LOOP_GAP) {
+            if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst))
+                || !state.loop_enabled.load(Ordering::SeqCst) { break; }
+            let last_offset = clicks.last().map(|click| Duration::from_millis(click.elapsed_ms)).unwrap_or_default();
+            let Some(next_loop_deadline) = loop_started.checked_add(last_offset).and_then(|deadline| deadline.checked_add(LOOP_GAP)) else {
+                playback_failed(&app, generation, "The macro loop timing exceeded the supported duration.");
+                return;
+            };
+            if !wait_while_playing_until(&state, generation, next_loop_deadline) {
                 completed_normally = false;
                 break;
             }
@@ -2117,10 +2218,8 @@ fn start_playback(app: AppHandle<Wry>) {
 
         if completed_normally {
             if let Some(state) = app.try_state::<MacroState>() {
-                if state
-                    .mode
-                    .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+                if state.playback_generation.load(Ordering::SeqCst) == generation
+                    && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
                 {
                     state.performance_event("playback_finished", json!({ "click_count": clicks.len() }));
                     refresh_tray_menu(&app);
@@ -2223,46 +2322,52 @@ fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()>
 fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result<()> {
     if !legacy.exists() { return Ok(()); }
     if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+    let recovery_copy = legacy.with_extension("jsonl.migrated");
     if !destination.exists() {
         fs::copy(legacy, destination)?;
-    } else {
-        let existing = fs::read_to_string(destination)?;
-        let mut output = fs::OpenOptions::new().append(true).open(destination)?;
-        for line in fs::read_to_string(legacy)?.lines() {
-            if !line.trim().is_empty() && !existing.lines().any(|saved| saved == line) {
-                writeln!(output, "{line}")?;
-            }
-        }
-        output.flush()?;
+        if !recovery_copy.exists() { fs::rename(legacy, recovery_copy)?; }
+        return Ok(());
     }
-    fs::remove_file(legacy)?;
-    if let Some(parent) = legacy.parent() { let _ = fs::remove_dir(parent); }
+
+    // Byte-based deduplication tolerates malformed UTF-8 and avoids the old
+    // O(legacy_lines × destination_lines) repeated scan. Keep a recovery copy.
+    let mut existing_lines: HashSet<Vec<u8>> = HashSet::new();
+    let destination_file = fs::File::open(destination)?;
+    for line in std::io::BufReader::new(destination_file).split(b'\n') {
+        let mut line = line?;
+        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
+        if !line.is_empty() { existing_lines.insert(line); }
+    }
+    let legacy_file = fs::File::open(legacy)?;
+    let mut output = fs::OpenOptions::new().create(true).append(true).open(destination)?;
+    for line in std::io::BufReader::new(legacy_file).split(b'\n') {
+        let mut line = line?;
+        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
+        if line.is_empty() || !existing_lines.insert(line.clone()) { continue; }
+        output.write_all(&line)?;
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
+    output.sync_all()?;
+    // Preserve the original bytes under a recovery suffix and stop re-importing
+    // the legacy path on every launch. If a prior recovery copy exists, leave the
+    // source in place; line deduplication still makes a later retry idempotent.
+    if !recovery_copy.exists() { fs::rename(legacy, recovery_copy)?; }
     Ok(())
 }
 
-// Preserve the one-time Run History cleanup marker introduced in dev.3. Its exact
-// path is intentionally retained across releases so upgrading from dev.3 never
-// clears history a second time. The marker lives outside Logs and survives log cleanup.
-fn reset_run_history_once(app_data_dir: &Path, history_file: &Path) -> Result<bool, String> {
+// Preserve the historical marker path for upgrade compatibility, but never clear
+// user history as part of startup. The marker lives outside Logs and survives cleanup.
+fn reset_run_history_once(app_data_dir: &Path, _history_file: &Path) -> Result<bool, String> {
     let marker_file = app_data_dir
         .join("Settings")
         .join("run-history-reset-v1.5.1-dev.3.done");
-    if marker_file.exists() {
-        return Ok(false);
-    }
+    if marker_file.exists() { return Ok(false); }
 
-    write_file_atomically(history_file, b"")?;
-
-    // The dashboard reads only the active file. Remove its one-generation
-    // rotation backup too, so the old history is not left behind on disk.
-    let backup_file = history_file.with_extension("jsonl.1");
-    match fs::remove_file(&backup_file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Run History was cleared, but its old backup could not be removed: {error}")),
-    }
-
-    write_file_atomically(&marker_file, b"Completed once for the legacy Run History cleanup safeguard.\n")?;
+    // The old dev-only safeguard erased history on first launch for users who
+    // never ran that development build. Mark the safeguard as handled without
+    // deleting the active history or its legacy rotation backup.
+    write_file_atomically(&marker_file, b"Non-destructive safeguard retained existing Run History.\n")?;
     Ok(true)
 }
 
@@ -2286,14 +2391,16 @@ fn open_tracker_window(app: &AppHandle<Wry>) {
     let (width, height, pinned) = app.try_state::<SettingsState>()
         .and_then(|state| state.settings.lock().ok().map(|s| (s.tracker_width, s.tracker_height, s.tracker_pinned)))
         .unwrap_or((760.0, 820.0, false));
-    match WebviewWindowBuilder::new(app, "tracker", WebviewUrl::App("tracker.html".into()))
+    let profile_dir = app.path().app_data_dir().ok().map(|path| path.join("webview2-profile"));
+    let mut builder = WebviewWindowBuilder::new(app, "tracker", WebviewUrl::App("tracker.html".into()))
         .title("BFR Macro — Run History")
         .inner_size(width, height)
         .min_inner_size(560.0, 600.0)
         .resizable(true)
         .always_on_top(pinned)
-        .center()
-        .build()
+        .center();
+    if let Some(profile_dir) = profile_dir { builder = builder.data_directory(profile_dir); }
+    match builder.build()
     {
         Ok(window) => {
             let handle = app.clone();
@@ -2308,9 +2415,11 @@ fn open_tracker_window(app: &AppHandle<Wry>) {
                             settings.tracker_width = size.width as f64 / scale;
                             settings.tracker_height = size.height as f64 / scale;
                         }
-                        if let Err(error) = state.save() {
+                        // Coalesce resize drags through the same 400 ms background
+                        // saver used by the main game window; never sync disk here.
+                        if state.resize_save_tx.send(()).is_err() {
                             if let Some(macro_state) = handle.try_state::<MacroState>() {
-                                macro_state.log(&format!("Could not save tracker window size: {error}"));
+                                macro_state.log("Could not queue the resized Run History window dimensions for saving.");
                             }
                         }
                     }
@@ -2586,7 +2695,10 @@ pub fn run() {
             fs::create_dir_all(&settings_dir)?;
             fs::create_dir_all(&macros_dir)?;
             fs::create_dir_all(&logs_dir)?;
-            migrate_tracker_history(&app_data.join("tracker-data").join("battle-rewards.jsonl"), &logs_dir.join("battle-rewards.jsonl"))?;
+            let tracker_migration_error = migrate_tracker_history(
+                &app_data.join("tracker-data").join("battle-rewards.jsonl"),
+                &logs_dir.join("battle-rewards.jsonl"),
+            ).err();
 
             // One-time, non-destructive migration from the original 0.5.1 data layout.
             migrate_legacy_file(&app_data.join("settings.json"), &settings_dir.join("settings.json"))?;
@@ -2614,8 +2726,13 @@ pub fn run() {
             let performance_file = logs_dir.join("performance.jsonl");
             let tracker_diagnostics_file = logs_dir.join("tracker-discovery.jsonl");
             let tracker_sessions_file = logs_dir.join("battle-rewards.jsonl");
-            let run_history_reset = reset_run_history_once(&app_data, &tracker_sessions_file)
-                .map_err(std::io::Error::other)?;
+            let tracker_context_file = logs_dir.join("tracker-context.jsonl");
+            let tracker_legacy_file = app_data.join("tracker-data").join("battle-rewards.jsonl");
+            let tracker_backup_file = tracker_sessions_file.with_extension("jsonl.1");
+            let tracker_dedupe_keys = load_history_dedupe_keys(&tracker_backup_file, &tracker_sessions_file);
+            let run_history_reset_result = reset_run_history_once(&app_data, &tracker_sessions_file);
+            let run_history_reset = run_history_reset_result.as_ref().copied().unwrap_or(false);
+            let run_history_marker_error = run_history_reset_result.err();
             let cdp_port = find_free_local_port().map_err(std::io::Error::other)?;
             let existing_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
             // The Rust CDP client does not send a browser Origin header, so the
@@ -2637,18 +2754,35 @@ pub fn run() {
                 performance_file: performance_file.clone(),
                 tracker_diagnostics_file,
                 tracker_sessions_file,
+                tracker_context_file,
+                tracker_legacy_file,
                 tracker_data_lock: Mutex::new(()),
+                tracker_dedupe_keys: Mutex::new(tracker_dedupe_keys.as_ref().cloned().unwrap_or_default()),
                 cdp_port,
                 mode: AtomicU8::new(MODE_IDLE),
+                playback_generation: AtomicU64::new(0),
                 bridge_ready: AtomicBool::new(false),
                 record_started: Mutex::new(None),
                 clicks: Mutex::new(Vec::new()),
                 loop_enabled: AtomicBool::new(settings.loop_enabled),
             };
             if run_history_reset {
-                macro_state.log("The one-time legacy Run History cleanup safeguard ran; settings and saved macros were preserved.");
+                macro_state.log("The one-time non-destructive Run History safeguard was marked; existing history, settings and saved macros were preserved.");
             }
-            let _ = macro_state.load_macro();
+            if let Some(error) = tracker_migration_error {
+                macro_state.log(&format!("Legacy Run History migration could not complete; the original file was retained for recovery: {error}"));
+            }
+            if let Some(error) = run_history_marker_error {
+                macro_state.log(&format!("Could not write the non-destructive Run History marker; startup continued without changing history: {error}"));
+            }
+            if let Err(error) = tracker_dedupe_keys {
+                macro_state.log(&format!("Could not pre-load Run History duplicate keys; new events will still be recorded: {error}"));
+            }
+            if macro_state.file.exists() {
+                if let Err(error) = macro_state.load_macro() {
+                    macro_state.log(&format!("Saved macro could not be loaded at startup: {error}"));
+                }
+            }
             let (resize_save_tx, resize_save_rx) = mpsc::channel::<()>();
             app.manage(SettingsState {
                 file: settings_file,
@@ -2794,4 +2928,101 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running BFR Macro & Tracking Utility");
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bfr-{label}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_reset_marker_never_erases_existing_history_or_backup() {
+        let dir = temp_dir("history-reset");
+        let history = dir.join("Logs/battle-rewards.jsonl");
+        let backup = history.with_extension("jsonl.1");
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        fs::write(&history, b"{\"record_type\":\"battle_reward\"}\n").unwrap();
+        fs::write(&backup, b"older-history\n").unwrap();
+        assert!(reset_run_history_once(&dir, &history).unwrap());
+        assert_eq!(fs::read(&history).unwrap(), b"{\"record_type\":\"battle_reward\"}\n");
+        assert_eq!(fs::read(&backup).unwrap(), b"older-history\n");
+        assert!(!reset_run_history_once(&dir, &history).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeat_run_count_uses_cumulative_fields_not_chunk_runs() {
+        let settlement = json!({"runs": 10, "wins": 10, "settled_runs": 20});
+        let totals = json!({"runs": 20, "wins": 20, "settled_runs": 20});
+        assert_eq!(repeat_cumulative_run_count(&settlement, &totals), Some(20));
+        let chunk_only = json!({"runs": 10, "wins": 10});
+        assert_eq!(repeat_cumulative_run_count(&chunk_only, &Value::Null), None);
+    }
+
+    #[test]
+    fn macro_validation_rejects_absurd_delays_and_click_counts() {
+        let absurd = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: u64::MAX }];
+        assert!(validate_macro_clicks(&absurd).is_err());
+        let too_many = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 0 }; MAX_MACRO_CLICKS + 1];
+        assert!(validate_macro_clicks(&too_many).is_err());
+    }
+
+    #[test]
+    fn playback_generation_invalidates_the_previous_worker() {
+        assert!(playback_session_is_current(MODE_PLAYING, 7, 7));
+        assert!(!playback_session_is_current(MODE_PLAYING, 7, 8));
+        assert!(!playback_session_is_current(MODE_IDLE, 7, 7));
+    }
+
+    #[test]
+    fn history_records_do_not_rotate_and_corrupt_lines_are_skipped() {
+        let dir = temp_dir("history-jsonl");
+        let history = dir.join("battle-rewards.jsonl");
+        let backup = history.with_extension("jsonl.1");
+        fs::write(&backup, b"{\"record_type\":\"battle_reward\",\"n\":1}\n").unwrap();
+        fs::write(&history, b"not-json\n{\"record_type\":\"battle_reward\",\"n\":2}\n").unwrap();
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(&backup, &mut records, &mut malformed).unwrap();
+        read_jsonl_records(&history, &mut records, &mut malformed).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(malformed, 1);
+        // Cross the diagnostics rotation threshold, then append again: history
+        // writes must not rotate the active file or discard the prior backup.
+        let large_record = json!({"record_type":"battle_reward","payload":"x".repeat(5 * 1024 * 1024)});
+        append_history_record(&history, &large_record).unwrap();
+        assert!(fs::metadata(&history).unwrap().len() > 5 * 1024 * 1024);
+        append_history_record(&history, &json!({"record_type":"battle_reward","n":3})).unwrap();
+        assert!(backup.exists());
+        assert!(fs::read_to_string(&backup).unwrap().contains("\"n\":1"));
+        assert!(fs::metadata(&history).unwrap().len() > 5 * 1024 * 1024);
+        assert_eq!(fs::read_to_string(&history).unwrap().lines().count(), 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tracker_history_migration_keeps_legacy_copy_and_deduplicates() {
+        let dir = temp_dir("history-migration");
+        let legacy = dir.join("legacy.jsonl");
+        let destination = dir.join("Logs/battle-rewards.jsonl");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"same\nnew\n").unwrap();
+        fs::write(&destination, b"same\n").unwrap();
+        migrate_tracker_history(&legacy, &destination).unwrap();
+        let recovery_copy = legacy.with_extension("jsonl.migrated");
+        assert!(!legacy.exists(), "migrated legacy path should not be imported again");
+        assert!(recovery_copy.exists(), "legacy history must remain as a recovery copy");
+        assert_eq!(fs::read(&recovery_copy).unwrap(), b"same\nnew\n");
+        assert_eq!(fs::read_to_string(&destination).unwrap().lines().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

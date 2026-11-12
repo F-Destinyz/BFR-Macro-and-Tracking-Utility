@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tracker-reward-event"
+description = "Enables the tracker_reward_event command without any pre-configured scope."
+commands.allow = ["tracker_reward_event"]
+
+[[permission]]
+identifier = "deny-tracker-reward-event"
+description = "Denies the tracker_reward_event command without any pre-configured scope."
+commands.deny = ["tracker_reward_event"]

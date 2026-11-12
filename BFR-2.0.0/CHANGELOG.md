@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — Reliability and data-preservation fixes
+
+- Remove the startup history wipe; first launch now marks the legacy safeguard without deleting active history or its rotation backup, and marker-write failures no longer prevent startup.
+- Stop automatic rotation of user-facing battle history, read legacy `.jsonl.1` backups, isolate dungeon-context diagnostics in `tracker-context.jsonl`, and skip malformed history lines while retaining valid records.
+- Make legacy history migration non-destructive and idempotent, preserve the source as a `.migrated` recovery copy, and use a preloaded deduplication-key cache for repeat snapshots.
+- Prefer cumulative `settled_runs`/`totals` counters over per-chunk `settlement.runs`, based on captured game response diagnostics.
+- Scope playback workers by generation, bound local CDP connection/read/write timeouts, recover playback state after unexpected worker exit, and schedule clicks against the recorded timeline.
+- Validate macro file size, click count, coordinates, timestamps, and maximum delay; restore the prior saved macro after an empty recording.
+- Reduce remote game-page permissions to the custom game bridge, share the configured WebView2 profile with Run History, debounce tracker-window resize saves, and avoid layout-forcing text reads during click capture.
+- Add Rust unit tests and run Rust tests and Clippy in the Windows release helper.
+
 ## 2.0.0 — Stable release
 
 - Promote the tested 1.5.1 development line to a stable release after live Windows regression testing.

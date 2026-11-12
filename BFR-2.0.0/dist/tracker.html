@@ -26,7 +26,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 let rewards=[];
 function dungeonLabel(r){const id=String(r.dungeon_id||'').trim();return r.dungeon_name||(id?`Run ID: ${id}`:'Unknown run ID')}
 function rewardData(r){return (r.batch_id&&r.totals&&Object.keys(r.totals).length)?r.totals:(r.settlement||r.totals||{})}
-function legacyRunCount(r){const settlement=r.settlement||{},totals=r.totals||{};const count=settlement.settled_runs??settlement.runs??settlement.wins??totals.settled_runs??totals.runs??totals.wins;return Number(r.run_count??(r.path==='/api/battles/finish'?1:(count??0)))}
+function legacyRunCount(r){const settlement=r.settlement||{},totals=r.totals||{};const count=settlement.settled_runs??totals.settled_runs??totals.runs??totals.wins??settlement.runs??settlement.wins;return Number(r.run_count??(r.path==='/api/battles/finish'?1:(count??0)))}
 function normalize(records){
  const raw=records.filter(r=>r&&r.record_type==='battle_reward').sort((a,b)=>Number(a.timestamp_unix_ms||0)-Number(b.timestamp_unix_ms||0));
  const byBatch=new Map(),singles=[];

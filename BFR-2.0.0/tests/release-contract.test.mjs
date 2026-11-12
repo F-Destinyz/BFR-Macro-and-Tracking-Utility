@@ -51,7 +51,9 @@ test('stable application identifier and data paths remain compatible', () => {
 test('one-time history cleanup guard is retained without creating a new release reset', () => {
   assert.match(rust, /if marker_file\.exists\(\)\s*\{\s*return Ok\(false\);/);
   assert.match(rust, /tracker_sessions_file\)/);
-  assert.match(rust, /The one-time legacy Run History cleanup safeguard ran/);
+  assert.match(rust, /Non-destructive safeguard retained existing Run History/);
+  assert.match(rust, /existing history, settings and saved macros were preserved/);
+  assert.doesNotMatch(rust.slice(rust.indexOf('fn reset_run_history_once'), rust.indexOf('fn open_data_folder')), /write_file_atomically\(history_file, b\"\"\)/);
   assert.match(readme, /Do not change it without adding and testing an explicit data migration/);
 });
 
@@ -90,6 +92,8 @@ test('Run History clear remains confirmation-protected and does not target setti
   assert.match(trackerHtml, /invoke\('tracker_clear_history'\)/);
   assert.match(rust, /fn tracker_clear_history/);
   assert.match(rust, /battle-rewards\.jsonl/);
+  assert.match(rust, /tracker_legacy_file\.with_extension\(\"jsonl\.migrated\"\)/);
+  assert.match(rust, /for legacy_copy in \[&self\.tracker_legacy_file, &migrated_legacy_file\]/);
 });
 
 test('minimize-to-tray still hides the game window and requests background memory target', () => {
@@ -177,6 +181,86 @@ test('stable documentation contains no development-only release notes or retired
   assert.doesNotMatch(`${readme}\n${changelog}`, /F8|F9|F10/);
   assert.match(readme, /Macro controls are operated through the tray menu/);
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
+});
+
+test('Run History preserves old backups, does not rotate, and skips malformed lines', () => {
+  assert.match(rust, /fn append_history_record\(path: &Path, record: &Value\)/);
+  assert.match(rust, /append_history_record\(&self\.tracker_sessions_file, &record\)/);
+  assert.match(rust, /read_jsonl_records\(&backup_file, &mut records, &mut malformed_lines\)/);
+  assert.match(rust, /malformed JSONL record/);
+  assert.match(rust, /tracker_context_file/);
+});
+
+test('repeat batch normalization prefers cumulative settled-run counters', () => {
+  assert.match(rust, /fn repeat_cumulative_run_count/);
+  assert.match(rust, /valid\(settlement, "settled_runs"\)[\s\S]*valid\(totals, "settled_runs"\)[\s\S]*valid\(totals, "runs"\)/);
+  const start = trackerHtml.indexOf('function legacyRunCount(');
+  const end = trackerHtml.indexOf('function normalize(', start);
+  const source = trackerHtml.slice(start, end);
+  const legacyRunCount = vm.runInNewContext(`${source}\nlegacyRunCount;`, { Number });
+  assert.equal(legacyRunCount({ path: '/api/battles/repeat', settlement: { runs: 10, settled_runs: 20 }, totals: { runs: 20 } }), 20);
+});
+
+test('remote game capability grants only the custom game bridge commands', () => {
+  const capability = JSON.parse(read('src-tauri/capabilities/default.json'));
+  assert.deepEqual(capability.permissions, ['allow-game-recording-bridge']);
+  assert.deepEqual(capability.remote.urls, ['https://rebornbf.com/*']);
+});
+
+test('playback sessions are generation-scoped and CDP I/O is time-bounded', () => {
+  assert.match(rust, /playback_generation: AtomicU64/);
+  assert.match(rust, /playback_session_is_current/);
+  assert.match(rust, /TcpStream::connect_timeout/);
+  assert.match(rust, /set_read_timeout\(Some\(CDP_IO_TIMEOUT\)\)/);
+  assert.match(rust, /set_write_timeout\(Some\(CDP_IO_TIMEOUT\)\)/);
+  assert.match(rust, /struct PlaybackSessionGuard/);
+});
+
+test('macro loading enforces size, click-count and delay limits', () => {
+  assert.match(rust, /MAX_MACRO_FILE_BYTES/);
+  assert.match(rust, /MAX_MACRO_CLICKS/);
+  assert.match(rust, /MAX_MACRO_DURATION_MS/);
+  assert.match(rust, /validate_macro_clicks/);
+});
+
+test('macro edge cases restore the previous save and reject overlong recordings', () => {
+  assert.match(rust, /No clicks were captured, so the previous saved macro was kept/);
+  assert.match(rust, /state\.load_macro\(\)/);
+  assert.match(rust, /Recording reached the 24-hour safety limit/);
+  assert.match(rust, /Recording reached the \{MAX_MACRO_CLICKS\}-click safety limit/);
+});
+
+test('click capture avoids layout reads on large non-interactive ancestors', () => {
+  assert.match(rust, /tag === 'html' \|\| tag === 'body'/);
+  assert.match(rust, /interactive \? \(node\.innerText \|\| node\.textContent/);
+});
+
+test('macro playback follows the original absolute click timeline', () => {
+  assert.match(rust, /loop_started\.checked_add\(Duration::from_millis\(click\.elapsed_ms\)\)/);
+  assert.match(rust, /checked_add\(LOOP_GAP\)/);
+});
+
+test('disk-heavy tracker IPC commands run away from the UI thread', () => {
+  for (const name of ['tracker_diagnostic_event', 'tracker_dungeon_context', 'tracker_reward_event', 'tracker_read_data', 'tracker_clear_history']) {
+    assert.match(rust, new RegExp(`#\\[tauri::command\\(async\\)\\]\\s*fn ${name}`));
+  }
+  assert.match(rust, /tracker_dedupe_keys: Mutex<HashSet<String>>/);
+  assert.match(rust, /load_history_dedupe_keys/);
+});
+
+test('tracker resize saves are debounced and tracker shares the game WebView2 profile', () => {
+  const trackerStart = rust.indexOf('fn open_tracker_window(');
+  const trackerEnd = rust.indexOf('fn build_tray(', trackerStart);
+  const trackerWindow = rust.slice(trackerStart, trackerEnd);
+  assert.match(trackerWindow, /data_directory\(profile_dir\)/);
+  assert.match(trackerWindow, /resize_save_tx\.send\(\(\)\)/);
+  assert.doesNotMatch(trackerWindow, /state\.save\(\)/);
+});
+
+test('release helper runs Rust checks before producing the Windows installer', () => {
+  const script = read('BUILD_WINDOWS_RELEASE.ps1');
+  assert.match(script, /cargo.*test.*--locked/i);
+  assert.match(script, /cargo.*clippy.*--locked/i);
 });
 
 test('all icons embedded by the Rust tray implementation exist', () => {

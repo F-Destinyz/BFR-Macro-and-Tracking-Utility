@@ -8,9 +8,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-        mpsc,
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -38,6 +37,7 @@ const MAX_MACRO_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
 const MODE_IDLE: u8 = 0;
 const MODE_RECORDING: u8 = 1;
 const MODE_PLAYING: u8 = 2;
+const MODE_STOPPING: u8 = 3;
 
 // Write beside the destination, flush the temporary file, then replace the old
 // file. Keeping the temporary file on the same volume allows replacement to be
@@ -46,14 +46,27 @@ fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), String>
     use std::sync::atomic::AtomicU64;
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    let parent = destination.parent().ok_or_else(|| "File destination has no parent directory".to_string())?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "File destination has no parent directory".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let file_name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("data");
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("data");
     let mut temporary = None;
     for _ in 0..10 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), sequence));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
                     let _ = fs::remove_file(&candidate);
@@ -67,7 +80,8 @@ fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), String>
             Err(error) => return Err(error.to_string()),
         }
     }
-    let temporary = temporary.ok_or_else(|| "Could not create a temporary save file".to_string())?;
+    let temporary =
+        temporary.ok_or_else(|| "Could not create a temporary save file".to_string())?;
     let result = replace_file(&temporary, destination);
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -85,11 +99,23 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let success = unsafe {
-        MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     };
-    if success == 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok(()) }
+    if success == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -544,7 +570,8 @@ const INJECTION_SCRIPT: &str = r#"
         console.error('[BFR Tracker] Tauri invoke bridge unavailable; reward was not persisted.');
         return;
       }
-      invoke('tracker_reward_event', { details }).then(() => {
+      invoke('tracker_reward_event', { details }).then((persisted) => {
+        if (!persisted) return;
         invoke('tracker_diagnostic_event', { event: 'reward_persisted', details: {
           dungeon_id: String(details.dungeon_id || '').slice(0, 40),
           settled_runs: Number(details.settlement?.settled_runs || 0)
@@ -739,11 +766,19 @@ struct SettingsState {
     file: PathBuf,
     settings: Mutex<AppSettings>,
     save_lock: Mutex<()>,
+    // If existing settings could not be read safely, refuse writes so defaults
+    // cannot overwrite the user's original file before manual recovery.
+    save_blocked_reason: Option<String>,
     resize_save_tx: mpsc::Sender<()>,
 }
 
 impl SettingsState {
     fn save(&self) -> Result<(), String> {
+        if let Some(reason) = &self.save_blocked_reason {
+            return Err(format!(
+                "Settings were not saved to protect the existing settings file: {reason}"
+            ));
+        }
         // Serialize save operations so concurrent tray/resize saves cannot overwrite
         // a newer snapshot with an older one.
         let _save_guard = self
@@ -800,7 +835,12 @@ fn begin_recording_if_idle(
         .map_err(|_| "Macro data is unavailable".to_string())?;
 
     if mode
-        .compare_exchange(MODE_IDLE, MODE_RECORDING, Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(
+            MODE_IDLE,
+            MODE_RECORDING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
         .is_err()
     {
         return Ok(false);
@@ -839,23 +879,48 @@ fn begin_playback_if_idle(
 }
 
 impl MacroState {
-    fn save_macro(&self) -> Result<usize, String> {
-        let clicks = self
-            .clicks
-            .lock()
-            .map_err(|_| "Macro data is unavailable".to_string())?
-            .clone();
+    fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
         if clicks.is_empty() {
             return Ok(0);
         }
-        validate_macro_clicks(&clicks)?;
+        validate_macro_clicks(clicks)?;
         let count = clicks.len();
         let data = MacroFile {
             format: "BFRMACRO3".to_string(),
-            clicks,
+            clicks: clicks.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
         write_file_atomically(&self.file, &bytes)?;
+        Ok(count)
+    }
+
+    // Restore the last saved macro into memory while new recording/playback/load
+    // operations are still blocked by MODE_STOPPING.
+    fn restore_saved_macro_during_stopping(&self) -> Result<usize, String> {
+        if !self.file.exists() {
+            return Ok(0);
+        }
+        let metadata = fs::metadata(&self.file).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_MACRO_FILE_BYTES {
+            return Err("The saved macro is too large to restore safely".to_string());
+        }
+        let bytes = fs::read(&self.file).map_err(|error| error.to_string())?;
+        let data: MacroFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
+            return Err("This macro file format is not supported".to_string());
+        }
+        validate_macro_clicks(&data.clicks)?;
+        let count = data.clicks.len();
+        let mut clicks = self
+            .clicks
+            .lock()
+            .map_err(|_| "Macro data is unavailable".to_string())?;
+        if self.mode.load(Ordering::SeqCst) != MODE_STOPPING {
+            return Err(
+                "Recording state changed before the previous macro could be restored".to_string(),
+            );
+        }
+        *clicks = data.clicks;
         Ok(count)
     }
 
@@ -918,7 +983,25 @@ impl MacroState {
 
     fn tracker_diagnostic_event(&self, event: &str, details: Value) -> Result<(), String> {
         let safe_event = match event {
-            "observer_started" | "resource_seen" | "observer_error" | "dungeon_context_seen" | "begin_quest_click_seen" | "repeat_action_click_seen" | "repeat_batch_click_seen" | "repeat_battles_click_seen" | "battle_response_seen" | "battle_response_schema_seen" | "api_response_schema_seen" | "dungeon_metadata_seen" | "reward_persisted" | "reward_persist_failed" | "network_activity" | "websocket_activity" | "dom_activity" | "navigation_activity" | "observer_status" => event,
+            "observer_started"
+            | "resource_seen"
+            | "observer_error"
+            | "dungeon_context_seen"
+            | "begin_quest_click_seen"
+            | "repeat_action_click_seen"
+            | "repeat_batch_click_seen"
+            | "repeat_battles_click_seen"
+            | "battle_response_seen"
+            | "battle_response_schema_seen"
+            | "api_response_schema_seen"
+            | "dungeon_metadata_seen"
+            | "reward_persisted"
+            | "reward_persist_failed"
+            | "network_activity"
+            | "websocket_activity"
+            | "dom_activity"
+            | "navigation_activity"
+            | "observer_status" => event,
             _ => return Err("Unsupported tracker diagnostic event".to_string()),
         };
         let safe_details = match safe_event {
@@ -939,7 +1022,10 @@ impl MacroState {
                 "dom": details.get("dom").and_then(Value::as_bool).unwrap_or(false),
                 "performance_resource": details.get("performance_resource").and_then(Value::as_bool).unwrap_or(false)
             }),
-            "begin_quest_click_seen" | "repeat_action_click_seen" | "repeat_batch_click_seen" | "repeat_battles_click_seen" => json!({
+            "begin_quest_click_seen"
+            | "repeat_action_click_seen"
+            | "repeat_batch_click_seen"
+            | "repeat_battles_click_seen" => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
                 "action_kind": details.get("action_kind").and_then(Value::as_str).filter(|v| ["batch", "battles", "generic"].contains(v)).unwrap_or("begin_quest"),
@@ -949,11 +1035,27 @@ impl MacroState {
             }),
             "dungeon_context_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" { return Ok(()); }
+                if host != "rebornbf.com" {
+                    return Ok(());
+                }
                 let route = details.get("route").and_then(Value::as_str).unwrap_or("");
-                if !route.starts_with("/dungeons/") && !route.starts_with("/start/") { return Ok(()); }
-                let safe_id = details.get("dungeon_id").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 40 && v.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))).unwrap_or("");
-                let name = details.get("dungeon_name").and_then(Value::as_str).unwrap_or("");
+                if !route.starts_with("/dungeons/") && !route.starts_with("/start/") {
+                    return Ok(());
+                }
+                let safe_id = details
+                    .get("dungeon_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| {
+                        !v.is_empty()
+                            && v.len() <= 40
+                            && v.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+                    })
+                    .unwrap_or("");
+                let name = details
+                    .get("dungeon_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 json!({
                     "host": host,
                     "route": route.chars().take(200).collect::<String>(),
@@ -961,12 +1063,16 @@ impl MacroState {
                     "dungeon_name": name.chars().take(100).filter(|c| !c.is_control()).collect::<String>(),
                     "source": details.get("source").and_then(Value::as_str).unwrap_or("route").chars().take(40).collect::<String>()
                 })
-            },
+            }
             "resource_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" { return Ok(()); }
+                if host != "rebornbf.com" {
+                    return Ok(());
+                }
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if !path.starts_with('/') || path.contains('?') || path.contains('#') { return Ok(()); }
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
+                    return Ok(());
+                }
                 json!({
                     "host": host,
                     "path": path.chars().take(300).collect::<String>(),
@@ -975,25 +1081,44 @@ impl MacroState {
                     "transfer_size": details.get("transfer_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000),
                     "encoded_body_size": details.get("encoded_body_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000)
                 })
-            },
+            }
             "battle_response_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
-                let method = details.get("method").and_then(Value::as_str).unwrap_or("GET");
-                let content_type = details.get("content_type").and_then(Value::as_str).unwrap_or("");
+                if host != "rebornbf.com"
+                    || !(path == "/api/battles/repeat" || path == "/api/battles/finish")
+                {
+                    return Ok(());
+                }
+                let method = details
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GET");
+                let content_type = details
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let mut safe_fields = Vec::new();
                 if let Some(fields) = details.get("fields").and_then(Value::as_array) {
                     for field in fields.iter().take(80) {
                         let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
                         let lower = field_path.to_ascii_lowercase();
-                        if field_path.is_empty() || field_path.len() > 180
-                            || lower.contains("token") || lower.contains("auth")
-                            || lower.contains("cookie") || lower.contains("password")
-                            || lower.contains("account") || lower.contains("player")
-                            || lower.contains("session") || lower.contains("email")
-                        { continue; }
-                        let Some(value) = field.get("value") else { continue; };
+                        if field_path.is_empty()
+                            || field_path.len() > 180
+                            || lower.contains("token")
+                            || lower.contains("auth")
+                            || lower.contains("cookie")
+                            || lower.contains("password")
+                            || lower.contains("account")
+                            || lower.contains("player")
+                            || lower.contains("session")
+                            || lower.contains("email")
+                        {
+                            continue;
+                        }
+                        let Some(value) = field.get("value") else {
+                            continue;
+                        };
                         let safe_value = match value {
                             Value::String(text) => Value::String(text.chars().take(100).collect()),
                             Value::Number(number) => Value::Number(number.clone()),
@@ -1015,27 +1140,69 @@ impl MacroState {
                     "field_count": safe_fields.len(),
                     "fields": safe_fields
                 })
-            },
+            }
             "battle_response_schema_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
+                if host != "rebornbf.com"
+                    || !(path == "/api/battles/repeat" || path == "/api/battles/finish")
+                {
+                    return Ok(());
+                }
                 let mut schema_fields = Vec::new();
                 if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
                     for field in fields.iter().take(240) {
                         let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
                         let lower_path = field_path.to_ascii_lowercase();
-                        if field_path.is_empty() || field_path.len() > 180 || !field_path.is_ascii()
-                            || ["token", "auth", "cookie", "password", "email", "account", "username", "player", "character", "session", "csrf", "secret", "credential", "profile", "user", "identity", "uuid"].iter().any(|blocked| lower_path.contains(blocked))
-                            || field_path.chars().any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
-                        { continue; }
-                        let value_type = match field.get("value_type").and_then(Value::as_str).unwrap_or("") {
-                            "object" | "array" | "array_item" | "null" | "number" | "boolean" | "string" => field.get("value_type").and_then(Value::as_str).unwrap_or("unknown"),
+                        if field_path.is_empty()
+                            || field_path.len() > 180
+                            || !field_path.is_ascii()
+                            || [
+                                "token",
+                                "auth",
+                                "cookie",
+                                "password",
+                                "email",
+                                "account",
+                                "username",
+                                "player",
+                                "character",
+                                "session",
+                                "csrf",
+                                "secret",
+                                "credential",
+                                "profile",
+                                "user",
+                                "identity",
+                                "uuid",
+                            ]
+                            .iter()
+                            .any(|blocked| lower_path.contains(blocked))
+                            || field_path
+                                .chars()
+                                .any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
+                        {
+                            continue;
+                        }
+                        let value_type = match field
+                            .get("value_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                        {
+                            "object" | "array" | "array_item" | "null" | "number" | "boolean"
+                            | "string" => field
+                                .get("value_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
                             _ => continue,
                         };
                         let mut safe = json!({ "path": field_path, "value_type": value_type });
                         if value_type == "array" || value_type == "array_item" {
-                            let length = field.get("array_length").and_then(Value::as_u64).unwrap_or(0).min(10000);
+                            let length = field
+                                .get("array_length")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0)
+                                .min(10000);
                             safe["array_length"] = json!(length);
                         }
                         schema_fields.push(safe);
@@ -1050,26 +1217,72 @@ impl MacroState {
                     "schema_field_count": schema_fields.len(),
                     "schema_fields": schema_fields
                 })
-            },
+            }
             "api_response_schema_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" || !path.starts_with("/api/") || path.len() > 240 || path.contains('?') || path.contains('#') { return Ok(()); }
+                if host != "rebornbf.com"
+                    || !path.starts_with("/api/")
+                    || path.len() > 240
+                    || path.contains('?')
+                    || path.contains('#')
+                {
+                    return Ok(());
+                }
                 let mut schema_fields = Vec::new();
                 if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
                     for field in fields.iter().take(240) {
                         let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
                         let lower_path = field_path.to_ascii_lowercase();
-                        if field_path.is_empty() || field_path.len() > 180 || !field_path.is_ascii()
-                            || ["token", "auth", "cookie", "password", "email", "account", "username", "player", "character", "session", "csrf", "secret", "credential", "profile", "user", "identity", "uuid"].iter().any(|blocked| lower_path.contains(blocked))
-                            || field_path.chars().any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c))) { continue; }
-                        let value_type = match field.get("value_type").and_then(Value::as_str).unwrap_or("") {
-                            "object" | "array" | "array_item" | "null" | "number" | "boolean" | "string" => field.get("value_type").and_then(Value::as_str).unwrap_or("unknown"),
+                        if field_path.is_empty()
+                            || field_path.len() > 180
+                            || !field_path.is_ascii()
+                            || [
+                                "token",
+                                "auth",
+                                "cookie",
+                                "password",
+                                "email",
+                                "account",
+                                "username",
+                                "player",
+                                "character",
+                                "session",
+                                "csrf",
+                                "secret",
+                                "credential",
+                                "profile",
+                                "user",
+                                "identity",
+                                "uuid",
+                            ]
+                            .iter()
+                            .any(|blocked| lower_path.contains(blocked))
+                            || field_path
+                                .chars()
+                                .any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
+                        {
+                            continue;
+                        }
+                        let value_type = match field
+                            .get("value_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                        {
+                            "object" | "array" | "array_item" | "null" | "number" | "boolean"
+                            | "string" => field
+                                .get("value_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
                             _ => continue,
                         };
                         let mut safe = json!({ "path": field_path, "value_type": value_type });
                         if value_type == "array" || value_type == "array_item" {
-                            safe["array_length"] = json!(field.get("array_length").and_then(Value::as_u64).unwrap_or(0).min(10000));
+                            safe["array_length"] = json!(field
+                                .get("array_length")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0)
+                                .min(10000));
                         }
                         schema_fields.push(safe);
                     }
@@ -1083,29 +1296,60 @@ impl MacroState {
                     "schema_field_count": schema_fields.len(),
                     "schema_fields": schema_fields
                 })
-            },
+            }
             "dungeon_metadata_seen" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" || !(path == "/dungeons" || path.starts_with("/dungeons/") || path.starts_with("/start/")) || path.contains('?') || path.contains('#') { return Ok(()); }
+                if host != "rebornbf.com"
+                    || !(path == "/dungeons"
+                        || path.starts_with("/dungeons/")
+                        || path.starts_with("/start/"))
+                    || path.contains('?')
+                    || path.contains('#')
+                {
+                    return Ok(());
+                }
                 let mut entries = Vec::new();
                 if let Some(items) = details.get("entries").and_then(Value::as_array) {
                     for item in items.iter().take(40) {
                         let mut safe = serde_json::Map::new();
                         if let Some(source) = item.get("source_path").and_then(Value::as_str) {
-                            let clean = source.chars().take(120).filter(|c| c.is_ascii_alphanumeric() || "._-*[]".contains(*c)).collect::<String>();
-                            if !clean.is_empty() { safe.insert("source_path".into(), json!(clean)); }
+                            let clean = source
+                                .chars()
+                                .take(120)
+                                .filter(|c| c.is_ascii_alphanumeric() || "._-*[]".contains(*c))
+                                .collect::<String>();
+                            if !clean.is_empty() {
+                                safe.insert("source_path".into(), json!(clean));
+                            }
                         }
                         if let Some(label) = item.get("label").and_then(Value::as_str) {
                             let label = label.trim();
-                            if !label.is_empty() && label.len() <= 100 && !label.chars().any(|c| c.is_control()) { safe.insert("label".into(), json!(label)); }
+                            if !label.is_empty()
+                                && label.len() <= 100
+                                && !label.chars().any(|c| c.is_control())
+                            {
+                                safe.insert("label".into(), json!(label));
+                            }
                         }
                         for key in ["id", "level"] {
                             if let Some(value) = item.get(key).and_then(Value::as_str) {
-                                if !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || " _.-".contains(c)) { safe.insert(key.into(), json!(value)); }
+                                if !value.is_empty()
+                                    && value.len() <= 40
+                                    && value
+                                        .chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || " _.-".contains(c))
+                                {
+                                    safe.insert(key.into(), json!(value));
+                                }
                             }
                         }
-                        if safe.contains_key("label") || safe.contains_key("id") || safe.contains_key("level") { entries.push(Value::Object(safe)); }
+                        if safe.contains_key("label")
+                            || safe.contains_key("id")
+                            || safe.contains_key("level")
+                        {
+                            entries.push(Value::Object(safe));
+                        }
                     }
                 }
                 json!({
@@ -1115,16 +1359,20 @@ impl MacroState {
                     "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
                     "entry_count": entries.len(), "entries": entries
                 })
-            },
+            }
             "reward_persisted" => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "settled_runs": details.get("settled_runs").and_then(Value::as_u64).unwrap_or(0).min(100000)
             }),
             "network_activity" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" { return Ok(()); }
+                if host != "rebornbf.com" {
+                    return Ok(());
+                }
                 let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if !path.starts_with('/') || path.contains('?') || path.contains('#') { return Ok(()); }
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
+                    return Ok(());
+                }
                 json!({
                     "host": host,
                     "path": path.chars().take(300).collect::<String>(),
@@ -1137,10 +1385,12 @@ impl MacroState {
                     "body_size": details.get("body_size").and_then(Value::as_u64).unwrap_or(0).min(100000000),
                     "is_json": details.get("is_json").and_then(Value::as_bool).unwrap_or(false)
                 })
-            },
+            }
             "websocket_activity" => {
                 let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" { return Ok(()); }
+                if host != "rebornbf.com" {
+                    return Ok(());
+                }
                 json!({
                     "transport": "websocket",
                     "phase": details.get("phase").and_then(Value::as_str).unwrap_or("message").chars().take(20).collect::<String>(),
@@ -1148,7 +1398,7 @@ impl MacroState {
                     "data_type": details.get("data_type").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
                     "payload_size": details.get("payload_size").and_then(Value::as_u64).unwrap_or(0).min(100000000)
                 })
-            },
+            }
             "dom_activity" => json!({
                 "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
                 "mutation_count": details.get("mutation_count").and_then(Value::as_u64).unwrap_or(0).min(100000),
@@ -1162,7 +1412,7 @@ impl MacroState {
             _ => json!({
                 "stage": details.get("stage").and_then(Value::as_str).unwrap_or("unknown").chars().take(80).collect::<String>(),
                 "message": details.get("message").and_then(Value::as_str).unwrap_or("unknown").chars().take(180).collect::<String>()
-            })
+            }),
         };
         let record = json!({
             "schema_version": 1,
@@ -1177,14 +1427,33 @@ impl MacroState {
     fn tracker_dungeon_context(&self, details: Value) -> Result<(), String> {
         let host = details.get("host").and_then(Value::as_str).unwrap_or("");
         let route = details.get("route").and_then(Value::as_str).unwrap_or("");
-        if host != "rebornbf.com" || !route.starts_with('/') || route.starts_with("//") || route.len() > 200 || route.contains('?') || route.contains('#') {
+        if host != "rebornbf.com"
+            || !route.starts_with('/')
+            || route.starts_with("//")
+            || route.len() > 200
+            || route.contains('?')
+            || route.contains('#')
+        {
             return Err("Rejected invalid dungeon context from the game page".to_string());
         }
-        let safe_id = details.get("dungeon_id").and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)))
+        let safe_id = details
+            .get("dungeon_id")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 40
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+            })
             .map(str::to_string);
-        let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim)
-            .filter(|value| !value.is_empty() && value.len() <= 100 && !value.chars().any(char::is_control));
+        let supplied_name = details
+            .get("dungeon_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 100 && !value.chars().any(char::is_control)
+            });
         let name = supplied_name.or(match safe_id.as_deref() {
             Some("100501") => Some("Gold Valley Lv. 2"),
             Some("100502") => Some("Gold Valley Lv. 3"),
@@ -1202,52 +1471,106 @@ impl MacroState {
             "run_active": details.get("run_active").and_then(Value::as_bool).unwrap_or(false),
             "run_type": details.get("run_type").and_then(Value::as_str).filter(|v| ["single", "repeat", "repeat_batch"].contains(v)).unwrap_or("single")
         });
-        let _history_guard = self.tracker_data_lock.lock()
-            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
+            "Tracker history is unavailable because its lock was poisoned".to_string()
+        })?;
         append_performance_record(&self.tracker_context_file, &record)
     }
 
-    fn tracker_reward_event(&self, details: Value) -> Result<(), String> {
+    fn tracker_reward_event(&self, details: Value) -> Result<bool, String> {
         let host = details.get("host").and_then(Value::as_str).unwrap_or("");
         let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-        if host != "rebornbf.com" || !(path == "/api/battles/repeat" || path == "/api/battles/finish") { return Ok(()); }
-        let _history_guard = self.tracker_data_lock.lock()
-            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        if host != "rebornbf.com"
+            || !(path == "/api/battles/repeat" || path == "/api/battles/finish")
+        {
+            return Ok(false);
+        }
+        let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
+            "Tracker history is unavailable because its lock was poisoned".to_string()
+        })?;
 
         let safe_id = |value: Option<&Value>, max: usize| -> Option<String> {
             let raw = value?.as_str()?;
-            if raw.is_empty() || raw.len() > max || !raw.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)) { return None; }
+            if raw.is_empty()
+                || raw.len() > max
+                || !raw
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+            {
+                return None;
+            }
             Some(raw.to_string())
         };
         let safe_number = |object: &Value, key: &str| -> Option<u64> {
-            object.get(key)?.as_u64().filter(|n| *n <= 9_000_000_000_000)
+            object
+                .get(key)?
+                .as_u64()
+                .filter(|n| *n <= 9_000_000_000_000)
         };
         let settlement = details.get("settlement").cloned().unwrap_or(Value::Null);
         let totals = details.get("totals").cloned().unwrap_or(Value::Null);
-        let numeric_keys = ["exp", "zel", "gems", "runs", "wins", "honor", "karma", "level", "settled_runs", "auto_sell_zel"];
+        let numeric_keys = [
+            "exp",
+            "zel",
+            "gems",
+            "runs",
+            "wins",
+            "honor",
+            "karma",
+            "level",
+            "settled_runs",
+            "auto_sell_zel",
+        ];
         let mut settlement_safe = serde_json::Map::new();
         let mut totals_safe = serde_json::Map::new();
         for key in numeric_keys {
-            if let Some(value) = safe_number(&settlement, key) { settlement_safe.insert(key.into(), json!(value)); }
-            if let Some(value) = safe_number(&totals, key) { totals_safe.insert(key.into(), json!(value)); }
+            if let Some(value) = safe_number(&settlement, key) {
+                settlement_safe.insert(key.into(), json!(value));
+            }
+            if let Some(value) = safe_number(&totals, key) {
+                totals_safe.insert(key.into(), json!(value));
+            }
         }
         let sanitize_items = |source: Option<&Value>| {
             let mut safe = serde_json::Map::new();
             if let Some(items) = source.and_then(Value::as_object) {
                 for (key, value) in items.iter().take(200) {
-                    let valid_key = !key.is_empty() && key.len() <= 80 && key.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
-                    if !valid_key { continue; }
-                    if let Some(amount) = value.as_u64().filter(|n| *n <= 9_000_000_000_000) { safe.insert(key.clone(), json!(amount)); }
+                    let valid_key = !key.is_empty()
+                        && key.len() <= 80
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
+                    if !valid_key {
+                        continue;
+                    }
+                    if let Some(amount) = value.as_u64().filter(|n| *n <= 9_000_000_000_000) {
+                        safe.insert(key.clone(), json!(amount));
+                    }
                 }
             }
             Value::Object(safe)
         };
         let settlement_items = sanitize_items(details.get("items"));
         let totals_items = sanitize_items(details.get("totals_items"));
-        let route = details.get("dungeon_route").and_then(Value::as_str).unwrap_or("");
-        let route = if (route.starts_with("/dungeons/") || route.starts_with("/start/")) && route.len() <= 200 && !route.contains('?') && !route.contains('#') { route } else { "" };
+        let route = details
+            .get("dungeon_route")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let route = if (route.starts_with("/dungeons/") || route.starts_with("/start/"))
+            && route.len() <= 200
+            && !route.contains('?')
+            && !route.contains('#')
+        {
+            route
+        } else {
+            ""
+        };
         let dungeon_id = safe_id(details.get("dungeon_id"), 40);
-        let supplied_name = details.get("dungeon_name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control()));
+        let supplied_name = details
+            .get("dungeon_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control()));
         // Only use a name explicitly supplied by the current game page.
         // No ID-to-name guesses: unknown quests are displayed by run ID.
         let dungeon_name = supplied_name.or(match dungeon_id.as_deref() {
@@ -1257,8 +1580,14 @@ impl MacroState {
         });
         let batch_id = safe_id(details.get("batch_id"), 100).unwrap_or_default();
         let authoritative_run_type = if path == "/api/battles/repeat" {
-            if batch_id.is_empty() { "repeat" } else { "repeat_batch" }
-        } else { "single" };
+            if batch_id.is_empty() {
+                "repeat"
+            } else {
+                "repeat_batch"
+            }
+        } else {
+            "single"
+        };
         let mut record = json!({
             "schema_version": 1,
             "record_type": "battle_reward",
@@ -1282,7 +1611,11 @@ impl MacroState {
         // Canonical run accounting is shared by persistence, deduplication and logs.
         // /finish is exactly one completed run. /repeat reports a cumulative batch
         // snapshot; prefer explicit settled_runs, then runs/wins in settlement/totals.
-        let batch_id = record.get("batch_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let batch_id = record
+            .get("batch_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let finish_path = path == "/api/battles/finish";
         let run_count = if finish_path {
             1
@@ -1291,37 +1624,61 @@ impl MacroState {
         };
         if run_count == 0 {
             self.log("Tracker reward ignored: repeat response did not contain a valid cumulative run count.");
-            return Ok(());
+            return Ok(false);
         }
         record["run_count"] = json!(run_count);
-        record["run_count_source"] = json!(if finish_path { "single_completion" } else { "repeat_cumulative" });
+        record["run_count_source"] = json!(if finish_path {
+            "single_completion"
+        } else {
+            "repeat_cumulative"
+        });
 
         // Repeat snapshots are deduplicated by batch ID + cumulative run count.
         // Later snapshots with a higher count are retained as updates. Single-run
         // completions are deduplicated by dungeon route + entry timestamp.
-        let finish_start = record.get("dungeon_started_at_unix_ms").and_then(Value::as_u64).unwrap_or(0);
-        let finish_route = record.get("dungeon_route").and_then(Value::as_str).unwrap_or("");
+        let finish_start = record
+            .get("dungeon_started_at_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let finish_route = record
+            .get("dungeon_route")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let dedupe_key = if !batch_id.is_empty() && !finish_path {
             Some(format!("{batch_id}:{run_count}"))
         } else if finish_path && finish_start > 0 && !finish_route.is_empty() {
             Some(format!("finish:{finish_route}:{finish_start}"))
-        } else { None };
+        } else {
+            None
+        };
         if let Some(key) = dedupe_key.as_deref() {
-            let keys = self.tracker_dedupe_keys.lock()
+            let keys = self
+                .tracker_dedupe_keys
+                .lock()
                 .map_err(|_| "Tracker deduplication cache is unavailable".to_string())?;
             if keys.contains(key) {
                 self.log(&format!("Tracker duplicate ignored (key {key})."));
-                return Ok(());
+                return Ok(false);
             }
         }
-        if let Some(key) = dedupe_key { record["dedupe_key"] = json!(key); }
+        if let Some(key) = dedupe_key {
+            record["dedupe_key"] = json!(key);
+        }
         match append_history_record(&self.tracker_sessions_file, &record) {
             Ok(()) => {
                 if let Some(key) = record.get("dedupe_key").and_then(Value::as_str) {
-                    if let Ok(mut keys) = self.tracker_dedupe_keys.lock() { keys.insert(key.to_string()); }
+                    if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
+                        keys.insert(key.to_string());
+                    }
                 }
-                self.log(&format!("Tracker reward saved (dungeon {}, path {}, batch {}, runs {}).", dungeon_id.as_deref().unwrap_or("unknown"), path, batch_id, run_count));
-                Ok(())
+                self.log(&format!(
+                    "Tracker reward saved (dungeon {}, path {}, batch {}, runs {}).",
+                    dungeon_id.as_deref().unwrap_or("unknown"),
+                    path,
+                    batch_id,
+                    run_count
+                ));
+                Ok(true)
             }
             Err(error) => {
                 self.log(&format!("Tracker reward save failed: {error}"));
@@ -1331,13 +1688,18 @@ impl MacroState {
     }
 
     fn tracker_read_data(&self) -> Result<Vec<Value>, String> {
-        let _history_guard = self.tracker_data_lock.lock()
-            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
+            "Tracker history is unavailable because its lock was poisoned".to_string()
+        })?;
         let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
         let mut records = Vec::new();
         let mut malformed_lines = 0usize;
         read_jsonl_records(&backup_file, &mut records, &mut malformed_lines)?;
-        read_jsonl_records(&self.tracker_sessions_file, &mut records, &mut malformed_lines)?;
+        read_jsonl_records(
+            &self.tracker_sessions_file,
+            &mut records,
+            &mut malformed_lines,
+        )?;
         if malformed_lines > 0 {
             self.log(&format!("Run History skipped {malformed_lines} malformed JSONL record(s); valid records remain available."));
         }
@@ -1345,8 +1707,9 @@ impl MacroState {
     }
 
     fn tracker_clear_history(&self) -> Result<(), String> {
-        let _history_guard = self.tracker_data_lock.lock()
-            .map_err(|_| "Tracker history is unavailable because its lock was poisoned".to_string())?;
+        let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
+            "Tracker history is unavailable because its lock was poisoned".to_string()
+        })?;
 
         // A user-requested clear also removes legacy migration copies, otherwise
         // an old source file could be imported again on the next application start.
@@ -1355,7 +1718,11 @@ impl MacroState {
             match fs::remove_file(legacy_copy) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("Could not remove a legacy Run History recovery copy: {error}")),
+                Err(error) => {
+                    return Err(format!(
+                        "Could not remove a legacy Run History recovery copy: {error}"
+                    ))
+                }
             }
         }
         // Replace the active JSONL file atomically. Run History also reads the
@@ -1365,9 +1732,15 @@ impl MacroState {
         match fs::remove_file(&backup_file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("Run History was cleared, but its old backup could not be removed: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "Run History was cleared, but its old backup could not be removed: {error}"
+                ))
+            }
         }
-        if let Ok(mut keys) = self.tracker_dedupe_keys.lock() { keys.clear(); }
+        if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
+            keys.clear();
+        }
         self.log("Run History cleared by the user.");
         Ok(())
     }
@@ -1395,6 +1768,7 @@ fn activity_name(mode: u8) -> &'static str {
     match mode {
         MODE_RECORDING => "recording",
         MODE_PLAYING => "playback",
+        MODE_STOPPING => "stopping",
         _ => "idle",
     }
 }
@@ -1426,7 +1800,11 @@ fn append_jsonl_record(path: &Path, record: &Value, rotate: bool) -> Result<(), 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    if rotate && fs::metadata(path).map(|metadata| metadata.len() >= MAX_LOG_BYTES).unwrap_or(false) {
+    if rotate
+        && fs::metadata(path)
+            .map(|metadata| metadata.len() >= MAX_LOG_BYTES)
+            .unwrap_or(false)
+    {
         let previous = path.with_extension("jsonl.1");
         let _ = fs::remove_file(&previous);
         fs::rename(path, previous).map_err(|error| error.to_string())?;
@@ -1451,18 +1829,35 @@ fn append_history_record(path: &Path, record: &Value) -> Result<(), String> {
     append_jsonl_record(path, record, false)
 }
 
-fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
-    if !path.exists() { return Ok(()); }
-    let file = fs::File::open(path).map_err(|error| format!("Could not open tracker data file: {error}"))?;
+fn read_jsonl_records(
+    path: &Path,
+    records: &mut Vec<Value>,
+    malformed_lines: &mut usize,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Could not open tracker data file: {error}"))?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
     loop {
         line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
             .map_err(|error| format!("Could not read tracker data: {error}"))?;
-        if bytes_read == 0 { break; }
-        while line.last().is_some_and(|last| *last == b'\n' || *last == b'\r') { line.pop(); }
-        if line.iter().all(u8::is_ascii_whitespace) { continue; }
+        if bytes_read == 0 {
+            break;
+        }
+        while line
+            .last()
+            .is_some_and(|last| *last == b'\n' || *last == b'\r')
+        {
+            line.pop();
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
         match serde_json::from_slice::<Value>(&line) {
             Ok(record) => records.push(record),
             Err(_) => *malformed_lines += 1,
@@ -1476,14 +1871,24 @@ fn load_history_dedupe_keys(backup: &Path, active: &Path) -> Result<HashSet<Stri
     let mut malformed_lines = 0usize;
     read_jsonl_records(backup, &mut records, &mut malformed_lines)?;
     read_jsonl_records(active, &mut records, &mut malformed_lines)?;
-    Ok(records.into_iter().filter_map(|record| {
-        record.get("dedupe_key").and_then(Value::as_str).map(str::to_string)
-    }).collect())
+    Ok(records
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .get("dedupe_key")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
 }
 
 fn repeat_cumulative_run_count(settlement: &Value, totals: &Value) -> Option<u64> {
-    let valid = |object: &Value, key: &str| object.get(key).and_then(Value::as_u64)
-        .filter(|count| *count > 0 && *count <= 1_000_000);
+    let valid = |object: &Value, key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0 && *count <= 1_000_000)
+    };
     // Observed game responses show settlement.runs is the current chunk (e.g. 10),
     // while settlement.settled_runs and totals.* are cumulative batch totals.
     valid(settlement, "settled_runs")
@@ -1494,18 +1899,30 @@ fn repeat_cumulative_run_count(settlement: &Value, totals: &Value) -> Option<u64
 
 fn validate_macro_clicks(clicks: &[MacroClick]) -> Result<(), String> {
     if clicks.len() > MAX_MACRO_CLICKS {
-        return Err(format!("The macro contains too many clicks (maximum {MAX_MACRO_CLICKS})"));
+        return Err(format!(
+            "The macro contains too many clicks (maximum {MAX_MACRO_CLICKS})"
+        ));
     }
     if clicks.iter().any(|click| {
-        !click.x.is_finite() || !click.y.is_finite()
-            || click.x < 0.0 || click.x > 1.0 || click.y < 0.0 || click.y > 1.0
+        !click.x.is_finite()
+            || !click.y.is_finite()
+            || click.x < 0.0
+            || click.x > 1.0
+            || click.y < 0.0
+            || click.y > 1.0
     }) {
         return Err("The macro contains invalid click coordinates".to_string());
     }
-    if clicks.iter().any(|click| click.elapsed_ms > MAX_MACRO_DURATION_MS) {
+    if clicks
+        .iter()
+        .any(|click| click.elapsed_ms > MAX_MACRO_DURATION_MS)
+    {
         return Err("The macro contains a delay longer than the 24-hour safety limit".to_string());
     }
-    if clicks.windows(2).any(|pair| pair[1].elapsed_ms < pair[0].elapsed_ms) {
+    if clicks
+        .windows(2)
+        .any(|pair| pair[1].elapsed_ms < pair[0].elapsed_ms)
+    {
         return Err("The macro contains click timestamps that are out of order".to_string());
     }
     Ok(())
@@ -1524,9 +1941,7 @@ struct ProcessMetrics {
 }
 
 #[cfg(windows)]
-fn collect_process_metrics(
-    previous_cpu: &mut Option<(u64, Instant)>,
-) -> ProcessMetrics {
+fn collect_process_metrics(previous_cpu: &mut Option<(u64, Instant)>) -> ProcessMetrics {
     use std::{ffi::c_void, mem::size_of};
 
     #[repr(C)]
@@ -1556,9 +1971,14 @@ fn collect_process_metrics(
         avail_extended_virtual: u64,
     }
     #[repr(C)]
-    struct FileTime { low: u32, high: u32 }
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
     impl FileTime {
-        fn ticks(&self) -> u64 { ((self.high as u64) << 32) | self.low as u64 }
+        fn ticks(&self) -> u64 {
+            ((self.high as u64) << 32) | self.low as u64
+        }
     }
     #[repr(C)]
     struct ProcessEntry32W {
@@ -1578,7 +1998,13 @@ fn collect_process_metrics(
     extern "system" {
         fn GetCurrentProcessId() -> u32;
         fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
-        fn GetProcessTimes(process: *mut c_void, creation: *mut FileTime, exit: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
         fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
@@ -1587,7 +2013,11 @@ fn collect_process_metrics(
     }
     #[link(name = "psapi")]
     extern "system" {
-        fn GetProcessMemoryInfo(process: *mut c_void, counters: *mut ProcessMemoryCountersEx, size: u32) -> i32;
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            size: u32,
+        ) -> i32;
     }
 
     const TH32CS_SNAPPROCESS: u32 = 0x00000002;
@@ -1606,14 +2036,22 @@ fn collect_process_metrics(
         entry.size = size_of::<ProcessEntry32W>() as u32;
         if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
             loop {
-                let end = entry.exe_file.iter().position(|unit| *unit == 0).unwrap_or(entry.exe_file.len());
+                let end = entry
+                    .exe_file
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.exe_file.len());
                 let name = String::from_utf16_lossy(&entry.exe_file[..end]);
                 process_names.insert(entry.process_id, name.chars().take(80).collect());
                 entries.push((entry.process_id, entry.parent_process_id));
-                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 { break; }
+                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                    break;
+                }
             }
         }
-        unsafe { CloseHandle(snapshot); }
+        unsafe {
+            CloseHandle(snapshot);
+        }
         // Include WebView2 renderer/GPU/utility descendants launched beneath this app.
         loop {
             let before = process_ids.len();
@@ -1622,7 +2060,9 @@ fn collect_process_metrics(
                     process_ids.push(*pid);
                 }
             }
-            if process_ids.len() == before { break; }
+            if process_ids.len() == before {
+                break;
+            }
         }
     }
 
@@ -1634,7 +2074,9 @@ fn collect_process_metrics(
     let mut process_details = Vec::new();
     for pid in process_ids {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
-        if handle.is_null() { continue; }
+        if handle.is_null() {
+            continue;
+        }
         let mut memory: ProcessMemoryCountersEx = unsafe { std::mem::zeroed() };
         memory.cb = size_of::<ProcessMemoryCountersEx>() as u32;
         let memory_size = memory.cb;
@@ -1652,13 +2094,16 @@ fn collect_process_metrics(
         let mut kernel: FileTime = unsafe { std::mem::zeroed() };
         let mut user: FileTime = unsafe { std::mem::zeroed() };
         let mut process_cpu_ticks = None;
-        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } != 0 {
+        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } != 0
+        {
             let ticks = kernel.ticks().saturating_add(user.ticks());
             cpu_ticks = cpu_ticks.saturating_add(ticks);
             process_cpu_ticks = Some(ticks);
             found_cpu = true;
         }
-        unsafe { CloseHandle(handle); }
+        unsafe {
+            CloseHandle(handle);
+        }
         process_details.push(json!({
             "pid": pid,
             "image_name": process_names.get(&pid).cloned().unwrap_or_else(|| "unknown".to_string()),
@@ -1677,9 +2122,12 @@ fn collect_process_metrics(
         if let Some((old_ticks, old_time)) = previous_cpu.take() {
             let elapsed = now.duration_since(old_time).as_secs_f64();
             let delta = cpu_ticks.saturating_sub(old_ticks) as f64 / 10_000_000.0;
-            let logical_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+            let logical_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1) as f64;
             if elapsed > 0.0 {
-                result.cpu_percent = Some((delta / elapsed / logical_cpus * 100.0).clamp(0.0, 100.0));
+                result.cpu_percent =
+                    Some((delta / elapsed / logical_cpus * 100.0).clamp(0.0, 100.0));
             }
         }
         *previous_cpu = Some((cpu_ticks, now));
@@ -1743,15 +2191,12 @@ fn feedback_sound(_error: bool) {}
 
 fn notify(app: &AppHandle<Wry>, title: &str, body: &str, error: bool) {
     feedback_sound(error);
-    let result = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let result = app.notification().builder().title(title).body(body).show();
     if let Err(notification_error) = result {
         if let Some(state) = app.try_state::<MacroState>() {
-            state.log(&format!("Notification failed: {notification_error}; intended message: {title} — {body}"));
+            state.log(&format!(
+                "Notification failed: {notification_error}; intended message: {title} — {body}"
+            ));
         }
     }
     if let Some(state) = app.try_state::<MacroState>() {
@@ -1773,21 +2218,27 @@ fn refresh_tray_menu(app: &AppHandle<Wry>) {
         .map(|clicks| !clicks.is_empty())
         .unwrap_or(false);
 
-    let _ = menu.record.set_text(if mode == MODE_RECORDING {
-        "Stop Recording"
-    } else {
-        "Start Recording"
-    });
+    let record_label = match mode {
+        MODE_RECORDING => "Stop Recording",
+        MODE_STOPPING => "Saving Recording...",
+        _ => "Start Recording",
+    };
+    let _ = menu.record.set_text(record_label);
     // Recording controls remain clickable regardless of game-window focus or bridge timing.
     // start_recording reports a clear readiness error if the remote bridge is not connected.
-    let _ = menu.record.set_enabled(mode != MODE_PLAYING);
+    let _ = menu
+        .record
+        .set_enabled(mode != MODE_PLAYING && mode != MODE_STOPPING);
 
-    let _ = menu.play.set_text(if mode == MODE_PLAYING {
-        "Stop Playback"
-    } else {
-        "Play Macro"
-    });
-    let _ = menu.play.set_enabled(mode != MODE_RECORDING && (mode == MODE_PLAYING || has_macro));
+    let play_label = match mode {
+        MODE_PLAYING => "Stop Playback",
+        MODE_STOPPING => "Saving Recording...",
+        _ => "Play Macro",
+    };
+    let _ = menu.play.set_text(play_label);
+    let _ = menu.play.set_enabled(
+        mode != MODE_RECORDING && mode != MODE_STOPPING && (mode == MODE_PLAYING || has_macro),
+    );
 
     let loop_text = if state.loop_enabled.load(Ordering::SeqCst) {
         "Loop Continuously: On"
@@ -1799,7 +2250,9 @@ fn refresh_tray_menu(app: &AppHandle<Wry>) {
         .try_state::<SettingsState>()
         .and_then(|settings| settings.settings.lock().ok().map(|value| value.pinned))
         .unwrap_or(false);
-    let _ = menu.pin.set_text(if pinned { "Unpin Window" } else { "Pin Window" });
+    let _ = menu
+        .pin
+        .set_text(if pinned { "Unpin Window" } else { "Pin Window" });
 }
 
 #[tauri::command]
@@ -1810,7 +2263,11 @@ fn recording_bridge_ready(app: AppHandle<Wry>, state: State<'_, MacroState>) {
 }
 
 #[tauri::command(async)]
-fn tracker_diagnostic_event(event: String, details: Value, state: State<'_, MacroState>) -> Result<(), String> {
+fn tracker_diagnostic_event(
+    event: String,
+    details: Value,
+    state: State<'_, MacroState>,
+) -> Result<(), String> {
     state.tracker_diagnostic_event(&event, details)
 }
 
@@ -1820,7 +2277,7 @@ fn tracker_dungeon_context(details: Value, state: State<'_, MacroState>) -> Resu
 }
 
 #[tauri::command(async)]
-fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<(), String> {
+fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<bool, String> {
     state.tracker_reward_event(details)
 }
 
@@ -1836,18 +2293,30 @@ fn tracker_clear_history(state: State<'_, MacroState>) -> Result<(), String> {
 
 #[tauri::command]
 fn tracker_get_pinned(settings: State<'_, SettingsState>) -> Result<bool, String> {
-    settings.settings.lock().map(|value| value.tracker_pinned)
+    settings
+        .settings
+        .lock()
+        .map(|value| value.tracker_pinned)
         .map_err(|_| "Settings are unavailable".to_string())
 }
 
 #[tauri::command]
-fn tracker_set_pinned(pinned: bool, app: AppHandle<Wry>, settings: State<'_, SettingsState>) -> Result<(), String> {
-    let window = app.get_webview_window("tracker")
+fn tracker_set_pinned(
+    pinned: bool,
+    app: AppHandle<Wry>,
+    settings: State<'_, SettingsState>,
+) -> Result<(), String> {
+    let window = app
+        .get_webview_window("tracker")
         .ok_or_else(|| "Run History window is not open".to_string())?;
-    window.set_always_on_top(pinned)
+    window
+        .set_always_on_top(pinned)
         .map_err(|error| format!("Could not change tracker pin state: {error}"))?;
     {
-        let mut value = settings.settings.lock().map_err(|_| "Settings are unavailable".to_string())?;
+        let mut value = settings
+            .settings
+            .lock()
+            .map_err(|_| "Settings are unavailable".to_string())?;
         value.tracker_pinned = pinned;
     }
     settings.save()
@@ -1879,7 +2348,9 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
     // appending a click after stop_recording has taken its save snapshot.
     if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
         if clicks.len() >= MAX_MACRO_CLICKS {
-            return Err(format!("Recording reached the {MAX_MACRO_CLICKS}-click safety limit"));
+            return Err(format!(
+                "Recording reached the {MAX_MACRO_CLICKS}-click safety limit"
+            ));
         }
         clicks.push(MacroClick {
             x: x.clamp(0.0, 1.0),
@@ -1890,72 +2361,126 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
     Ok(())
 }
 
-// Transition to Idle only when a recording is active. A late recording-error
-// IPC event must never cancel an unrelated playback session.
-fn end_recording_if_recording(mode: &AtomicU8) -> bool {
-    mode.compare_exchange(MODE_RECORDING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+// An immutable copy of the completed recording and its elapsed duration.
+type RecordingSnapshot = (Vec<MacroClick>, Option<u128>);
+
+// Enter a non-startable Stopping state while taking an immutable snapshot of the
+// completed recording. Lock order matches begin_recording_if_idle.
+fn begin_stopping_recording(
+    mode: &AtomicU8,
+    record_started: &Mutex<Option<Instant>>,
+    clicks: &Mutex<Vec<MacroClick>>,
+) -> Result<Option<RecordingSnapshot>, String> {
+    let mut started = record_started
+        .lock()
+        .map_err(|_| "Recording timer is unavailable".to_string())?;
+    let clicks = clicks
+        .lock()
+        .map_err(|_| "Macro data is unavailable".to_string())?;
+    if mode
+        .compare_exchange(
+            MODE_RECORDING,
+            MODE_STOPPING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let duration = started.take().map(|instant| instant.elapsed().as_millis());
+    Ok(Some((clicks.clone(), duration)))
+}
+
+fn finish_stopping_recording(mode: &AtomicU8) -> bool {
+    mode.compare_exchange(MODE_STOPPING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
 }
 
 #[tauri::command]
 fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_, MacroState>) {
-    if end_recording_if_recording(&state.mode) {
-        let recording_duration_ms = state.record_started.lock().ok().and_then(|mut started| {
-            started.take().map(|instant| instant.elapsed().as_millis())
-        });
-        state.performance_event("recording_error", json!({ "message": &message, "recording_duration_ms": recording_duration_ms }));
-        state.log(&format!("Click capture IPC error: {message}"));
-        refresh_tray_menu(&app);
-        let recovery = match state.save_macro() {
-            Ok(0) => "No clicks had been captured; the previous saved macro was preserved.".to_string(),
-            Ok(count) => format!("Recovered and saved the {count} clicks captured before the error."),
-            Err(error) => format!("Could not save the captured clicks: {error}"),
-        };
-        notify(
-            &app,
-            "BFR Macro — Recording error",
-            &format!("Recording stopped because communication with the game failed: {message}\n{recovery}"),
-            true,
-        );
-    }
+    let snapshot = match begin_stopping_recording(&state.mode, &state.record_started, &state.clicks)
+    {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(error) => {
+            state.log(&format!(
+                "Could not safely stop recording after capture error: {error}"
+            ));
+            return;
+        }
+    };
+    let (clicks, recording_duration_ms) = snapshot;
+    state.performance_event(
+        "recording_error",
+        json!({ "message": &message, "recording_duration_ms": recording_duration_ms }),
+    );
+    state.log(&format!("Click capture IPC error: {message}"));
+    let recovery = match state.save_macro_snapshot(&clicks) {
+        Ok(0) => {
+            match state.restore_saved_macro_during_stopping() {
+                Ok(_) => "No clicks had been captured; the previous saved macro was preserved.".to_string(),
+                Err(error) => format!("No clicks were captured; the previous saved macro file was preserved, but could not be restored in memory: {error}"),
+            }
+        }
+        Ok(count) => format!("Recovered and saved the {count} clicks captured before the error."),
+        Err(error) => format!("Could not save the captured clicks: {error}"),
+    };
+    finish_stopping_recording(&state.mode);
+    refresh_tray_menu(&app);
+    notify(
+        &app,
+        "BFR Macro — Recording error",
+        &format!(
+            "Recording stopped because communication with the game failed: {message}\n{recovery}"
+        ),
+        true,
+    );
 }
 
 fn stop_recording(app: &AppHandle<Wry>) {
     let Some(state) = app.try_state::<MacroState>() else {
         return;
     };
-    if state
-        .mode
-        .compare_exchange(MODE_RECORDING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
+    let snapshot = match begin_stopping_recording(&state.mode, &state.record_started, &state.clicks)
     {
-        return;
-    }
-    let recording_duration_ms = state.record_started.lock().ok().and_then(|mut started| {
-        started.take().map(|instant| instant.elapsed().as_millis())
-    });
-    let click_count = state.clicks.lock().map(|clicks| clicks.len()).unwrap_or(0);
-    state.performance_event("recording_stopped", json!({
-        "click_count": click_count,
-        "recording_duration_ms": recording_duration_ms
-    }));
-    refresh_tray_menu(app);
-    match state.save_macro() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(error) => {
+            notify(app, "BFR Macro — Recording unavailable", &error, true);
+            return;
+        }
+    };
+    let (clicks, recording_duration_ms) = snapshot;
+    state.performance_event(
+        "recording_stopped",
+        json!({
+            "click_count": clicks.len(),
+            "recording_duration_ms": recording_duration_ms
+        }),
+    );
+    let result = match state.save_macro_snapshot(&clicks) {
         Ok(0) => {
-            // start_recording clears the in-memory buffer. Restore the last saved
-            // macro when this recording captured nothing, matching the file on disk.
-            if state.file.exists() {
-                if let Err(error) = state.load_macro() {
+            let restore_result = state.restore_saved_macro_during_stopping();
+            match restore_result {
+                Ok(_) => Ok(0),
+                Err(error) => {
                     state.log(&format!("Could not restore the previous saved macro after an empty recording: {error}"));
+                    Ok(0)
                 }
             }
-            notify(
-                app,
-                "BFR Macro — Recording stopped",
-                "No clicks were captured, so the previous saved macro was kept.",
-                false,
-            );
-        },
+        }
+        other => other,
+    };
+    finish_stopping_recording(&state.mode);
+    refresh_tray_menu(app);
+    match result {
+        Ok(0) => notify(
+            app,
+            "BFR Macro — Recording stopped",
+            "No clicks were captured, so the previous saved macro was kept.",
+            false,
+        ),
         Ok(count) => notify(
             app,
             "BFR Macro — Recording saved",
@@ -1976,6 +2501,7 @@ fn start_recording(app: &AppHandle<Wry>) {
             return;
         }
         MODE_PLAYING => stop_playback(app),
+        MODE_STOPPING => return,
         _ => {}
     }
     if !state.bridge_ready.load(Ordering::SeqCst) {
@@ -2006,14 +2532,25 @@ fn start_recording(app: &AppHandle<Wry>) {
 }
 
 fn stop_playback(app: &AppHandle<Wry>) {
-    let Some(state) = app.try_state::<MacroState>() else { return; };
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
     if state.mode.load(Ordering::SeqCst) == MODE_PLAYING {
         // Invalidate the old worker before making the state available to a new one.
         state.playback_generation.fetch_add(1, Ordering::SeqCst);
-        if state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if state
+            .mode
+            .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             state.performance_event("playback_stopped", json!({}));
             refresh_tray_menu(app);
-            notify(app, "BFR Macro — Playback stopped", "Macro playback has stopped.", false);
+            notify(
+                app,
+                "BFR Macro — Playback stopped",
+                "Macro playback has stopped.",
+                false,
+            );
         }
     }
 }
@@ -2031,7 +2568,10 @@ impl Drop for PlaybackSessionGuard {
     fn drop(&mut self) {
         if let Some(state) = self.app.try_state::<MacroState>() {
             if state.playback_generation.load(Ordering::SeqCst) == self.generation
-                && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+                && state
+                    .mode
+                    .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
             {
                 state.performance_event("playback_worker_exited_unexpectedly", json!({}));
                 refresh_tray_menu(&self.app);
@@ -2043,11 +2583,16 @@ impl Drop for PlaybackSessionGuard {
 fn wait_while_playing_until(state: &MacroState, generation: u64, deadline: Instant) -> bool {
     loop {
         if !playback_session_is_current(
-            state.mode.load(Ordering::SeqCst), generation,
+            state.mode.load(Ordering::SeqCst),
+            generation,
             state.playback_generation.load(Ordering::SeqCst),
-        ) { return false; }
+        ) {
+            return false;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { return true; }
+        if remaining.is_zero() {
+            return true;
+        }
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
@@ -2065,7 +2610,8 @@ fn is_game_page_url(value: &str) -> bool {
 }
 
 fn validate_cdp_websocket_url(value: &str, expected_port: u16) -> Result<(), String> {
-    let url = Url::parse(value).map_err(|error| format!("Invalid local DevTools WebSocket URL: {error}"))?;
+    let url = Url::parse(value)
+        .map_err(|error| format!("Invalid local DevTools WebSocket URL: {error}"))?;
     let valid = url.scheme() == "ws"
         && url.host_str() == Some("127.0.0.1")
         && url.port() == Some(expected_port)
@@ -2106,7 +2652,9 @@ fn discover_cdp_target(port: u16) -> Result<String, String> {
         }
         thread::sleep(Duration::from_millis(250));
     }
-    Err(format!("Could not find the Brave Frontier WebView2 page for DevTools playback: {last_error}"))
+    Err(format!(
+        "Could not find the Brave Frontier WebView2 page for DevTools playback: {last_error}"
+    ))
 }
 
 fn cdp_call<S: Read + Write>(
@@ -2138,7 +2686,9 @@ fn cdp_call<S: Read + Write>(
             }
             Message::Close(_) => return Err("WebView2 closed the DevTools connection".to_string()),
             Message::Ping(data) => {
-                socket.send(Message::Pong(data)).map_err(|error| error.to_string())?;
+                socket
+                    .send(Message::Pong(data))
+                    .map_err(|error| error.to_string())?;
             }
             _ => {}
         }
@@ -2201,7 +2751,10 @@ fn dispatch_click<S: Read + Write>(
 fn playback_failed(app: &AppHandle<Wry>, generation: u64, message: &str) {
     if let Some(state) = app.try_state::<MacroState>() {
         if state.playback_generation.load(Ordering::SeqCst) == generation
-            && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            && state
+                .mode
+                .compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
             state.performance_event("playback_failed", json!({ "message": message }));
             refresh_tray_menu(app);
@@ -2211,12 +2764,16 @@ fn playback_failed(app: &AppHandle<Wry>, generation: u64, message: &str) {
 }
 
 fn start_playback(app: AppHandle<Wry>) {
-    let Some(state) = app.try_state::<MacroState>() else { return; };
+    let Some(state) = app.try_state::<MacroState>() else {
+        return;
+    };
     if state.mode.load(Ordering::SeqCst) == MODE_PLAYING {
         stop_playback(&app);
         return;
     }
-    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING { stop_recording(&app); }
+    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
+        stop_recording(&app);
+    }
     let clicks = match begin_playback_if_idle(&state.mode, &state.clicks) {
         Ok(Some(clicks)) => clicks,
         Ok(None) => return,
@@ -2226,68 +2783,144 @@ fn start_playback(app: AppHandle<Wry>) {
         }
     };
     if clicks.is_empty() {
-        notify(&app, "BFR Macro — No recording", "There is no saved macro to play. Record some clicks first.", true);
+        notify(
+            &app,
+            "BFR Macro — No recording",
+            "There is no saved macro to play. Record some clicks first.",
+            true,
+        );
         return;
     }
-    let generation = state.playback_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let generation = state
+        .playback_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
     let port = state.cdp_port;
     state.performance_event("playback_started", json!({ "click_count": clicks.len(), "loop_enabled": state.loop_enabled.load(Ordering::SeqCst) }));
     refresh_tray_menu(&app);
-    notify(&app, "BFR Macro — Connecting", "Connecting to the game input channel…", false);
+    notify(
+        &app,
+        "BFR Macro — Connecting",
+        "Connecting to the game input channel…",
+        false,
+    );
 
     thread::spawn(move || {
-        let Some(state) = app.try_state::<MacroState>() else { return; };
-        if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) { return; }
-        let _session_guard = PlaybackSessionGuard { app: app.clone(), generation };
+        let Some(state) = app.try_state::<MacroState>() else {
+            return;
+        };
+        if !playback_session_is_current(
+            state.mode.load(Ordering::SeqCst),
+            generation,
+            state.playback_generation.load(Ordering::SeqCst),
+        ) {
+            return;
+        }
+        let _session_guard = PlaybackSessionGuard {
+            app: app.clone(),
+            generation,
+        };
 
         let websocket_url = match discover_cdp_target(port) {
             Ok(url) => url,
-            Err(error) => { playback_failed(&app, generation, &error); return; }
+            Err(error) => {
+                playback_failed(&app, generation, &error);
+                return;
+            }
         };
         // The validated WebSocket URL is loopback-only. Connect with an explicit
         // TCP timeout and bound all subsequent reads/writes so Stop can recover.
         let address = SocketAddr::from(([127, 0, 0, 1], port));
         let stream = match TcpStream::connect_timeout(&address, CDP_CONNECT_TIMEOUT) {
             Ok(stream) => stream,
-            Err(error) => { playback_failed(&app, generation, &format!("Could not connect to WebView2 input: {error}")); return; }
+            Err(error) => {
+                playback_failed(
+                    &app,
+                    generation,
+                    &format!("Could not connect to WebView2 input: {error}"),
+                );
+                return;
+            }
         };
-        if let Err(error) = stream.set_read_timeout(Some(CDP_IO_TIMEOUT)).and_then(|_| stream.set_write_timeout(Some(CDP_IO_TIMEOUT))) {
-            playback_failed(&app, generation, &format!("Could not configure WebView2 input timeouts: {error}"));
+        if let Err(error) = stream
+            .set_read_timeout(Some(CDP_IO_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(CDP_IO_TIMEOUT)))
+        {
+            playback_failed(
+                &app,
+                generation,
+                &format!("Could not configure WebView2 input timeouts: {error}"),
+            );
             return;
         }
         let (mut socket, _) = match tungstenite::client(websocket_url.as_str(), stream) {
             Ok(connection) => connection,
-            Err(error) => { playback_failed(&app, generation, &format!("Could not complete WebView2 input handshake: {error}")); return; }
+            Err(error) => {
+                playback_failed(
+                    &app,
+                    generation,
+                    &format!("Could not complete WebView2 input handshake: {error}"),
+                );
+                return;
+            }
         };
         let mut next_id = 1_u64;
         if let Err(error) = viewport_size(&mut socket, &mut next_id) {
             playback_failed(&app, generation, &error);
             return;
         }
-        let Some(state) = app.try_state::<MacroState>() else { return; };
-        if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) { return; }
-        notify(&app, "BFR Macro — Playback started", "The macro is running independently of your physical mouse and keyboard.", false);
+        let Some(state) = app.try_state::<MacroState>() else {
+            return;
+        };
+        if !playback_session_is_current(
+            state.mode.load(Ordering::SeqCst),
+            generation,
+            state.playback_generation.load(Ordering::SeqCst),
+        ) {
+            return;
+        }
+        notify(
+            &app,
+            "BFR Macro — Playback started",
+            "The macro is running independently of your physical mouse and keyboard.",
+            false,
+        );
 
         let mut completed_normally = true;
         'playback: loop {
             let loop_started = Instant::now();
             for click in &clicks {
-                let Some(state) = app.try_state::<MacroState>() else { return; };
-                let Some(deadline) = loop_started.checked_add(Duration::from_millis(click.elapsed_ms)) else {
-                    playback_failed(&app, generation, "The macro timing exceeded the supported duration.");
+                let Some(state) = app.try_state::<MacroState>() else {
+                    return;
+                };
+                let Some(deadline) =
+                    loop_started.checked_add(Duration::from_millis(click.elapsed_ms))
+                else {
+                    playback_failed(
+                        &app,
+                        generation,
+                        "The macro timing exceeded the supported duration.",
+                    );
                     return;
                 };
                 if !wait_while_playing_until(&state, generation, deadline) {
                     completed_normally = false;
                     break 'playback;
                 }
-                if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst)) {
+                if !playback_session_is_current(
+                    state.mode.load(Ordering::SeqCst),
+                    generation,
+                    state.playback_generation.load(Ordering::SeqCst),
+                ) {
                     completed_normally = false;
                     break 'playback;
                 }
                 let (width, height) = match viewport_size(&mut socket, &mut next_id) {
                     Ok(size) => size,
-                    Err(error) => { playback_failed(&app, generation, &error); return; }
+                    Err(error) => {
+                        playback_failed(&app, generation, &error);
+                        return;
+                    }
                 };
                 let x = (click.x * width).clamp(0.0, width - 1.0);
                 let y = (click.y * height).clamp(0.0, height - 1.0);
@@ -2297,12 +2930,30 @@ fn start_playback(app: AppHandle<Wry>) {
                 }
             }
 
-            let Some(state) = app.try_state::<MacroState>() else { return; };
-            if !playback_session_is_current(state.mode.load(Ordering::SeqCst), generation, state.playback_generation.load(Ordering::SeqCst))
-                || !state.loop_enabled.load(Ordering::SeqCst) { break; }
-            let last_offset = clicks.last().map(|click| Duration::from_millis(click.elapsed_ms)).unwrap_or_default();
-            let Some(next_loop_deadline) = loop_started.checked_add(last_offset).and_then(|deadline| deadline.checked_add(LOOP_GAP)) else {
-                playback_failed(&app, generation, "The macro loop timing exceeded the supported duration.");
+            let Some(state) = app.try_state::<MacroState>() else {
+                return;
+            };
+            if !playback_session_is_current(
+                state.mode.load(Ordering::SeqCst),
+                generation,
+                state.playback_generation.load(Ordering::SeqCst),
+            ) || !state.loop_enabled.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            let last_offset = clicks
+                .last()
+                .map(|click| Duration::from_millis(click.elapsed_ms))
+                .unwrap_or_default();
+            let Some(next_loop_deadline) = loop_started
+                .checked_add(last_offset)
+                .and_then(|deadline| deadline.checked_add(LOOP_GAP))
+            else {
+                playback_failed(
+                    &app,
+                    generation,
+                    "The macro loop timing exceeded the supported duration.",
+                );
                 return;
             };
             if !wait_while_playing_until(&state, generation, next_loop_deadline) {
@@ -2314,11 +2965,27 @@ fn start_playback(app: AppHandle<Wry>) {
         if completed_normally {
             if let Some(state) = app.try_state::<MacroState>() {
                 if state.playback_generation.load(Ordering::SeqCst) == generation
-                    && state.mode.compare_exchange(MODE_PLAYING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+                    && state
+                        .mode
+                        .compare_exchange(
+                            MODE_PLAYING,
+                            MODE_IDLE,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
                 {
-                    state.performance_event("playback_finished", json!({ "click_count": clicks.len() }));
+                    state.performance_event(
+                        "playback_finished",
+                        json!({ "click_count": clicks.len() }),
+                    );
                     refresh_tray_menu(&app);
-                    notify(&app, "BFR Macro — Playback finished", "The macro completed its playback.", false);
+                    notify(
+                        &app,
+                        "BFR Macro — Playback finished",
+                        "The macro completed its playback.",
+                        false,
+                    );
                 }
             }
         }
@@ -2329,8 +2996,7 @@ fn set_webview_memory_target(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>, 
     #[cfg(windows)]
     {
         use webview2_com::Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2_19,
-            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
             COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
         };
         // `cast()` is provided by the windows-core Interface trait. It must
@@ -2351,8 +3017,9 @@ fn set_webview_memory_target(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>, 
                 // directly so this works with the project's locked Tauri/Wry APIs.
                 let core = unsafe { webview.controller().CoreWebView2() }
                     .map_err(|error| error.to_string())?;
-                let core19 = core.cast::<ICoreWebView2_19>()
-                    .map_err(|error| format!("WebView2 memory target API is unavailable: {error}"))?;
+                let core19 = core.cast::<ICoreWebView2_19>().map_err(|error| {
+                    format!("WebView2 memory target API is unavailable: {error}")
+                })?;
                 unsafe { core19.SetMemoryUsageTargetLevel(target) }
                     .map_err(|error| error.to_string())
             })();
@@ -2362,16 +3029,26 @@ fn set_webview_memory_target(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>, 
                 }
             }
         });
-        let error = invoke_result.err().map(|error| error.to_string()).or_else(|| {
-            result.lock().ok().and_then(|slot| slot.clone())
-        });
+        let error = invoke_result
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| result.lock().ok().and_then(|slot| slot.clone()));
         if let Some(error) = error {
             if let Some(state) = app.try_state::<MacroState>() {
-                state.log(&format!("WebView2 memory target change to {} was unavailable: {error}", if low { "Low" } else { "Normal" }));
-                state.performance_event("webview_memory_target_failed", json!({ "target": if low { "low" } else { "normal" }, "error": error }));
+                state.log(&format!(
+                    "WebView2 memory target change to {} was unavailable: {error}",
+                    if low { "Low" } else { "Normal" }
+                ));
+                state.performance_event(
+                    "webview_memory_target_failed",
+                    json!({ "target": if low { "low" } else { "normal" }, "error": error }),
+                );
             }
         } else if let Some(state) = app.try_state::<MacroState>() {
-            state.performance_event("webview_memory_target_changed", json!({ "target": if low { "low" } else { "normal" } }));
+            state.performance_event(
+                "webview_memory_target_changed",
+                json!({ "target": if low { "low" } else { "normal" } }),
+            );
         }
     }
     #[cfg(not(windows))]
@@ -2387,7 +3064,10 @@ fn show_game(app: &AppHandle<Wry>, window: &WebviewWindow<Wry>) {
 
 fn find_free_local_port() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
-    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
     drop(listener);
     Ok(port)
 }
@@ -2415,12 +3095,18 @@ fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()>
 }
 
 fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result<()> {
-    if !legacy.exists() { return Ok(()); }
-    if let Some(parent) = destination.parent() { fs::create_dir_all(parent)?; }
+    if !legacy.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let recovery_copy = legacy.with_extension("jsonl.migrated");
     if !destination.exists() {
         fs::copy(legacy, destination)?;
-        if !recovery_copy.exists() { fs::rename(legacy, recovery_copy)?; }
+        if !recovery_copy.exists() {
+            fs::rename(legacy, recovery_copy)?;
+        }
         return Ok(());
     }
 
@@ -2430,8 +3116,12 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
     let destination_file = fs::File::open(destination)?;
     for line in std::io::BufReader::new(destination_file).split(b'\n') {
         let mut line = line?;
-        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
-        if !line.is_empty() { existing_lines.insert(line); }
+        while line.last().is_some_and(|last| *last == b'\r') {
+            line.pop();
+        }
+        if !line.is_empty() {
+            existing_lines.insert(line);
+        }
     }
     let legacy_file = fs::File::open(legacy)?;
     let mut output = fs::OpenOptions::new()
@@ -2442,8 +3132,12 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
     let mut appended_any = false;
     for line in std::io::BufReader::new(legacy_file).split(b'\n') {
         let mut line = line?;
-        while line.last().is_some_and(|last| *last == b'\r') { line.pop(); }
-        if line.is_empty() || !existing_lines.insert(line.clone()) { continue; }
+        while line.last().is_some_and(|last| *last == b'\r') {
+            line.pop();
+        }
+        if line.is_empty() || !existing_lines.insert(line.clone()) {
+            continue;
+        }
         if !appended_any {
             // Separate imported records from a pre-existing torn final line,
             // preserving that line's bytes rather than concatenating records.
@@ -2458,7 +3152,9 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
     // Preserve the original bytes under a recovery suffix and stop re-importing
     // the legacy path on every launch. If a prior recovery copy exists, leave the
     // source in place; line deduplication still makes a later retry idempotent.
-    if !recovery_copy.exists() { fs::rename(legacy, recovery_copy)?; }
+    if !recovery_copy.exists() {
+        fs::rename(legacy, recovery_copy)?;
+    }
     Ok(())
 }
 
@@ -2468,23 +3164,38 @@ fn reset_run_history_once(app_data_dir: &Path, _history_file: &Path) -> Result<b
     let marker_file = app_data_dir
         .join("Settings")
         .join("run-history-reset-v1.5.1-dev.3.done");
-    if marker_file.exists() { return Ok(false); }
+    if marker_file.exists() {
+        return Ok(false);
+    }
 
     // The old dev-only safeguard erased history on first launch for users who
     // never ran that development build. Mark the safeguard as handled without
     // deleting the active history or its legacy rotation backup.
-    write_file_atomically(&marker_file, b"Non-destructive safeguard retained existing Run History.\n")?;
+    write_file_atomically(
+        &marker_file,
+        b"Non-destructive safeguard retained existing Run History.\n",
+    )?;
     Ok(true)
 }
 
 fn open_data_folder(app: &AppHandle<Wry>, folder: PathBuf, label: &str) {
     if let Err(error) = fs::create_dir_all(&folder) {
-        notify(app, "BFR Macro — Folder unavailable", &format!("Could not create the {label} folder: {error}"), true);
+        notify(
+            app,
+            "BFR Macro — Folder unavailable",
+            &format!("Could not create the {label} folder: {error}"),
+            true,
+        );
         return;
     }
     match Command::new("explorer.exe").arg(&folder).spawn() {
         Ok(_) => {}
-        Err(error) => notify(app, "BFR Macro — Could not open folder", &format!("Could not open the {label} folder: {error}"), true),
+        Err(error) => notify(
+            app,
+            "BFR Macro — Could not open folder",
+            &format!("Could not open the {label} folder: {error}"),
+            true,
+        ),
     }
 }
 
@@ -2494,20 +3205,33 @@ fn open_tracker_window(app: &AppHandle<Wry>) {
         let _ = existing.set_focus();
         return;
     }
-    let (width, height, pinned) = app.try_state::<SettingsState>()
-        .and_then(|state| state.settings.lock().ok().map(|s| (s.tracker_width, s.tracker_height, s.tracker_pinned)))
+    let (width, height, pinned) = app
+        .try_state::<SettingsState>()
+        .and_then(|state| {
+            state
+                .settings
+                .lock()
+                .ok()
+                .map(|s| (s.tracker_width, s.tracker_height, s.tracker_pinned))
+        })
         .unwrap_or((760.0, 820.0, false));
-    let profile_dir = app.path().app_data_dir().ok().map(|path| path.join("webview2-profile"));
-    let mut builder = WebviewWindowBuilder::new(app, "tracker", WebviewUrl::App("tracker.html".into()))
-        .title("BFR Macro — Run History")
-        .inner_size(width, height)
-        .min_inner_size(560.0, 600.0)
-        .resizable(true)
-        .always_on_top(pinned)
-        .center();
-    if let Some(profile_dir) = profile_dir { builder = builder.data_directory(profile_dir); }
-    match builder.build()
-    {
+    let profile_dir = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|path| path.join("webview2-profile"));
+    let mut builder =
+        WebviewWindowBuilder::new(app, "tracker", WebviewUrl::App("tracker.html".into()))
+            .title("BFR Macro — Run History")
+            .inner_size(width, height)
+            .min_inner_size(560.0, 600.0)
+            .resizable(true)
+            .always_on_top(pinned)
+            .center();
+    if let Some(profile_dir) = profile_dir {
+        builder = builder.data_directory(profile_dir);
+    }
+    match builder.build() {
         Ok(window) => {
             let handle = app.clone();
             window.on_window_event(move |event| {
@@ -2531,29 +3255,104 @@ fn open_tracker_window(app: &AppHandle<Wry>) {
                     }
                 }
             });
-        },
-        Err(error) => notify(app, "BFR Run History — Could not open", &error.to_string(), true),
+        }
+        Err(error) => notify(
+            app,
+            "BFR Run History — Could not open",
+            &error.to_string(),
+            true,
+        ),
     }
 }
 
 fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
-    let open = icon_item(app, "open", "Open Game", include_bytes!("../icons/menu/monitor.png"))?;
-    let tracker = icon_item(app, "open_tracker", "Run History", include_bytes!("../icons/menu/history.png"))?;
-    let minimize = icon_item(app, "minimize", "Minimize to Tray", include_bytes!("../icons/menu/minimize.png"))?;
-    let reset = icon_item(app, "reset_size", "Reset Window Size", include_bytes!("../icons/menu/reset.png"))?;
-    let pin = Arc::new(icon_item(app, "toggle_pin", "Pin Window", include_bytes!("../icons/menu/pin.png"))?);
+    let open = icon_item(
+        app,
+        "open",
+        "Open Game",
+        include_bytes!("../icons/menu/monitor.png"),
+    )?;
+    let tracker = icon_item(
+        app,
+        "open_tracker",
+        "Run History",
+        include_bytes!("../icons/menu/history.png"),
+    )?;
+    let minimize = icon_item(
+        app,
+        "minimize",
+        "Minimize to Tray",
+        include_bytes!("../icons/menu/minimize.png"),
+    )?;
+    let reset = icon_item(
+        app,
+        "reset_size",
+        "Reset Window Size",
+        include_bytes!("../icons/menu/reset.png"),
+    )?;
+    let pin = Arc::new(icon_item(
+        app,
+        "toggle_pin",
+        "Pin Window",
+        include_bytes!("../icons/menu/pin.png"),
+    )?);
     let separator = PredefinedMenuItem::separator(app)?;
-    let record = Arc::new(icon_item(app, "record", "Start Recording", include_bytes!("../icons/menu/record.png"))?);
-    let play = Arc::new(icon_item(app, "play", "Play Macro", include_bytes!("../icons/menu/play.png"))?);
-    let loop_item = Arc::new(icon_item(app, "loop", "Loop Continuously: On", include_bytes!("../icons/menu/loop.png"))?);
-    let load = icon_item(app, "load", "Load Last Saved Macro", include_bytes!("../icons/menu/folder.png"))?;
+    let record = Arc::new(icon_item(
+        app,
+        "record",
+        "Start Recording",
+        include_bytes!("../icons/menu/record.png"),
+    )?);
+    let play = Arc::new(icon_item(
+        app,
+        "play",
+        "Play Macro",
+        include_bytes!("../icons/menu/play.png"),
+    )?);
+    let loop_item = Arc::new(icon_item(
+        app,
+        "loop",
+        "Loop Continuously: On",
+        include_bytes!("../icons/menu/loop.png"),
+    )?);
+    let load = icon_item(
+        app,
+        "load",
+        "Load Last Saved Macro",
+        include_bytes!("../icons/menu/folder.png"),
+    )?;
     let separator2 = PredefinedMenuItem::separator(app)?;
-    let app_folder = icon_item(app, "open_app_folder", "Open Application Folder", include_bytes!("../icons/menu/folder.png"))?;
-    let settings_folder = icon_item(app, "open_settings_folder", "Open Settings Folder", include_bytes!("../icons/menu/folder.png"))?;
-    let macros_folder = icon_item(app, "open_macros_folder", "Open Saved Macros Folder", include_bytes!("../icons/menu/folder.png"))?;
-    let logs_folder = icon_item(app, "open_logs_folder", "Open Logs Folder", include_bytes!("../icons/menu/folder.png"))?;
+    let app_folder = icon_item(
+        app,
+        "open_app_folder",
+        "Open Application Folder",
+        include_bytes!("../icons/menu/folder.png"),
+    )?;
+    let settings_folder = icon_item(
+        app,
+        "open_settings_folder",
+        "Open Settings Folder",
+        include_bytes!("../icons/menu/folder.png"),
+    )?;
+    let macros_folder = icon_item(
+        app,
+        "open_macros_folder",
+        "Open Saved Macros Folder",
+        include_bytes!("../icons/menu/folder.png"),
+    )?;
+    let logs_folder = icon_item(
+        app,
+        "open_logs_folder",
+        "Open Logs Folder",
+        include_bytes!("../icons/menu/folder.png"),
+    )?;
     let separator3 = PredefinedMenuItem::separator(app)?;
-    let exit = icon_item(app, "exit", "Exit BFR Macro & Tracking Utility", include_bytes!("../icons/menu/exit.png"))?;
+    let exit = icon_item(
+        app,
+        "exit",
+        "Exit BFR Macro & Tracking Utility",
+        include_bytes!("../icons/menu/exit.png"),
+    )?;
 
     let items: [&dyn IsMenuItem<Wry>; 17] = [
         &open,
@@ -2583,7 +3382,11 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     });
 
     TrayIconBuilder::with_id("bfr-macro-tray")
-        .icon(app.default_window_icon().cloned().expect("default app icon is configured"))
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .expect("default app icon is configured"),
+        )
         .tooltip("BFR Macro & Tracking Utility")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -2591,9 +3394,13 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
             let window = app.get_webview_window("game");
             match event.id().as_ref() {
                 "open" => {
-                    if let Some(window) = window.as_ref() { show_game(app, window); }
+                    if let Some(window) = window.as_ref() {
+                        show_game(app, window);
+                    }
                 }
-                "open_tracker" => { open_tracker_window(app); }
+                "open_tracker" => {
+                    open_tracker_window(app);
+                }
                 "minimize" => {
                     if let Some(window) = window.as_ref() {
                         set_webview_memory_target(app, window, true);
@@ -2602,7 +3409,8 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                 }
                 "reset_size" => {
                     if let Some(window) = window.as_ref() {
-                        let _ = window.set_size(tauri::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+                        let _ =
+                            window.set_size(tauri::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
                         let _ = window.center();
                     }
                     if let Some(state) = app.try_state::<SettingsState>() {
@@ -2612,9 +3420,15 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                         }
                         if let Err(error) = state.save() {
                             if let Some(macro_state) = app.try_state::<MacroState>() {
-                                macro_state.log(&format!("Could not save reset window size: {error}"));
+                                macro_state
+                                    .log(&format!("Could not save reset window size: {error}"));
                             }
-                            notify(app, "BFR Macro — Settings save failed", &format!("Could not save window settings: {error}"), true);
+                            notify(
+                                app,
+                                "BFR Macro — Settings save failed",
+                                &format!("Could not save window settings: {error}"),
+                                true,
+                            );
                         }
                     }
                     notify(app, "BFR Macro", "Window size reset.", false);
@@ -2630,10 +3444,24 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                             };
                             let _ = window.set_always_on_top(pinned);
                             if let Err(error) = state.save() {
-                                notify(app, "BFR Macro — Settings save failed", &format!("Could not save window pin setting: {error}"), true);
+                                notify(
+                                    app,
+                                    "BFR Macro — Settings save failed",
+                                    &format!("Could not save window pin setting: {error}"),
+                                    true,
+                                );
                             }
                             refresh_tray_menu(app);
-                            notify(app, "BFR Macro", if pinned { "Window pin enabled." } else { "Window pin disabled." }, false);
+                            notify(
+                                app,
+                                "BFR Macro",
+                                if pinned {
+                                    "Window pin enabled."
+                                } else {
+                                    "Window pin disabled."
+                                },
+                                false,
+                            );
                         }
                     }
                 }
@@ -2648,11 +3476,25 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                                 value.loop_enabled = enabled;
                             }
                             if let Err(error) = settings.save() {
-                                notify(app, "BFR Macro — Settings save failed", &format!("Could not save loop setting: {error}"), true);
+                                notify(
+                                    app,
+                                    "BFR Macro — Settings save failed",
+                                    &format!("Could not save loop setting: {error}"),
+                                    true,
+                                );
                             }
                         }
                         refresh_tray_menu(app);
-                        notify(app, "BFR Macro", if enabled { "Continuous looping enabled." } else { "Continuous looping disabled." }, false);
+                        notify(
+                            app,
+                            "BFR Macro",
+                            if enabled {
+                                "Continuous looping enabled."
+                            } else {
+                                "Continuous looping disabled."
+                            },
+                            false,
+                        );
                     }
                 }
                 "load" => {
@@ -2660,22 +3502,35 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                         match state.load_macro() {
                             Ok(count) => {
                                 refresh_tray_menu(app);
-                                notify(app, "BFR Macro", &format!("Loaded the last saved macro ({count} clicks)."), false);
+                                notify(
+                                    app,
+                                    "BFR Macro",
+                                    &format!("Loaded the last saved macro ({count} clicks)."),
+                                    false,
+                                );
                             }
-                            Err(error) => notify(app, "BFR Macro — Load failed", &format!("Could not load a saved macro: {error}"), true),
+                            Err(error) => notify(
+                                app,
+                                "BFR Macro — Load failed",
+                                &format!("Could not load a saved macro: {error}"),
+                                true,
+                            ),
                         }
                     }
                 }
-                "open_app_folder" => {
-                    match std::env::current_exe() {
-                        Ok(executable) => {
-                            if let Some(folder) = executable.parent() {
-                                open_data_folder(app, folder.to_path_buf(), "application");
-                            }
+                "open_app_folder" => match std::env::current_exe() {
+                    Ok(executable) => {
+                        if let Some(folder) = executable.parent() {
+                            open_data_folder(app, folder.to_path_buf(), "application");
                         }
-                        Err(error) => notify(app, "BFR Macro — Could not locate application", &error.to_string(), true),
                     }
-                }
+                    Err(error) => notify(
+                        app,
+                        "BFR Macro — Could not locate application",
+                        &error.to_string(),
+                        true,
+                    ),
+                },
                 "open_settings_folder" => {
                     if let Ok(app_data) = app.path().app_data_dir() {
                         open_data_folder(app, app_data.join("Settings"), "settings");
@@ -2741,7 +3596,11 @@ fn ensure_single_instance() -> Result<bool, String> {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn CreateMutexW(
+            attributes: *mut c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
         fn GetLastError() -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
@@ -2756,7 +3615,9 @@ fn ensure_single_instance() -> Result<bool, String> {
     }
 
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        unsafe { CloseHandle(handle); }
+        unsafe {
+            CloseHandle(handle);
+        }
         return Ok(false);
     }
 
@@ -2807,15 +3668,29 @@ pub fn run() {
             ).err();
 
             // One-time, non-destructive migration from the original 0.5.1 data layout.
-            migrate_legacy_file(&app_data.join("settings.json"), &settings_dir.join("settings.json"))?;
-            migrate_legacy_file(&app_data.join("recording.bfrmacro"), &macros_dir.join("recording.bfrmacro"))?;
-            migrate_legacy_file(&app_data.join("bfr-macro.log"), &logs_dir.join("bfr-macro.log"))?;
-
+            // Migration failures are recorded and startup continues; originals are copied,
+            // never moved or deleted. Settings writes are separately guarded below.
+            let legacy_settings_file = app_data.join("settings.json");
             let settings_file = settings_dir.join("settings.json");
-            let mut settings = fs::read(&settings_file)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
-                .unwrap_or_default();
+            let settings_migration_error = migrate_legacy_file(&legacy_settings_file, &settings_file).err();
+            let macro_migration_error = migrate_legacy_file(&app_data.join("recording.bfrmacro"), &macros_dir.join("recording.bfrmacro")).err();
+            let log_migration_error = migrate_legacy_file(&app_data.join("bfr-macro.log"), &logs_dir.join("bfr-macro.log")).err();
+
+            // Prefer the new location, but if migration failed and only the legacy
+            // file exists, read it without changing it. Any uncertain/corrupt state
+            // blocks subsequent saves so defaults cannot destroy the original.
+            let settings_source = if settings_file.exists() { &settings_file } else { &legacy_settings_file };
+            let (mut settings, settings_save_blocked_reason) = if settings_source.exists() {
+                match fs::read(settings_source) {
+                    Ok(bytes) => match serde_json::from_slice::<AppSettings>(&bytes) {
+                        Ok(value) => (value, settings_migration_error.as_ref().map(|error| format!("legacy settings migration failed: {error}"))),
+                        Err(error) => (AppSettings::default(), Some(format!("existing settings file could not be parsed: {error}"))),
+                    },
+                    Err(error) => (AppSettings::default(), Some(format!("existing settings file could not be read: {error}"))),
+                }
+            } else {
+                (AppSettings::default(), None)
+            };
             if !settings.width.is_finite() || settings.width < 600.0 {
                 settings.width = WINDOW_WIDTH;
             }
@@ -2878,6 +3753,18 @@ pub fn run() {
             if let Some(error) = tracker_migration_error {
                 macro_state.log(&format!("Legacy Run History migration could not complete; the original file was retained for recovery: {error}"));
             }
+            if let Some(error) = settings_migration_error {
+                macro_state.log(&format!("Legacy settings migration could not complete; the original file was retained: {error}"));
+            }
+            if let Some(error) = macro_migration_error {
+                macro_state.log(&format!("Legacy macro migration could not complete; the original file was retained: {error}"));
+            }
+            if let Some(error) = log_migration_error {
+                macro_state.log(&format!("Legacy application log migration could not complete; the original file was retained: {error}"));
+            }
+            if let Some(reason) = settings_save_blocked_reason.as_deref() {
+                macro_state.log(&format!("Settings persistence is temporarily blocked to protect existing user data: {reason}"));
+            }
             if let Some(error) = run_history_marker_error {
                 macro_state.log(&format!("Could not write the non-destructive Run History marker; startup continued without changing history: {error}"));
             }
@@ -2894,6 +3781,7 @@ pub fn run() {
                 file: settings_file,
                 settings: Mutex::new(settings.clone()),
                 save_lock: Mutex::new(()),
+                save_blocked_reason: settings_save_blocked_reason,
                 resize_save_tx,
             });
             app.manage(macro_state);
@@ -3035,7 +3923,6 @@ pub fn run() {
         .expect("error while running BFR Macro & Tracking Utility");
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3058,7 +3945,10 @@ mod tests {
         fs::write(&history, b"{\"record_type\":\"battle_reward\"}\n").unwrap();
         fs::write(&backup, b"older-history\n").unwrap();
         assert!(reset_run_history_once(&dir, &history).unwrap());
-        assert_eq!(fs::read(&history).unwrap(), b"{\"record_type\":\"battle_reward\"}\n");
+        assert_eq!(
+            fs::read(&history).unwrap(),
+            b"{\"record_type\":\"battle_reward\"}\n"
+        );
         assert_eq!(fs::read(&backup).unwrap(), b"older-history\n");
         assert!(!reset_run_history_once(&dir, &history).unwrap());
         fs::remove_dir_all(dir).unwrap();
@@ -3075,9 +3965,20 @@ mod tests {
 
     #[test]
     fn macro_validation_rejects_absurd_delays_and_click_counts() {
-        let absurd = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: u64::MAX }];
+        let absurd = vec![MacroClick {
+            x: 0.5,
+            y: 0.5,
+            elapsed_ms: u64::MAX,
+        }];
         assert!(validate_macro_clicks(&absurd).is_err());
-        let too_many = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 0 }; MAX_MACRO_CLICKS + 1];
+        let too_many = vec![
+            MacroClick {
+                x: 0.5,
+                y: 0.5,
+                elapsed_ms: 0
+            };
+            MAX_MACRO_CLICKS + 1
+        ];
         assert!(validate_macro_clicks(&too_many).is_err());
     }
 
@@ -3086,13 +3987,18 @@ mod tests {
         assert!(can_load_macro(MODE_IDLE));
         assert!(!can_load_macro(MODE_RECORDING));
         assert!(!can_load_macro(MODE_PLAYING));
+        assert!(!can_load_macro(MODE_STOPPING));
     }
 
     #[test]
     fn macro_buffer_transitions_are_serialized_with_mode_changes() {
         let mode = AtomicU8::new(MODE_IDLE);
         let record_started = Mutex::new(None);
-        let clicks = Mutex::new(vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 10 }]);
+        let clicks = Mutex::new(vec![MacroClick {
+            x: 0.5,
+            y: 0.5,
+            elapsed_ms: 10,
+        }]);
 
         assert!(begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
         assert_eq!(mode.load(Ordering::SeqCst), MODE_RECORDING);
@@ -3101,7 +4007,11 @@ mod tests {
         assert!(!can_load_macro(mode.load(Ordering::SeqCst)));
 
         mode.store(MODE_IDLE, Ordering::SeqCst);
-        clicks.lock().unwrap().push(MacroClick { x: 0.25, y: 0.75, elapsed_ms: 20 });
+        clicks.lock().unwrap().push(MacroClick {
+            x: 0.25,
+            y: 0.75,
+            elapsed_ms: 20,
+        });
         let snapshot = begin_playback_if_idle(&mode, &clicks).unwrap().unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(mode.load(Ordering::SeqCst), MODE_PLAYING);
@@ -3115,18 +4025,97 @@ mod tests {
     }
 
     #[test]
-    fn recording_error_only_ends_an_active_recording() {
-        let mode = AtomicU8::new(MODE_RECORDING);
-        assert!(end_recording_if_recording(&mode));
-        assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
+    fn recording_cannot_restart_or_replace_buffer_until_stop_save_finishes() {
+        let mode = AtomicU8::new(MODE_IDLE);
+        let record_started = Mutex::new(None);
+        let clicks = Mutex::new(Vec::new());
+        assert!(begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        clicks.lock().unwrap().push(MacroClick {
+            x: 0.2,
+            y: 0.3,
+            elapsed_ms: 10,
+        });
 
-        mode.store(MODE_PLAYING, Ordering::SeqCst);
-        assert!(!end_recording_if_recording(&mode));
+        let (snapshot, _) = begin_stopping_recording(&mode, &record_started, &clicks)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_STOPPING);
+        assert_eq!(snapshot.len(), 1);
+        assert!(!can_load_macro(mode.load(Ordering::SeqCst)));
+        assert!(!begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        assert!(begin_playback_if_idle(&mode, &clicks).unwrap().is_none());
+        assert_eq!(clicks.lock().unwrap()[0].elapsed_ms, 10);
+
+        // Hold a simulated save operation open on another thread. While it is
+        // blocked, attempts to start/load/play must remain rejected.
+        let mode = Arc::new(mode);
+        let save_entered = Arc::new(std::sync::Barrier::new(2));
+        let allow_save_finish = Arc::new(std::sync::Barrier::new(2));
+        let worker_mode = Arc::clone(&mode);
+        let worker_entered = Arc::clone(&save_entered);
+        let worker_release = Arc::clone(&allow_save_finish);
+        let worker = std::thread::spawn(move || {
+            worker_entered.wait();
+            worker_release.wait();
+            assert!(finish_stopping_recording(&worker_mode));
+        });
+        save_entered.wait();
+        assert_eq!(snapshot[0].elapsed_ms, 10);
+        assert!(!begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        assert!(begin_playback_if_idle(&mode, &clicks).unwrap().is_none());
+        assert!(!can_load_macro(mode.load(Ordering::SeqCst)));
+        allow_save_finish.wait();
+        worker.join().unwrap();
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
+        assert!(begin_recording_if_idle(&mode, &record_started, &clicks).unwrap());
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_error_stop_does_not_end_playback_or_idle_state() {
+        let mode = AtomicU8::new(MODE_PLAYING);
+        let started = Mutex::new(None);
+        let clicks = Mutex::new(Vec::new());
+        assert!(begin_stopping_recording(&mode, &started, &clicks)
+            .unwrap()
+            .is_none());
         assert_eq!(mode.load(Ordering::SeqCst), MODE_PLAYING);
-
         mode.store(MODE_IDLE, Ordering::SeqCst);
-        assert!(!end_recording_if_recording(&mode));
+        assert!(begin_stopping_recording(&mode, &started, &clicks)
+            .unwrap()
+            .is_none());
         assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
+    }
+
+    #[test]
+    fn blocked_settings_save_preserves_the_original_corrupt_file() {
+        let dir = temp_dir("settings-preservation");
+        let file = dir.join("settings.json");
+        let original = b"{ this is intentionally malformed settings";
+        fs::write(&file, original).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let state = SettingsState {
+            file: file.clone(),
+            settings: Mutex::new(AppSettings::default()),
+            save_lock: Mutex::new(()),
+            save_blocked_reason: Some("existing settings could not be parsed".to_string()),
+            resize_save_tx: tx,
+        };
+        assert!(state.save().is_err());
+        assert_eq!(fs::read(&file).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_bfrmacro2_fixture_remains_deserializable() {
+        // Synthetic compatibility fixture only; this is not evidence from an
+        // authentic file produced by a historical application release.
+        let fixture = br#"{"format":"BFRMACRO2","clicks":[{"x":0.25,"y":0.75,"elapsed_ms":125}]}"#;
+        let parsed: MacroFile = serde_json::from_slice(fixture).unwrap();
+        assert_eq!(parsed.format, "BFRMACRO2");
+        assert_eq!(parsed.clicks.len(), 1);
+        assert_eq!(parsed.clicks[0].elapsed_ms, 125);
+        validate_macro_clicks(&parsed.clicks).unwrap();
     }
 
     #[test]
@@ -3142,7 +4131,11 @@ mod tests {
         let history = dir.join("battle-rewards.jsonl");
         let backup = history.with_extension("jsonl.1");
         fs::write(&backup, b"{\"record_type\":\"battle_reward\",\"n\":1}\n").unwrap();
-        fs::write(&history, b"not-json\n{\"record_type\":\"battle_reward\",\"n\":2}\n").unwrap();
+        fs::write(
+            &history,
+            b"not-json\n{\"record_type\":\"battle_reward\",\"n\":2}\n",
+        )
+        .unwrap();
         let mut records = Vec::new();
         let mut malformed = 0;
         read_jsonl_records(&backup, &mut records, &mut malformed).unwrap();
@@ -3151,7 +4144,8 @@ mod tests {
         assert_eq!(malformed, 1);
         // Cross the diagnostics rotation threshold, then append again: history
         // writes must not rotate the active file or discard the prior backup.
-        let large_record = json!({"record_type":"battle_reward","payload":"x".repeat(5 * 1024 * 1024)});
+        let large_record =
+            json!({"record_type":"battle_reward","payload":"x".repeat(5 * 1024 * 1024)});
         append_history_record(&history, &large_record).unwrap();
         assert!(fs::metadata(&history).unwrap().len() > 5 * 1024 * 1024);
         append_history_record(&history, &json!({"record_type":"battle_reward","n":3})).unwrap();
@@ -3226,8 +4220,14 @@ mod tests {
         fs::write(&destination, b"same\n").unwrap();
         migrate_tracker_history(&legacy, &destination).unwrap();
         let recovery_copy = legacy.with_extension("jsonl.migrated");
-        assert!(!legacy.exists(), "migrated legacy path should not be imported again");
-        assert!(recovery_copy.exists(), "legacy history must remain as a recovery copy");
+        assert!(
+            !legacy.exists(),
+            "migrated legacy path should not be imported again"
+        );
+        assert!(
+            recovery_copy.exists(),
+            "legacy history must remain as a recovery copy"
+        );
         assert_eq!(fs::read(&recovery_copy).unwrap(), b"same\nnew\n");
         assert_eq!(fs::read_to_string(&destination).unwrap().lines().count(), 2);
         fs::remove_dir_all(dir).unwrap();

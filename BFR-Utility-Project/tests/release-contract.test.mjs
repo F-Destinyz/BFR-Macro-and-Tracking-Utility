@@ -225,7 +225,7 @@ test('macro loading enforces size, click-count and delay limits', () => {
 
 test('macro edge cases restore the previous save and reject overlong recordings', () => {
   assert.match(rust, /No clicks were captured, so the previous saved macro was kept/);
-  assert.match(rust, /state\.load_macro\(\)/);
+  assert.match(rust, /restore_saved_macro_during_stopping/);
   assert.match(rust, /Recording reached the 24-hour safety limit/);
   assert.match(rust, /Recording reached the \{MAX_MACRO_CLICKS\}-click safety limit/);
 });
@@ -269,4 +269,32 @@ test('all icons embedded by the Rust tray implementation exist', () => {
   for (const match of references) {
     assert.ok(fs.existsSync(path.join(root, 'src-tauri', 'icons', match[1])), `Missing icon asset: ${match[1]}`);
   }
+});
+
+test('recording stop is serialized through a non-startable Stopping state', () => {
+  assert.match(rust, /const MODE_STOPPING: u8 = 3/);
+  assert.match(rust, /fn begin_stopping_recording\(/);
+  assert.match(rust, /fn finish_stopping_recording\(/);
+  assert.match(rust, /save_macro_snapshot\(&clicks\)/);
+  assert.match(rust, /MODE_STOPPING => return/);
+  assert.match(rust, /mode != MODE_STOPPING/);
+});
+
+test('reward persistence diagnostics only report records actually appended', () => {
+  assert.match(rust, /fn tracker_reward_event\(&self, details: Value\) -> Result<bool, String>/);
+  assert.match(rust, /Ok\(true\)/);
+  assert.match(rust, /if \(!persisted\) return/);
+  assert.match(rust, /event: 'reward_persisted'/);
+});
+
+test('settings migration and parsing failures protect the original file', () => {
+  assert.match(rust, /settings_save_blocked_reason/);
+  assert.match(rust, /Settings were not saved to protect the existing settings file/);
+  assert.match(rust, /legacy settings migration failed/);
+  assert.match(rust, /Legacy settings migration could not complete; the original file was retained/);
+});
+
+test('legacy macro compatibility fixture is explicitly synthetic', () => {
+  assert.match(rust, /synthetic_bfrmacro2_fixture_remains_deserializable/);
+  assert.match(rust, /Synthetic compatibility fixture only/);
 });

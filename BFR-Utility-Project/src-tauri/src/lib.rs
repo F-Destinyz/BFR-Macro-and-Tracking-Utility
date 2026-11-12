@@ -2048,7 +2048,8 @@ fn read_jsonl_page(
 
     // Anchor offsets to the record count from the previous page. New appends
     // shift the physical tail, so account for them without skipping older rows.
-    let effective_offset = offset.saturating_add(total_records.saturating_sub(anchor_total));
+    let newly_appended = if anchor_total == 0 { 0 } else { total_records.saturating_sub(anchor_total) };
+    let effective_offset = offset.saturating_add(newly_appended);
     let end = total_records.saturating_sub(effective_offset);
     let start = end.saturating_sub(limit);
     let mut records = Vec::with_capacity(end.saturating_sub(start));

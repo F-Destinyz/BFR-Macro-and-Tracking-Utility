@@ -1807,7 +1807,7 @@ impl MacroState {
         }
     }
 
-    fn tracker_read_data_page(&self, offset: usize, requested_limit: usize) -> Result<TrackerHistoryPage, String> {
+    fn tracker_read_data_page(&self, offset: usize, anchor_total: usize, requested_limit: usize) -> Result<TrackerHistoryPage, String> {
         let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
             "Tracker history is unavailable because its lock was poisoned".to_string()
         })?;
@@ -1821,7 +1821,8 @@ impl MacroState {
                 total_records = total_records.saturating_add(1);
             })?;
         }
-        let end = total_records.saturating_sub(offset);
+        let effective_offset = offset.saturating_add(total_records.saturating_sub(anchor_total));
+        let end = total_records.saturating_sub(effective_offset);
         let start = end.saturating_sub(limit);
         let mut records = Vec::with_capacity(end.saturating_sub(start));
         let mut record_index = 0usize;
@@ -2463,8 +2464,8 @@ fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<
 }
 
 #[tauri::command(async)]
-fn tracker_read_data_page(offset: usize, limit: usize, state: State<'_, MacroState>) -> Result<TrackerHistoryPage, String> {
-    state.tracker_read_data_page(offset, limit)
+fn tracker_read_data_page(offset: usize, anchor_total: usize, limit: usize, state: State<'_, MacroState>) -> Result<TrackerHistoryPage, String> {
+    state.tracker_read_data_page(offset, anchor_total, limit)
 }
 
 #[tauri::command(async)]

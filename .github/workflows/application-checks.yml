@@ -1,0 +1,50 @@
+name: Application checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-checks:
+    name: Node, Rust tests and Clippy
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: BFR-Utility-Project/package-lock.json
+
+      - name: Install JavaScript dependencies
+        working-directory: BFR-Utility-Project
+        run: npm ci
+
+      - name: Run JavaScript release-contract tests
+        working-directory: BFR-Utility-Project
+        run: npm test
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Rust tests
+        working-directory: BFR-Utility-Project
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Clippy
+        working-directory: BFR-Utility-Project
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

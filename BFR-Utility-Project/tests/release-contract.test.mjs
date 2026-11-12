@@ -140,8 +140,8 @@ test('Run History normalizes single completions and repeat snapshots without dou
 });
 
 test('Run History duration display rejects API fallback timestamps', () => {
-  const durationSource = trackerHtml.match(/const durationText=ms=>\\{[^\\n]*\\};/);
-  const elapsedSource = trackerHtml.match(/function elapsedTimeText\\(record\\)\\{[^\\n]*\\}/);
+  const durationSource = trackerHtml.match(/const durationText=ms=>\\{[\\s\\S]*?\\};/);
+  const elapsedSource = trackerHtml.match(/function elapsedTimeText\\(record\\)\\{[\\s\\S]*?\\}/);
   assert.ok(durationSource && elapsedSource, 'Run History duration functions were not found');
   const elapsedTimeText = vm.runInNewContext(`${durationSource[0]}\n${elapsedSource[0]}\nelapsedTimeText;`);
   assert.equal(elapsedTimeText({ dungeon_started_at_unix_ms: 1000, timestamp_unix_ms: 19208 }), '18s');

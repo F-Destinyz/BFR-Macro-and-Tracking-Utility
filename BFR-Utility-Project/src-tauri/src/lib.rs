@@ -1802,9 +1802,16 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
     Ok(())
 }
 
+// Transition to Idle only when a recording is active. A late recording-error
+// IPC event must never cancel an unrelated playback session.
+fn end_recording_if_recording(mode: &AtomicU8) -> bool {
+    mode.compare_exchange(MODE_RECORDING, MODE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 #[tauri::command]
 fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_, MacroState>) {
-    if state.mode.swap(MODE_IDLE, Ordering::SeqCst) == MODE_RECORDING {
+    if end_recording_if_recording(&state.mode) {
         let recording_duration_ms = state.record_started.lock().ok().and_then(|mut started| {
             started.take().map(|instant| instant.elapsed().as_millis())
         });
@@ -2972,6 +2979,21 @@ mod tests {
         assert!(validate_macro_clicks(&absurd).is_err());
         let too_many = vec![MacroClick { x: 0.5, y: 0.5, elapsed_ms: 0 }; MAX_MACRO_CLICKS + 1];
         assert!(validate_macro_clicks(&too_many).is_err());
+    }
+
+    #[test]
+    fn recording_error_only_ends_an_active_recording() {
+        let mode = AtomicU8::new(MODE_RECORDING);
+        assert!(end_recording_if_recording(&mode));
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
+
+        mode.store(MODE_PLAYING, Ordering::SeqCst);
+        assert!(!end_recording_if_recording(&mode));
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_PLAYING);
+
+        mode.store(MODE_IDLE, Ordering::SeqCst);
+        assert!(!end_recording_if_recording(&mode));
+        assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
     }
 
     #[test]

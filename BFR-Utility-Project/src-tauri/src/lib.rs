@@ -4750,7 +4750,7 @@ mod tests {
         let destination = dir.join("Logs/battle-rewards.jsonl");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
 
-        let legacy_bytes = b"{\"record_type\":\"battle_reward\",\"run_id\":\"first\"}\\n{\"record_type\":\"battle_reward\",\"run_id\":\"second\"}\\n";
+        let legacy_bytes = b"{\"record_type\":\"battle_reward\",\"run_id\":\"first\"}\n{\"record_type\":\"battle_reward\",\"run_id\":\"second\"}\\n";
         fs::write(&legacy, legacy_bytes).unwrap();
 
         migrate_tracker_history(&legacy, &destination).unwrap();

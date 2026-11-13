@@ -409,3 +409,11 @@ test('macro click IPC queue is bounded and stops capture when the bridge stalls'
   assert.equal(calls.filter((call) => call.command === 'record_click').length, 1,
     'Further physical clicks must be ignored after overflow');
 });
+
+test('Run History dashboard provides keyboard focus and accessible table semantics', () => {
+  assert.match(trackerHtml, /button:focus-visible,input:focus-visible/);
+  assert.match(trackerHtml, /<table aria-label="Completed dungeon rewards">/);
+  assert.equal((trackerHtml.match(/<th scope="col">/g) || []).length, 9);
+  assert.match(trackerHtml, /id="loadOlder" aria-controls="historyTable"/);
+  assert.match(trackerHtml, /id="status" class="status" role="status" aria-live="polite"/);
+});

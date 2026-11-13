@@ -461,7 +461,10 @@ test('unreadable saved macros cannot be overwritten by later recordings', () => 
   assert.match(rust, /automatic replacement is disabled until it can be loaded or removed/);
   assert.match(rust, /path inspection failed: \{error\}/);
   assert.match(rust, /fn blocked_macro_save_preserves_existing_file\(/);
+  assert.match(rust, /fn manually_removed_saved_macro_clears_the_save_block\(/);
+  assert.match(rust, /fn existing_saved_macro_keeps_the_save_block_until_loaded\(/);
   assert.match(rust, /fn empty_macro_snapshot_remains_a_no_op_even_when_saving_is_blocked\(/);
+  assert.match(rust, /clear_macro_save_block_if_file_missing\(&self\.file, &mut blocked_reason\)/);
   const start = rust.indexOf('fn save_macro_snapshot_to_file(');
   const end = rust.indexOf('impl MacroState {', start);
   assert.ok(start >= 0 && end > start, 'Macro save guard helper was not found');

@@ -64,7 +64,7 @@ function updatePinButton(){pinButton.setAttribute('aria-pressed',String(pinned))
 function showPinError(message){pinStatus.className='status error';pinStatus.textContent=message}
 (async()=>{try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!=='function')throw new Error('Window controls unavailable');pinned=Boolean(await invoke('tracker_get_pinned'));pinStateReady=true;updatePinButton();pinButton.disabled=false}catch(e){pinButton.title='Pin state unavailable';pinButton.setAttribute('aria-label','Pin state unavailable');showPinError(`Pin state error: ${String(e)}`)}})();
 pinButton.addEventListener('click',async()=>{if(!pinStateReady||pinButton.disabled)return;const next=!pinned;pinButton.disabled=true;try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!=='function')throw new Error('Window controls unavailable');await invoke('tracker_set_pinned',{pinned:next});pinned=next;updatePinButton()}catch(e){showPinError(`Pin error: ${String(e)}`)}finally{pinButton.disabled=!pinStateReady}});
-document.getElementById('refresh').addEventListener('click',load);
+document.getElementById('refresh').addEventListener('click',()=>load(false));
 document.getElementById('historySearch').addEventListener('input',render);
 clearHistoryButton.addEventListener('click',async()=>{
  if(loadingPage||historyMutationInProgress)return;

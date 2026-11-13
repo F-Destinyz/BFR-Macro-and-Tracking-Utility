@@ -1968,6 +1968,23 @@ fn select_app_process_ids(root_pid: u32, entries: &[ProcessTreeEntry]) -> Vec<u3
     selected
 }
 
+fn calculate_cpu_percent(
+    previous_ticks: u64,
+    current_ticks: u64,
+    elapsed: Duration,
+    logical_cpus: usize,
+) -> Option<f64> {
+    let elapsed_seconds = elapsed.as_secs_f64();
+    if elapsed_seconds <= 0.0 {
+        return None;
+    }
+    let cpu_seconds = current_ticks.saturating_sub(previous_ticks) as f64 / 10_000_000.0;
+    Some(
+        (cpu_seconds / elapsed_seconds / logical_cpus.max(1) as f64 * 100.0)
+            .clamp(0.0, 100.0),
+    )
+}
+
 #[cfg(windows)]
 #[derive(Default)]
 struct ProcessMetrics {
@@ -2154,15 +2171,15 @@ fn collect_process_metrics(previous_cpu: &mut Option<(u64, Instant)>) -> Process
     if found_cpu {
         let now = Instant::now();
         if let Some((old_ticks, old_time)) = previous_cpu.take() {
-            let elapsed = now.duration_since(old_time).as_secs_f64();
-            let delta = cpu_ticks.saturating_sub(old_ticks) as f64 / 10_000_000.0;
             let logical_cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(1) as f64;
-            if elapsed > 0.0 {
-                result.cpu_percent =
-                    Some((delta / elapsed / logical_cpus * 100.0).clamp(0.0, 100.0));
-            }
+                .unwrap_or(1);
+            result.cpu_percent = calculate_cpu_percent(
+                old_ticks,
+                cpu_ticks,
+                now.duration_since(old_time),
+                logical_cpus,
+            );
         }
         *previous_cpu = Some((cpu_ticks, now));
     }
@@ -4116,6 +4133,33 @@ mod tests {
         ];
 
         assert_eq!(select_app_process_ids(100, &entries), vec![100, 201, 202]);
+    }
+
+    #[test]
+    fn performance_cpu_aggregation_uses_elapsed_time_and_logical_cpu_count() {
+        let cpu_percent = calculate_cpu_percent(
+            0,
+            20_000_000,
+            Duration::from_secs(2),
+            2,
+        );
+        assert_eq!(cpu_percent, Some(50.0));
+    }
+
+    #[test]
+    fn performance_cpu_aggregation_handles_counter_reset_and_zero_elapsed_time() {
+        assert_eq!(
+            calculate_cpu_percent(20_000_000, 10_000_000, Duration::from_secs(2), 4),
+            Some(0.0)
+        );
+        assert_eq!(
+            calculate_cpu_percent(0, 10_000_000, Duration::ZERO, 4),
+            None
+        );
+        assert_eq!(
+            calculate_cpu_percent(0, 400_000_000, Duration::from_secs(10), 4),
+            Some(100.0)
+        );
     }
 
     #[test]

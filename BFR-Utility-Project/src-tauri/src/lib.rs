@@ -4436,7 +4436,7 @@ mod tests {
         assert!(keys.lock().unwrap().is_empty());
 
         fs::create_dir_all(active.parent().unwrap()).unwrap();
-        fs::write(&active, "{\\"dedupe_key\\":\\"batch-A:5\\"}\\n").unwrap();
+        fs::write(&active, b"{\"dedupe_key\":\"batch-A:5\"}\n").unwrap();
         ensure_history_dedupe_keys_loaded(&ready, &keys, &backup, &active).unwrap();
 
         assert!(ready.load(Ordering::Acquire));

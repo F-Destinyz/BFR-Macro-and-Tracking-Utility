@@ -226,6 +226,21 @@ test('Run History startup loads deduplication keys as a stream', () => {
   assert.match(rust, /tracker_dedupe_keys_ready: AtomicBool/);
 });
 
+test('Run History scanner skips only missing files and propagates other open errors', () => {
+  const start = rust.indexOf('fn scan_jsonl_records<');
+  const end = rust.indexOf('#[cfg(test)]\\nfn read_jsonl_records', start);
+  assert.ok(start >= 0 && end > start, 'Run History scanner was not found');
+  const scanner = rust.slice(start, end);
+  assert.doesNotMatch(scanner, /path\\.exists\\(\\)/);
+  assert.match(scanner, /ErrorKind::NotFound/);
+  assert.match(rust, /history_scanner_skips_missing_files_and_propagates_read_errors/);
+});
+
+test('Run History startup warning accurately describes fail-closed reward handling', () => {
+  assert.match(rust, /deduplicated reward events will be rejected until history can be read/);
+  assert.doesNotMatch(rust, /new events will still be recorded/);
+});
+
 test('Run History reloads deduplication keys before appending after startup read failures', () => {
   const start = rust.indexOf('fn tracker_reward_event(');
   const end = rust.indexOf('fn tracker_read_data_page(', start);

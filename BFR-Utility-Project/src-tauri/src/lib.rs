@@ -4081,7 +4081,7 @@ mod tests {
         fs::write(&present, b"data").unwrap();
         assert!(path_entry_exists(&present).unwrap());
 
-        let invalid = PathBuf::from("invalid\\0path");
+        let invalid = PathBuf::from("invalid\0path");
         assert!(path_entry_exists(&invalid).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -4100,7 +4100,7 @@ mod tests {
         fs::write(&settings, b"current").unwrap();
         assert_eq!(resolve_settings_source(&settings, &legacy).unwrap(), Some(settings.clone()));
 
-        let invalid_settings = PathBuf::from("invalid\\0settings.json");
+        let invalid_settings = PathBuf::from("invalid\0settings.json");
         assert!(resolve_settings_source(&invalid_settings, &legacy).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -4108,7 +4108,7 @@ mod tests {
     #[test]
     fn legacy_migrations_propagate_path_inspection_errors() {
         let dir = temp_dir("legacy-migration-path-errors");
-        let invalid_legacy = PathBuf::from("invalid\\0legacy.json");
+        let invalid_legacy = PathBuf::from("invalid\0legacy.json");
         let destination = dir.join("Settings/settings.json");
         assert!(migrate_legacy_file(&invalid_legacy, &destination).is_err());
         assert!(migrate_tracker_history(&invalid_legacy, &destination).is_err());

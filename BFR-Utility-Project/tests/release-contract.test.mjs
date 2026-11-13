@@ -454,6 +454,38 @@ test('macro file loading and restore share validated BFRMACRO2/BFRMACRO3 parsing
   assert.match(rust, /macro_file_serialization_round_trips_as_current_format/);
 });
 
+test('unreadable saved macros cannot be overwritten by later recordings', () => {
+  assert.match(rust, /macro_save_blocked_reason: Mutex<Option<String>>/);
+  assert.match(rust, /fn save_macro_snapshot_to_file\(/);
+  assert.match(rust, /fn block_macro_saves\(&self, reason: String\)/);
+  assert.match(rust, /automatic replacement is disabled until it can be loaded or removed/);
+  assert.match(rust, /path inspection failed: \{error\}/);
+  assert.match(rust, /fn blocked_macro_save_preserves_existing_file\(/);
+  assert.match(rust, /fn manually_removed_saved_macro_clears_the_save_block\(/);
+  assert.match(rust, /fn existing_saved_macro_keeps_the_save_block_until_loaded\(/);
+  assert.match(rust, /fn macro_save_block_remains_when_path_cannot_be_inspected\(/);
+  assert.match(rust, /fn empty_macro_snapshot_remains_a_no_op_even_when_saving_is_blocked\(/);
+  const loadStart = rust.indexOf('fn load_macro(&self)');
+  const loadEnd = rust.indexOf('fn log(&self, message: &str)', loadStart);
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, 'Saved macro load method was not found');
+  assert.match(rust.slice(loadStart, loadEnd), /\*save_blocked_reason = None/);
+  const restoreStart = rust.indexOf('fn restore_saved_macro_during_stopping(&self)');
+  const restoreEnd = rust.indexOf('fn load_macro(&self)', restoreStart);
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart, 'Saved macro restore method was not found');
+  assert.match(rust.slice(restoreStart, restoreEnd), /\*save_blocked_reason = None/);
+  assert.match(rust, /clear_macro_save_block_if_file_missing\(&self\.file, &mut blocked_reason\)/);
+  const start = rust.indexOf('fn save_macro_snapshot_to_file(');
+  const end = rust.indexOf('impl MacroState {', start);
+  assert.ok(start >= 0 && end > start, 'Macro save guard helper was not found');
+  const saver = rust.slice(start, end);
+  assert.ok(saver.indexOf('if clicks.is_empty()') < saver.indexOf('if let Some(reason) = blocked_reason'));
+  assert.ok(saver.indexOf('if let Some(reason) = blocked_reason') < saver.indexOf('write_file_atomically('));
+  const snapshotStart = rust.indexOf('fn save_macro_snapshot(&self');
+  const snapshotEnd = rust.indexOf('fn block_macro_saves(&self', snapshotStart);
+  assert.ok(snapshotStart >= 0 && snapshotEnd > snapshotStart, 'Macro snapshot method was not found');
+  assert.match(rust.slice(snapshotStart, snapshotEnd), /if clicks\.is_empty\(\)\s*\{\s*return Ok\(0\);/);
+});
+
 test('macro click IPC queue is bounded and stops capture when the bridge stalls', async () => {
   const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
   assert.ok(injectionMatch, 'Rust game-page injection script was not found');

@@ -863,6 +863,8 @@ struct MacroState {
     tracker_data_lock: Mutex<()>,
     tracker_dedupe_keys: Mutex<HashSet<String>>,
     tracker_dedupe_keys_ready: AtomicBool,
+    // Prevent an unreadable or invalid saved macro from being overwritten by a later recording.
+    macro_save_blocked_reason: Mutex<Option<String>>,
     tracker_diagnostic_rate_limit: Mutex<TrackerDiagnosticRateLimit>,
     cdp_port: u16,
     mode: AtomicU8,
@@ -1068,26 +1070,76 @@ fn parse_macro_file(bytes: &[u8]) -> Result<MacroFile, String> {
     Ok(data)
 }
 
+fn clear_macro_save_block_if_file_missing(
+    path: &Path,
+    blocked_reason: &mut Option<String>,
+) -> Result<(), String> {
+    if blocked_reason.is_none() {
+        return Ok(());
+    }
+    match path_entry_exists(path) {
+        Ok(false) => *blocked_reason = None,
+        Ok(true) => {}
+        Err(error) => {
+            return Err(format!("Could not verify the saved macro before replacing it: {error}"));
+        }
+    }
+    Ok(())
+}
+
+fn save_macro_snapshot_to_file(
+    path: &Path,
+    clicks: &[MacroClick],
+    blocked_reason: Option<&str>,
+) -> Result<usize, String> {
+    if clicks.is_empty() {
+        return Ok(0);
+    }
+    if let Some(reason) = blocked_reason {
+        return Err(format!(
+            "The existing saved macro was not replaced because it could not be loaded safely: {reason}. Resolve the problem or remove the file manually before recording again."
+        ));
+    }
+    validate_macro_clicks(clicks)?;
+    let count = clicks.len();
+    let data = MacroFile {
+        format: "BFRMACRO3".to_string(),
+        clicks: clicks.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&data).map_err(|error| error.to_string())?;
+    write_file_atomically(path, &bytes)?;
+    Ok(count)
+}
+
 impl MacroState {
     fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
         if clicks.is_empty() {
             return Ok(0);
         }
-        validate_macro_clicks(clicks)?;
-        let count = clicks.len();
-        let data = MacroFile {
-            format: "BFRMACRO3".to_string(),
-            clicks: clicks.to_vec(),
-        };
-        let bytes = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
-        write_file_atomically(&self.file, &bytes)?;
-        Ok(count)
+        let mut blocked_reason = self
+            .macro_save_blocked_reason
+            .lock()
+            .map_err(|_| "Saved macro protection state is unavailable".to_string())?;
+        clear_macro_save_block_if_file_missing(&self.file, &mut blocked_reason)?;
+        save_macro_snapshot_to_file(&self.file, clicks, blocked_reason.as_deref())
+    }
+
+    fn block_macro_saves(&self, reason: String) {
+        match self.macro_save_blocked_reason.lock() {
+            Ok(mut blocked_reason) => *blocked_reason = Some(reason),
+            Err(_) => self.log("Saved macro auto-save could not be guarded because its protection state is unavailable."),
+        }
     }
 
     // Restore the last saved macro into memory while new recording/playback/load
     // operations are still blocked by MODE_STOPPING.
     fn restore_saved_macro_during_stopping(&self) -> Result<usize, String> {
+        let mut save_blocked_reason = self
+            .macro_save_blocked_reason
+            .lock()
+            .map_err(|_| "Saved macro protection state is unavailable".to_string())?;
         if !path_entry_exists(&self.file).map_err(|error| error.to_string())? {
+            *save_blocked_reason = None;
             return Ok(0);
         }
         let metadata = fs::metadata(&self.file).map_err(|error| error.to_string())?;
@@ -1107,10 +1159,15 @@ impl MacroState {
             );
         }
         *clicks = data.clicks;
+        *save_blocked_reason = None;
         Ok(count)
     }
 
     fn load_macro(&self) -> Result<usize, String> {
+        let mut save_blocked_reason = self
+            .macro_save_blocked_reason
+            .lock()
+            .map_err(|_| "Saved macro protection state is unavailable".to_string())?;
         if !can_load_macro(self.mode.load(Ordering::SeqCst)) {
             return Err("Stop recording or playback before loading a saved macro".to_string());
         }
@@ -1131,6 +1188,7 @@ impl MacroState {
             return Err("Stop recording or playback before loading a saved macro".to_string());
         }
         *clicks = data.clicks;
+        *save_blocked_reason = None;
         Ok(count)
     }
 
@@ -3785,6 +3843,7 @@ pub fn run() {
                 tracker_data_lock: Mutex::new(()),
                 tracker_dedupe_keys: Mutex::new(tracker_dedupe_keys.as_ref().cloned().unwrap_or_default()),
                 tracker_dedupe_keys_ready: AtomicBool::new(tracker_dedupe_keys.is_ok()),
+                macro_save_blocked_reason: Mutex::new(None),
                 tracker_diagnostic_rate_limit: Mutex::new(TrackerDiagnosticRateLimit::default()),
                 cdp_port,
                 mode: AtomicU8::new(MODE_IDLE),
@@ -3821,13 +3880,17 @@ pub fn run() {
             match path_entry_exists(&macro_state.file) {
                 Ok(true) => {
                     if let Err(error) = macro_state.load_macro() {
-                        macro_state.log(&format!("Saved macro could not be loaded at startup: {error}"));
+                        macro_state.block_macro_saves(format!("startup load failed: {error}"));
+                        macro_state.log(&format!("Saved macro could not be loaded at startup; automatic replacement is disabled until it can be loaded or removed: {error}"));
                     }
                 }
                 Ok(false) => {}
-                Err(error) => macro_state.log(&format!(
-                    "Saved macro path could not be inspected at startup: {error}"
-                )),
+                Err(error) => {
+                    macro_state.block_macro_saves(format!("startup path inspection failed: {error}"));
+                    macro_state.log(&format!(
+                        "Saved macro path could not be inspected at startup; automatic replacement is disabled until it can be inspected or removed: {error}"
+                    ));
+                }
             }
             let (resize_save_tx, resize_save_rx) = mpsc::channel::<()>();
             app.manage(SettingsState {
@@ -4375,6 +4438,76 @@ mod tests {
         assert_eq!(parsed.format, "BFRMACRO3");
         assert_eq!(parsed.clicks.len(), 2);
         assert_eq!(parsed.clicks[1].elapsed_ms, 500);
+    }
+
+    #[test]
+    fn blocked_macro_save_preserves_existing_file() {
+        let dir = temp_dir("blocked-macro-save");
+        let path = dir.join("recording.bfrmacro");
+        let original = b"existing saved macro bytes that could not be loaded";
+        fs::write(&path, original).unwrap();
+        let clicks = vec![MacroClick {
+            x: 0.5,
+            y: 0.5,
+            elapsed_ms: 125,
+        }];
+
+        let error = save_macro_snapshot_to_file(
+            &path,
+            &clicks,
+            Some("startup load failed: permission denied"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not be loaded safely"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manually_removed_saved_macro_clears_the_save_block() {
+        let dir = temp_dir("removed-blocked-macro");
+        let path = dir.join("recording.bfrmacro");
+        let mut blocked_reason = Some("startup load failed: corrupt file".to_string());
+
+        clear_macro_save_block_if_file_missing(&path, &mut blocked_reason).unwrap();
+
+        assert!(blocked_reason.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_saved_macro_keeps_the_save_block_until_loaded() {
+        let dir = temp_dir("existing-blocked-macro");
+        let path = dir.join("recording.bfrmacro");
+        fs::write(&path, b"existing macro").unwrap();
+        let mut blocked_reason = Some("startup load failed: corrupt file".to_string());
+
+        clear_macro_save_block_if_file_missing(&path, &mut blocked_reason).unwrap();
+
+        assert_eq!(blocked_reason.as_deref(), Some("startup load failed: corrupt file"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn macro_save_block_remains_when_path_cannot_be_inspected() {
+        let invalid = PathBuf::from("invalid\0recording.bfrmacro");
+        let mut blocked_reason = Some("startup path inspection failed".to_string());
+
+        assert!(clear_macro_save_block_if_file_missing(&invalid, &mut blocked_reason).is_err());
+        assert_eq!(blocked_reason.as_deref(), Some("startup path inspection failed"));
+    }
+
+    #[test]
+    fn empty_macro_snapshot_remains_a_no_op_even_when_saving_is_blocked() {
+        let dir = temp_dir("blocked-empty-macro-save");
+        let path = dir.join("recording.bfrmacro");
+        let original = b"existing saved macro";
+        fs::write(&path, original).unwrap();
+
+        assert_eq!(save_macro_snapshot_to_file(&path, &[], Some("unreadable")).unwrap(), 0);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

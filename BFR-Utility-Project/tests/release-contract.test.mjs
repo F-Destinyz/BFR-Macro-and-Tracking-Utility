@@ -407,6 +407,18 @@ test('playback rechecks its session after viewport lookup before dispatching a c
     'The playback generation must be rechecked after viewport lookup and before click dispatch');
 });
 
+test('application shutdown stops macro activity and saves settings', () => {
+  const start = rust.indexOf('window.on_window_event');
+  const end = rust.indexOf('tauri::WindowEvent::Resized', start);
+  assert.ok(start >= 0 && end > start, 'Main window event handler was not found');
+  const closeHandler = rust.slice(start, end);
+  assert.match(closeHandler, /CloseRequested/);
+  assert.match(closeHandler, /stop_recording\(&app_handle\)/);
+  assert.match(closeHandler, /stop_playback\(&app_handle\)/);
+  assert.match(closeHandler, /save_settings_on_exit\(&app_handle\)/);
+  assert.match(closeHandler, /app_handle\.exit\(0\)/);
+});
+
 test('macro loading enforces size, click-count and delay limits', () => {
   assert.match(rust, /MAX_MACRO_FILE_BYTES/);
   assert.match(rust, /MAX_MACRO_CLICKS/);

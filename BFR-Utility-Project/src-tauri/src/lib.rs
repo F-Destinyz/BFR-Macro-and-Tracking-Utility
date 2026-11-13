@@ -862,6 +862,7 @@ struct MacroState {
     tracker_legacy_file: PathBuf,
     tracker_data_lock: Mutex<()>,
     tracker_dedupe_keys: Mutex<HashSet<String>>,
+    tracker_dedupe_keys_ready: AtomicBool,
     tracker_diagnostic_rate_limit: Mutex<TrackerDiagnosticRateLimit>,
     cdp_port: u16,
     mode: AtomicU8,
@@ -1487,6 +1488,15 @@ impl MacroState {
         } else {
             None
         };
+        if dedupe_key.is_some() {
+            let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
+            ensure_history_dedupe_keys_loaded(
+                &self.tracker_dedupe_keys_ready,
+                &self.tracker_dedupe_keys,
+                &backup_file,
+                &self.tracker_sessions_file,
+            )?;
+        }
         if let Some(key) = dedupe_key.as_deref() {
             let keys = self
                 .tracker_dedupe_keys
@@ -1784,6 +1794,24 @@ fn read_jsonl_page(
         },
         malformed_lines,
     ))
+}
+
+fn ensure_history_dedupe_keys_loaded(
+    ready: &AtomicBool,
+    keys: &Mutex<HashSet<String>>,
+    backup: &Path,
+    active: &Path,
+) -> Result<(), String> {
+    if ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let loaded = load_history_dedupe_keys(backup, active)?;
+    let mut cache = keys
+        .lock()
+        .map_err(|_| "Tracker deduplication cache is unavailable".to_string())?;
+    *cache = loaded;
+    ready.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn load_history_dedupe_keys(backup: &Path, active: &Path) -> Result<HashSet<String>, String> {
@@ -3721,6 +3749,7 @@ pub fn run() {
                 tracker_legacy_file,
                 tracker_data_lock: Mutex::new(()),
                 tracker_dedupe_keys: Mutex::new(tracker_dedupe_keys.as_ref().cloned().unwrap_or_default()),
+                tracker_dedupe_keys_ready: AtomicBool::new(tracker_dedupe_keys.is_ok()),
                 tracker_diagnostic_rate_limit: Mutex::new(TrackerDiagnosticRateLimit::default()),
                 cdp_port,
                 mode: AtomicU8::new(MODE_IDLE),
@@ -4391,6 +4420,29 @@ mod tests {
         assert!(error.contains("could not be permanently deleted"));
         assert!(error.contains(quarantined.to_string_lossy().as_ref()));
         assert_eq!(fs::read(&quarantined).unwrap(), b"retained recovery data");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_dedupe_cache_retries_after_initial_read_failure() {
+        let dir = temp_dir("history-dedupe-cache-retry");
+        let backup = dir.join("blocked/backup.jsonl");
+        let active = dir.join("Logs/battle-rewards.jsonl");
+        let ready = AtomicBool::new(false);
+        let keys = Mutex::new(HashSet::new());
+
+        fs::create_dir_all(&backup).unwrap();
+        assert!(ensure_history_dedupe_keys_loaded(&ready, &keys, &backup, &active).is_err());
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(keys.lock().unwrap().is_empty());
+        fs::remove_dir_all(backup.parent().unwrap()).unwrap();
+
+        fs::create_dir_all(active.parent().unwrap()).unwrap();
+        fs::write(&active, b"{\"dedupe_key\":\"batch-A:5\"}\n").unwrap();
+        ensure_history_dedupe_keys_loaded(&ready, &keys, &backup, &active).unwrap();
+
+        assert!(ready.load(Ordering::Acquire));
+        assert!(keys.lock().unwrap().contains("batch-A:5"));
         fs::remove_dir_all(dir).unwrap();
     }
 

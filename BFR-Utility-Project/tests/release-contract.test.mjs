@@ -221,6 +221,21 @@ test('Run History startup loads deduplication keys as a stream', () => {
   assert.match(loader, /scan_jsonl_records\(path,/);
   assert.doesNotMatch(loader, /let mut records = Vec::new\(\)|read_jsonl_records/);
   assert.match(rust, /fn history_dedupe_keys_stream_from_backup_and_active_files\(/);
+  assert.match(rust, /fn ensure_history_dedupe_keys_loaded\(/);
+  assert.match(rust, /history_dedupe_cache_retries_after_initial_read_failure/);
+  assert.match(rust, /tracker_dedupe_keys_ready: AtomicBool/);
+});
+
+test('Run History reloads deduplication keys before appending after startup read failures', () => {
+  const start = rust.indexOf('fn tracker_reward_event(');
+  const end = rust.indexOf('fn tracker_read_data_page(', start);
+  assert.ok(start >= 0 && end > start, 'Run History reward handler was not found');
+  const handler = rust.slice(start, end);
+  const reload = handler.indexOf('ensure_history_dedupe_keys_loaded(');
+  const append = handler.indexOf('append_history_record(');
+  assert.ok(reload >= 0 && append > reload,
+    'Reward deduplication must recover the on-disk key cache before appending records');
+  assert.match(handler, /if let Some\(key\) = dedupe_key\.as_deref\(\)/);
 });
 
 test('Run History preserves old backups, does not rotate, and skips malformed lines', () => {

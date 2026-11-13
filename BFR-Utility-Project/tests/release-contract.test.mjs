@@ -480,6 +480,10 @@ test('unreadable saved macros cannot be overwritten by later recordings', () => 
   const saver = rust.slice(start, end);
   assert.ok(saver.indexOf('if clicks.is_empty()') < saver.indexOf('if let Some(reason) = blocked_reason'));
   assert.ok(saver.indexOf('if let Some(reason) = blocked_reason') < saver.indexOf('write_file_atomically('));
+  const snapshotStart = rust.indexOf('fn save_macro_snapshot(&self');
+  const snapshotEnd = rust.indexOf('fn block_macro_saves(&self', snapshotStart);
+  assert.ok(snapshotStart >= 0 && snapshotEnd > snapshotStart, 'Macro snapshot method was not found');
+  assert.match(rust.slice(snapshotStart, snapshotEnd), /if clicks\.is_empty\(\)\s*\{\s*return Ok\(0\);/);
 });
 
 test('macro click IPC queue is bounded and stops capture when the bridge stalls', async () => {

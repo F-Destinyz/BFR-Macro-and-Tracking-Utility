@@ -57,6 +57,8 @@ jobs:
           git add src-tauri/Cargo.lock
           if (-not (git diff --cached --quiet)) {
             git commit -m "deps: refresh Cargo.lock for Wry 0.57.2"
+            git fetch origin "${{ github.head_ref }}"
+            git rebase "origin/${{ github.head_ref }}"
             git push origin HEAD:${{ github.head_ref }}
           }
 

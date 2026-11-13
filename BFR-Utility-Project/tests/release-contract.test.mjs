@@ -51,7 +51,7 @@ test('stable application identifier and data paths remain compatible', () => {
 });
 
 test('one-time history cleanup guard is retained without creating a new release reset', () => {
-  assert.match(rust, /if marker_file\.exists\(\)\s*\{\s*return Ok\(false\);/);
+  assert.match(rust, /if path_entry_exists\(&marker_file\)\.map_err\(/);
   assert.match(rust, /tracker_sessions_file\)/);
   assert.match(rust, /Non-destructive safeguard retained existing Run History/);
   assert.match(rust, /existing history, settings and saved macros were preserved/);

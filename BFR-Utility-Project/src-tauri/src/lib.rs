@@ -3134,7 +3134,9 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
     }
     let recovery_copy = legacy.with_extension("jsonl.migrated");
     if !path_entry_exists(destination)? {
-        fs::copy(legacy, destination)?;
+        // Use the same staged, same-directory replacement as settings/macros/logs.
+        // A startup interruption must not leave a partial first Run History file.
+        copy_file_atomically(legacy, destination)?;
         if !path_entry_exists(&recovery_copy)? {
             fs::rename(legacy, recovery_copy)?;
         }
@@ -4738,6 +4740,27 @@ mod tests {
         assert_eq!(malformed, 1);
         assert_eq!(records, vec![imported]);
         assert!(legacy.with_extension("jsonl.migrated").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tracker_history_first_migration_uses_atomic_copy_and_preserves_recovery_bytes() {
+        let dir = temp_dir("history-migration-first-copy");
+        let legacy = dir.join("tracker-data/battle-rewards.jsonl");
+        let destination = dir.join("Logs/battle-rewards.jsonl");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+
+        let legacy_bytes = b"{\"record_type\":\"battle_reward\",\"run_id\":\"first\"}\\n{\"record_type\":\"battle_reward\",\"run_id\":\"second\"}\\n";
+        fs::write(&legacy, legacy_bytes).unwrap();
+
+        migrate_tracker_history(&legacy, &destination).unwrap();
+
+        let recovery_copy = legacy.with_extension("jsonl.migrated");
+        assert_eq!(fs::read(&destination).unwrap(), legacy_bytes);
+        assert!(!path_entry_exists(&legacy).unwrap());
+        assert_eq!(fs::read(&recovery_copy).unwrap(), legacy_bytes);
+        assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1);
+
         fs::remove_dir_all(dir).unwrap();
     }
 

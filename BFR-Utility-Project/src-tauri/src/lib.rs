@@ -2485,6 +2485,21 @@ impl Drop for PlaybackSessionGuard {
     }
 }
 
+fn playback_click_deadline(loop_started: Instant, elapsed_ms: u64) -> Option<Instant> {
+    loop_started.checked_add(Duration::from_millis(elapsed_ms))
+}
+
+fn playback_click_position(click: &MacroClick, width: f64, height: f64) -> (f64, f64) {
+    (
+        (click.x * width).clamp(0.0, width - 1.0),
+        (click.y * height).clamp(0.0, height - 1.0),
+    )
+}
+
+fn playback_next_loop_deadline(loop_started: Instant, last_elapsed_ms: u64) -> Option<Instant> {
+    playback_click_deadline(loop_started, last_elapsed_ms)?.checked_add(LOOP_GAP)
+}
+
 fn wait_while_playing_until(state: &MacroState, generation: u64, deadline: Instant) -> bool {
     loop {
         if !playback_session_is_current(
@@ -2798,8 +2813,7 @@ fn start_playback(app: AppHandle<Wry>) {
                 let Some(state) = app.try_state::<MacroState>() else {
                     return;
                 };
-                let Some(deadline) =
-                    loop_started.checked_add(Duration::from_millis(click.elapsed_ms))
+                let Some(deadline) = playback_click_deadline(loop_started, click.elapsed_ms)
                 else {
                     playback_failed(
                         &app,
@@ -2827,8 +2841,7 @@ fn start_playback(app: AppHandle<Wry>) {
                         return;
                     }
                 };
-                let x = (click.x * width).clamp(0.0, width - 1.0);
-                let y = (click.y * height).clamp(0.0, height - 1.0);
+                let (x, y) = playback_click_position(click, width, height);
                 if let Err(error) = dispatch_click(&mut socket, &mut next_id, x, y) {
                     playback_failed(&app, generation, &error);
                     return;
@@ -2846,13 +2859,9 @@ fn start_playback(app: AppHandle<Wry>) {
             {
                 break;
             }
-            let last_offset = clicks
-                .last()
-                .map(|click| Duration::from_millis(click.elapsed_ms))
-                .unwrap_or_default();
-            let Some(next_loop_deadline) = loop_started
-                .checked_add(last_offset)
-                .and_then(|deadline| deadline.checked_add(LOOP_GAP))
+            let last_elapsed_ms = clicks.last().map(|click| click.elapsed_ms).unwrap_or_default();
+            let Some(next_loop_deadline) =
+                playback_next_loop_deadline(loop_started, last_elapsed_ms)
             else {
                 playback_failed(
                     &app,
@@ -4074,6 +4083,46 @@ mod tests {
         assert_eq!(parsed.clicks.len(), 1);
         assert_eq!(parsed.clicks[0].elapsed_ms, 125);
         validate_macro_clicks(&parsed.clicks).unwrap();
+    }
+
+    #[test]
+    fn playback_click_deadlines_are_relative_to_each_loop_start() {
+        let loop_started = Instant::now();
+        let first = playback_click_deadline(loop_started, 125).unwrap();
+        let second = playback_click_deadline(loop_started, 375).unwrap();
+        assert_eq!(first.duration_since(loop_started), Duration::from_millis(125));
+        assert_eq!(second.duration_since(loop_started), Duration::from_millis(375));
+        assert!(second > first);
+    }
+
+    #[test]
+    fn playback_click_position_scales_normalized_coordinates_and_clamps_edges() {
+        let center = MacroClick {
+            x: 0.5,
+            y: 0.25,
+            elapsed_ms: 0,
+        };
+        assert_eq!(playback_click_position(&center, 800.0, 600.0), (400.0, 150.0));
+
+        let bottom_right = MacroClick {
+            x: 1.0,
+            y: 1.0,
+            elapsed_ms: 0,
+        };
+        assert_eq!(
+            playback_click_position(&bottom_right, 800.0, 600.0),
+            (799.0, 599.0)
+        );
+    }
+
+    #[test]
+    fn playback_loop_deadline_keeps_the_existing_half_second_gap() {
+        let loop_started = Instant::now();
+        let deadline = playback_next_loop_deadline(loop_started, 1_250).unwrap();
+        assert_eq!(
+            deadline.duration_since(loop_started),
+            Duration::from_millis(1_750)
+        );
     }
 
     #[test]

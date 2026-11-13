@@ -1937,9 +1937,8 @@ fn validate_macro_clicks(clicks: &[MacroClick]) -> Result<(), String> {
 }
 
 // Keep performance accounting scoped to this application and its WebView2
-// subprocesses. Windows parent-process IDs alone are not a safe process-tree
-// filter: unrelated processes can otherwise be included through stale/reused
-// ancestry relationships. WebView2 renderer, GPU, and utility processes use
+// subprocesses. The process snapshot can contain unrelated applications as well
+// as this app's descendants. WebView2 renderer, GPU, and utility processes use
 // msedgewebview2.exe; unrelated child executables are deliberately excluded.
 #[derive(Clone, Debug)]
 struct ProcessTreeEntry {

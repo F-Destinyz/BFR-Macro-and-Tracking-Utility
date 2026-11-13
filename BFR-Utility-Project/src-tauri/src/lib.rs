@@ -4488,7 +4488,7 @@ mod tests {
 
     #[test]
     fn macro_save_block_remains_when_path_cannot_be_inspected() {
-        let invalid = PathBuf::from("invalid\\0recording.bfrmacro");
+        let invalid = PathBuf::from("invalid\0recording.bfrmacro");
         let mut blocked_reason = Some("startup path inspection failed".to_string());
 
         assert!(clear_macro_save_block_if_file_missing(&invalid, &mut blocked_reason).is_err());

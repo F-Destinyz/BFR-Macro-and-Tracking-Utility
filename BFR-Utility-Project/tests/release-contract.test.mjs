@@ -189,6 +189,15 @@ test('stable documentation contains no development-only release notes or retired
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
+test('Run History page loading propagates second-pass read errors', () => {
+  const start = rust.indexOf('fn read_jsonl_page(');
+  const end = rust.indexOf('fn load_history_dedupe_keys(', start);
+  assert.ok(start >= 0 && end > start, 'Run History page reader was not found');
+  const pageReader = rust.slice(start, end);
+  assert.doesNotMatch(pageReader, /let _ = scan_jsonl_records/);
+  assert.match(pageReader, /scan_jsonl_records\(path, \|record\|[\s\S]*?\}\)\?;/);
+});
+
 test('Run History startup loads deduplication keys as a stream', () => {
   const start = rust.indexOf('fn load_history_dedupe_keys(');
   const end = rust.indexOf('fn repeat_cumulative_run_count(', start);

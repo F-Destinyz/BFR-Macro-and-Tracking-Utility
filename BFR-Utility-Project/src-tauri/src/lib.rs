@@ -1766,7 +1766,7 @@ fn read_jsonl_page(
     let mut records = Vec::with_capacity(end.saturating_sub(start));
     let mut record_index = 0usize;
     for path in paths {
-        let _ = scan_jsonl_records(path, |record| {
+        scan_jsonl_records(path, |record| {
             if record_index >= start && record_index < end {
                 records.push(record);
             }

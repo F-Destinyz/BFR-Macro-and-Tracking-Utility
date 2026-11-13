@@ -1070,6 +1070,23 @@ fn parse_macro_file(bytes: &[u8]) -> Result<MacroFile, String> {
     Ok(data)
 }
 
+fn clear_macro_save_block_if_file_missing(
+    path: &Path,
+    blocked_reason: &mut Option<String>,
+) -> Result<(), String> {
+    if blocked_reason.is_none() {
+        return Ok(());
+    }
+    match path_entry_exists(path) {
+        Ok(false) => *blocked_reason = None,
+        Ok(true) => {}
+        Err(error) => {
+            return Err(format!("Could not verify the saved macro before replacing it: {error}"));
+        }
+    }
+    Ok(())
+}
+
 fn save_macro_snapshot_to_file(
     path: &Path,
     clicks: &[MacroClick],
@@ -1096,10 +1113,11 @@ fn save_macro_snapshot_to_file(
 
 impl MacroState {
     fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
-        let blocked_reason = self
+        let mut blocked_reason = self
             .macro_save_blocked_reason
             .lock()
             .map_err(|_| "Saved macro protection state is unavailable".to_string())?;
+        clear_macro_save_block_if_file_missing(&self.file, &mut blocked_reason)?;
         save_macro_snapshot_to_file(&self.file, clicks, blocked_reason.as_deref())
     }
 
@@ -4440,6 +4458,31 @@ mod tests {
 
         assert!(error.contains("could not be loaded safely"));
         assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manually_removed_saved_macro_clears_the_save_block() {
+        let dir = temp_dir("removed-blocked-macro");
+        let path = dir.join("recording.bfrmacro");
+        let mut blocked_reason = Some("startup load failed: corrupt file".to_string());
+
+        clear_macro_save_block_if_file_missing(&path, &mut blocked_reason).unwrap();
+
+        assert!(blocked_reason.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_saved_macro_keeps_the_save_block_until_loaded() {
+        let dir = temp_dir("existing-blocked-macro");
+        let path = dir.join("recording.bfrmacro");
+        fs::write(&path, b"existing macro").unwrap();
+        let mut blocked_reason = Some("startup load failed: corrupt file".to_string());
+
+        clear_macro_save_block_if_file_missing(&path, &mut blocked_reason).unwrap();
+
+        assert_eq!(blocked_reason.as_deref(), Some("startup load failed: corrupt file"));
         fs::remove_dir_all(dir).unwrap();
     }
 

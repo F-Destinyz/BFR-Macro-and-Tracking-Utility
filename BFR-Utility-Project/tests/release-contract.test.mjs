@@ -30,27 +30,27 @@ test('all release version metadata is synchronized at 2.0.3', () => {
   assert.equal(packageLock.version, '2.0.3');
   assert.equal(packageLock.packages[''].version, '2.0.3');
   assert.equal(tauriConfig.version, '2.0.3');
-  assert.match(cargoToml, /^version = "2\.0\.2"$/m);
-  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0\.2"/);
+  assert.match(cargoToml, /^version = "2\.0\.3"$/m);
+  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0.3"/);
 });
 
 
 test('build runtimes and WebView dependencies use the current compatible releases', () => {
-  assert.match(cargoToml, /wry = "=0\\.57\\.2"/);
-  assert.match(cargoLock, /name = "wry"\\r?\\nversion = "0\\.57\\.2"/);
-  assert.match(applicationWorkflow, /actions\\/checkout@v7/);
-  assert.match(applicationWorkflow, /actions\\/setup-node@v7/);
+  assert.match(cargoToml, /wry = "=0\.57\.2"/);
+  assert.match(cargoLock, /name = "wry"\r?\nversion = "0\.57\.2"/);
+  assert.match(applicationWorkflow, /actions\/checkout@v7/);
+  assert.match(applicationWorkflow, /actions\/setup-node@v7/);
   assert.match(applicationWorkflow, /node-version: 26/);
-  assert.match(securityWorkflow, /actions\\/checkout@v7/);
-  assert.match(securityWorkflow, /actions\\/setup-node@v7/);
+  assert.match(securityWorkflow, /actions\/checkout@v7/);
+  assert.match(securityWorkflow, /actions\/setup-node@v7/);
   assert.match(securityWorkflow, /node-version: 26/);
-  assert.match(readme, /Node\\.js 26 LTS/);
+  assert.match(readme, /Node\.js 26 LTS/);
 });
 
 test('v2.0.3 release publishing waits for both installer build and dependency audit', () => {
-  assert.match(applicationWorkflow, /actions\\/upload-artifact@v7/);
-  assert.match(applicationWorkflow, /actions\\/download-artifact@v8/);
-  assert.match(applicationWorkflow, /needs: \\[windows-checks, dependency-audit\\]/);
+  assert.match(applicationWorkflow, /actions\/upload-artifact@v7/);
+  assert.match(applicationWorkflow, /actions\/download-artifact@v8/);
+  assert.match(applicationWorkflow, /needs: \[windows-checks, dependency-audit\]/);
   assert.match(applicationWorkflow, /gh release create/);
   assert.match(applicationWorkflow, /Get-FileHash/);
   assert.match(securityWorkflow, /workflow_call:/);

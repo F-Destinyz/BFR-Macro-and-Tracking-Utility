@@ -4080,6 +4080,154 @@ mod tests {
         path
     }
 
+    fn test_macro_state(dir: &Path) -> MacroState {
+        MacroState {
+            file: dir.join("recording.bfrmacro"),
+            log_file: dir.join("bfr-macro.log"),
+            performance_file: dir.join("performance.jsonl"),
+            tracker_diagnostics_file: dir.join("tracker-diagnostics.jsonl"),
+            tracker_sessions_file: dir.join("battle-rewards.jsonl"),
+            tracker_context_file: dir.join("dungeon-context.jsonl"),
+            tracker_legacy_file: dir.join("legacy-history.jsonl"),
+            tracker_data_lock: Mutex::new(()),
+            tracker_dedupe_keys: Mutex::new(HashSet::new()),
+            tracker_dedupe_keys_ready: AtomicBool::new(false),
+            macro_save_blocked_reason: Mutex::new(None),
+            tracker_diagnostic_rate_limit: Mutex::new(TrackerDiagnosticRateLimit::default()),
+            cdp_port: 0,
+            mode: AtomicU8::new(MODE_IDLE),
+            playback_generation: AtomicU64::new(0),
+            bridge_ready: AtomicBool::new(false),
+            record_started: Mutex::new(None),
+            clicks: Mutex::new(Vec::new()),
+            loop_enabled: AtomicBool::new(false),
+        }
+    }
+
+    fn read_test_history(path: &Path) -> Vec<Value> {
+        let mut records = Vec::new();
+        let mut malformed = 0;
+        read_jsonl_records(path, &mut records, &mut malformed).unwrap();
+        assert_eq!(malformed, 0, "test history should contain only valid JSONL");
+        records
+    }
+
+    #[test]
+    fn reward_tracker_persists_single_completion_and_deduplicates_after_restart() {
+        let dir = temp_dir("reward-single-regression");
+        let state = test_macro_state(&dir);
+        let details = json!({
+            "host": "rebornbf.com",
+            "path": "/api/battles/finish",
+            "dungeon_route": "/start/100501/begin",
+            "dungeon_started_at_unix_ms": 1_700_000_000_000_u64,
+            "dungeon_start_source": "begin_quest_click",
+            "dungeon_id": "100501",
+            "dungeon_name": "Gold Valley Lv. 2",
+            "settlement": {"zel": 1200, "karma": 340, "honor": 56, "exp": 7800, "finished": true},
+            "totals": {"zel": 1200, "karma": 340, "honor": 56, "exp": 7800},
+            "items": {"rare_item": 2, "invalid key": 9, "too_large": 9000000000001_u64}
+        });
+
+        assert!(state.tracker_reward_event(details.clone()).unwrap());
+        assert!(!state.tracker_reward_event(details.clone()).unwrap());
+
+        let history_path = dir.join("battle-rewards.jsonl");
+        let records = read_test_history(&history_path);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["record_type"], "battle_reward");
+        assert_eq!(record["path"], "/api/battles/finish");
+        assert_eq!(record["run_type"], "single");
+        assert_eq!(record["run_count"], 1);
+        assert_eq!(record["run_count_source"], "single_completion");
+        assert_eq!(record["dungeon_id"], "100501");
+        assert_eq!(record["dungeon_name"], "Gold Valley Lv. 2");
+        assert_eq!(record["settlement"]["zel"], 1200);
+        assert_eq!(record["totals"]["exp"], 7800);
+        assert_eq!(record["items"]["rare_item"], 2);
+        assert!(record["items"].get("invalid key").is_none());
+        assert!(record["items"].get("too_large").is_none());
+
+        // A fresh state simulates an application restart: the on-disk key must
+        // be loaded before the same completion can be appended again.
+        let restarted = test_macro_state(&dir);
+        assert!(!restarted.tracker_reward_event(details).unwrap());
+        assert_eq!(read_test_history(&history_path).len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reward_tracker_keeps_cumulative_repeat_snapshots_without_duplicate_counts() {
+        let dir = temp_dir("reward-repeat-regression");
+        let state = test_macro_state(&dir);
+        let first = json!({
+            "host": "rebornbf.com",
+            "path": "/api/battles/repeat",
+            "batch_id": "batch-A",
+            "dungeon_route": "/dungeons/vortex/100501",
+            "dungeon_started_at_unix_ms": 1_700_000_000_000_u64,
+            "dungeon_start_source": "repeat_action_click",
+            "dungeon_id": "100501",
+            "dungeon_name": "Gold Valley Lv. 2",
+            "settlement": {"runs": 10, "settled_runs": 20, "zel": 100},
+            "totals": {"runs": 20, "zel": 200},
+            "items": {"rare_item": 3}
+        });
+        assert!(state.tracker_reward_event(first.clone()).unwrap());
+        assert!(!state.tracker_reward_event(first).unwrap());
+
+        let later = json!({
+            "host": "rebornbf.com",
+            "path": "/api/battles/repeat",
+            "batch_id": "batch-A",
+            "dungeon_route": "/dungeons/vortex/100501",
+            "dungeon_started_at_unix_ms": 1_700_000_000_000_u64,
+            "dungeon_start_source": "repeat_action_click",
+            "dungeon_id": "100501",
+            "dungeon_name": "Gold Valley Lv. 2",
+            "settlement": {"runs": 10, "settled_runs": 30, "zel": 150},
+            "totals": {"runs": 30, "zel": 450},
+            "items": {"rare_item": 5}
+        });
+        assert!(state.tracker_reward_event(later).unwrap());
+
+        let records = read_test_history(&dir.join("battle-rewards.jsonl"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["run_type"], "repeat_batch");
+        assert_eq!(records[0]["run_count"], 20);
+        assert_eq!(records[0]["dedupe_key"], "batch-A:20");
+        assert_eq!(records[1]["run_count"], 30);
+        assert_eq!(records[1]["dedupe_key"], "batch-A:30");
+        assert_eq!(records[1]["totals"]["zel"], 450);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reward_tracker_rejects_untrusted_sources_and_repeat_responses_without_counts() {
+        let dir = temp_dir("reward-invalid-regression");
+        let state = test_macro_state(&dir);
+        assert!(!state.tracker_reward_event(json!({
+            "host": "evil.example",
+            "path": "/api/battles/finish",
+            "settlement": {"zel": 100}
+        })).unwrap());
+        assert!(!state.tracker_reward_event(json!({
+            "host": "rebornbf.com",
+            "path": "/api/other",
+            "settlement": {"zel": 100}
+        })).unwrap());
+        assert!(!state.tracker_reward_event(json!({
+            "host": "rebornbf.com",
+            "path": "/api/battles/repeat",
+            "batch_id": "batch-empty",
+            "settlement": {"runs": 10},
+            "totals": {}
+        })).unwrap());
+        assert!(!dir.join("battle-rewards.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn repeated_atomic_save_failures_preserve_existing_data_and_clean_temporary_files() {
         let dir = temp_dir("atomic-save-failure");

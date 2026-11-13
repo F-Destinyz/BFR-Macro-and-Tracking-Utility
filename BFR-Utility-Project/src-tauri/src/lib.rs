@@ -1087,7 +1087,7 @@ impl MacroState {
     // Restore the last saved macro into memory while new recording/playback/load
     // operations are still blocked by MODE_STOPPING.
     fn restore_saved_macro_during_stopping(&self) -> Result<usize, String> {
-        if !self.file.exists() {
+        if !path_entry_exists(&self.file).map_err(|error| error.to_string())? {
             return Ok(0);
         }
         let metadata = fs::metadata(&self.file).map_err(|error| error.to_string())?;
@@ -3096,8 +3096,27 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()
     Ok(())
 }
 
+
+fn path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_settings_source(settings_file: &Path, legacy_file: &Path) -> std::io::Result<Option<PathBuf>> {
+    if path_entry_exists(settings_file)? {
+        return Ok(Some(settings_file.to_path_buf()));
+    }
+    if path_entry_exists(legacy_file)? {
+        return Ok(Some(legacy_file.to_path_buf()));
+    }
+    Ok(None)
+}
+
 fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()> {
-    if destination.exists() || !legacy.exists() {
+    if path_entry_exists(destination)? || !path_entry_exists(legacy)? {
         return Ok(());
     }
     // Copy rather than move so the original 0.5.1 data remains as a rollback copy.
@@ -3107,16 +3126,16 @@ fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()>
 }
 
 fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result<()> {
-    if !legacy.exists() {
+    if !path_entry_exists(legacy)? {
         return Ok(());
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     let recovery_copy = legacy.with_extension("jsonl.migrated");
-    if !destination.exists() {
+    if !path_entry_exists(destination)? {
         fs::copy(legacy, destination)?;
-        if !recovery_copy.exists() {
+        if !path_entry_exists(&recovery_copy)? {
             fs::rename(legacy, recovery_copy)?;
         }
         return Ok(());
@@ -3164,7 +3183,7 @@ fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result
     // Preserve the original bytes under a recovery suffix and stop re-importing
     // the legacy path on every launch. If a prior recovery copy exists, leave the
     // source in place; line deduplication still makes a later retry idempotent.
-    if !recovery_copy.exists() {
+    if !path_entry_exists(&recovery_copy)? {
         fs::rename(legacy, recovery_copy)?;
     }
     Ok(())
@@ -3176,7 +3195,7 @@ fn reset_run_history_once(app_data_dir: &Path, _history_file: &Path) -> Result<b
     let marker_file = app_data_dir
         .join("Settings")
         .join("run-history-reset-v1.5.1-dev.3.done");
-    if marker_file.exists() {
+    if path_entry_exists(&marker_file).map_err(|error| error.to_string())? {
         return Ok(false);
     }
 
@@ -3691,18 +3710,32 @@ pub fn run() {
             // Prefer the new location, but if migration failed and only the legacy
             // file exists, read it without changing it. Any uncertain/corrupt state
             // blocks subsequent saves so defaults cannot destroy the original.
-            let settings_source = if settings_file.exists() { &settings_file } else { &legacy_settings_file };
-            let (mut settings, settings_save_blocked_reason) = if settings_source.exists() {
-                match fs::read(settings_source) {
-                    Ok(bytes) => match serde_json::from_slice::<AppSettings>(&bytes) {
-                        Ok(value) => (value, settings_migration_error.as_ref().map(|error| format!("legacy settings migration failed: {error}"))),
-                        Err(error) => (AppSettings::default(), Some(format!("existing settings file could not be parsed: {error}"))),
+            let (mut settings, settings_save_blocked_reason) =
+                match resolve_settings_source(&settings_file, &legacy_settings_file) {
+                    Err(error) => (
+                        AppSettings::default(),
+                        Some(format!("existing settings path could not be inspected: {error}")),
+                    ),
+                    Ok(None) => (AppSettings::default(), None),
+                    Ok(Some(settings_source)) => match fs::read(&settings_source) {
+                        Ok(bytes) => match serde_json::from_slice::<AppSettings>(&bytes) {
+                            Ok(value) => (
+                                value,
+                                settings_migration_error.as_ref().map(|error| {
+                                    format!("legacy settings migration failed: {error}")
+                                }),
+                            ),
+                            Err(error) => (
+                                AppSettings::default(),
+                                Some(format!("existing settings file could not be parsed: {error}")),
+                            ),
+                        },
+                        Err(error) => (
+                            AppSettings::default(),
+                            Some(format!("existing settings file could not be read: {error}")),
+                        ),
                     },
-                    Err(error) => (AppSettings::default(), Some(format!("existing settings file could not be read: {error}"))),
-                }
-            } else {
-                (AppSettings::default(), None)
-            };
+                };
             if !settings.width.is_finite() || settings.width < 600.0 {
                 settings.width = WINDOW_WIDTH;
             }
@@ -3785,10 +3818,16 @@ pub fn run() {
             if let Err(error) = tracker_dedupe_keys {
                 macro_state.log(&format!("Could not pre-load Run History duplicate keys; deduplicated reward events will be rejected until history can be read: {error}"));
             }
-            if macro_state.file.exists() {
-                if let Err(error) = macro_state.load_macro() {
-                    macro_state.log(&format!("Saved macro could not be loaded at startup: {error}"));
+            match path_entry_exists(&macro_state.file) {
+                Ok(true) => {
+                    if let Err(error) = macro_state.load_macro() {
+                        macro_state.log(&format!("Saved macro could not be loaded at startup: {error}"));
+                    }
                 }
+                Ok(false) => {}
+                Err(error) => macro_state.log(&format!(
+                    "Saved macro path could not be inspected at startup: {error}"
+                )),
             }
             let (resize_save_tx, resize_save_rx) = mpsc::channel::<()>();
             app.manage(SettingsState {
@@ -4029,6 +4068,50 @@ mod tests {
 
         assert!(destination.is_dir());
         assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn path_entry_exists_distinguishes_missing_present_and_inspection_errors() {
+        let dir = temp_dir("checked-path-presence");
+        let missing = dir.join("missing.json");
+        assert!(!path_entry_exists(&missing).unwrap());
+
+        let present = dir.join("present.json");
+        fs::write(&present, b"data").unwrap();
+        assert!(path_entry_exists(&present).unwrap());
+
+        let invalid = PathBuf::from("invalid\\0path");
+        assert!(path_entry_exists(&invalid).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_source_prefers_new_location_and_falls_back_only_when_missing() {
+        let dir = temp_dir("settings-source-selection");
+        let settings = dir.join("Settings/settings.json");
+        let legacy = dir.join("settings.json");
+        assert_eq!(resolve_settings_source(&settings, &legacy).unwrap(), None);
+
+        fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(resolve_settings_source(&settings, &legacy).unwrap(), Some(legacy.clone()));
+
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, b"current").unwrap();
+        assert_eq!(resolve_settings_source(&settings, &legacy).unwrap(), Some(settings.clone()));
+
+        let invalid_settings = PathBuf::from("invalid\\0settings.json");
+        assert!(resolve_settings_source(&invalid_settings, &legacy).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_migrations_propagate_path_inspection_errors() {
+        let dir = temp_dir("legacy-migration-path-errors");
+        let invalid_legacy = PathBuf::from("invalid\\0legacy.json");
+        let destination = dir.join("Settings/settings.json");
+        assert!(migrate_legacy_file(&invalid_legacy, &destination).is_err());
+        assert!(migrate_tracker_history(&invalid_legacy, &destination).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

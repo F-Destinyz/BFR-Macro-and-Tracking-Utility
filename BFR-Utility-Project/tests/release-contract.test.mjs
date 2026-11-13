@@ -100,6 +100,9 @@ test('Run History clear remains confirmation-protected and does not target setti
   assert.match(rust, /quarantine_history_files\(&\[/);
   assert.match(rust, /history_clear_stage_error/);
   assert.match(rust, /original files were restored/);
+  assert.match(rust, /fn delete_quarantined_history_files/);
+  assert.match(rust, /could not be permanently deleted/);
+  assert.match(rust, /history_clear_reports_quarantined_files_that_cannot_be_deleted/);
 });
 
 test('minimize-to-tray still hides the game window and requests background memory target', () => {

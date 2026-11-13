@@ -1038,6 +1038,15 @@ fn history_clear_stage_error(reason: &str, rollback_errors: &[String]) -> String
     }
 }
 
+fn parse_macro_file(bytes: &[u8]) -> Result<MacroFile, String> {
+    let data: MacroFile = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
+        return Err("This macro file format is not supported".to_string());
+    }
+    validate_macro_clicks(&data.clicks)?;
+    Ok(data)
+}
+
 impl MacroState {
     fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
         if clicks.is_empty() {
@@ -1065,11 +1074,7 @@ impl MacroState {
             return Err("The saved macro is too large to restore safely".to_string());
         }
         let bytes = fs::read(&self.file).map_err(|error| error.to_string())?;
-        let data: MacroFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
-            return Err("This macro file format is not supported".to_string());
-        }
-        validate_macro_clicks(&data.clicks)?;
+        let data = parse_macro_file(&bytes)?;
         let count = data.clicks.len();
         let mut clicks = self
             .clicks
@@ -1093,11 +1098,7 @@ impl MacroState {
             return Err("The macro file is too large to load safely (16 MB maximum)".to_string());
         }
         let bytes = fs::read(&self.file).map_err(|e| e.to_string())?;
-        let data: MacroFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if data.format != "BFRMACRO2" && data.format != "BFRMACRO3" {
-            return Err("This macro file format is not supported".to_string());
-        }
-        validate_macro_clicks(&data.clicks)?;
+        let data = parse_macro_file(&bytes)?;
         let count = data.clicks.len();
         let mut clicks = self
             .clicks
@@ -4083,6 +4084,70 @@ mod tests {
         assert_eq!(parsed.clicks.len(), 1);
         assert_eq!(parsed.clicks[0].elapsed_ms, 125);
         validate_macro_clicks(&parsed.clicks).unwrap();
+    }
+
+    #[test]
+    fn macro_file_parser_accepts_both_supported_formats() {
+        for format in ["BFRMACRO2", "BFRMACRO3"] {
+            let fixture = format!(
+                r#"{{"format":"{format}","clicks":[{{"x":0.25,"y":0.75,"elapsed_ms":125}}]}}"#
+            );
+            let parsed = parse_macro_file(fixture.as_bytes()).unwrap();
+            assert_eq!(parsed.format, format);
+            assert_eq!(parsed.clicks.len(), 1);
+            assert_eq!(parsed.clicks[0].x, 0.25);
+            assert_eq!(parsed.clicks[0].y, 0.75);
+            assert_eq!(parsed.clicks[0].elapsed_ms, 125);
+        }
+    }
+
+    #[test]
+    fn macro_file_parser_rejects_unsupported_formats_and_invalid_clicks() {
+        let unsupported = br#"{"format":"BFRMACRO1","clicks":[]}"#;
+        assert_eq!(
+            parse_macro_file(unsupported).unwrap_err(),
+            "This macro file format is not supported"
+        );
+
+        let invalid_coordinates =
+            br#"{"format":"BFRMACRO3","clicks":[{"x":1.5,"y":0.5,"elapsed_ms":0}]}"#;
+        assert_eq!(
+            parse_macro_file(invalid_coordinates).unwrap_err(),
+            "The macro contains invalid click coordinates"
+        );
+
+        let out_of_order =
+            br#"{"format":"BFRMACRO3","clicks":[{"x":0.5,"y":0.5,"elapsed_ms":200},{"x":0.5,"y":0.5,"elapsed_ms":100}]}"#;
+        assert_eq!(
+            parse_macro_file(out_of_order).unwrap_err(),
+            "The macro contains click timestamps that are out of order"
+        );
+
+        assert!(parse_macro_file(b"not valid json").is_err());
+    }
+
+    #[test]
+    fn macro_file_serialization_round_trips_as_current_format() {
+        let data = MacroFile {
+            format: "BFRMACRO3".to_string(),
+            clicks: vec![
+                MacroClick {
+                    x: 0.25,
+                    y: 0.75,
+                    elapsed_ms: 125,
+                },
+                MacroClick {
+                    x: 0.5,
+                    y: 0.5,
+                    elapsed_ms: 500,
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&data).unwrap();
+        let parsed = parse_macro_file(&bytes).unwrap();
+        assert_eq!(parsed.format, "BFRMACRO3");
+        assert_eq!(parsed.clicks.len(), 2);
+        assert_eq!(parsed.clicks[1].elapsed_ms, 500);
     }
 
     #[test]

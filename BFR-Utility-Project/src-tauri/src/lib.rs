@@ -1560,7 +1560,7 @@ impl MacroState {
         // All active/recovery paths are now detached, so old records cannot be
         // re-imported. Report a cleanup failure to the dashboard instead of
         // claiming permanent deletion when a quarantined file remains on disk.
-        let cleanup_result = delete_quarantined_history_files(&staged_files, fs::remove_file);
+        let cleanup_result = delete_quarantined_history_files(&staged_files, |path| fs::remove_file(path));
         if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
             keys.clear();
         }

@@ -1,0 +1,32 @@
+name: Refresh Wry lockfile
+
+on:
+  push:
+    branches:
+      - deps/update-wry-0-57-2
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: deps/update-wry-0-57-2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate the locked Wry dependency graph
+        working-directory: BFR-Utility-Project
+        run: cargo update -p wry --manifest-path src-tauri/Cargo.toml
+      - name: Commit refreshed Cargo.lock
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add BFR-Utility-Project/src-tauri/Cargo.lock
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "deps: refresh Cargo.lock for Wry 0.57.2"
+            git push
+          }

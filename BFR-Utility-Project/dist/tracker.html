@@ -23,9 +23,11 @@ const fmt=n=>Number(n||0).toLocaleString();
 const timeText=ms=>ms?new Date(Number(ms)).toLocaleString():'—';
 const durationText=ms=>{const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;return h?`${h}h ${m}m`:m?`${m}m ${r}s`:`${r}s`};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let rawRewards=[],rewards=[],nextOffset=0,totalRecords=0,hasMore=false,loadingPage=false,lastKnownTotal=0;
+let rawRewards=[],rewards=[],nextOffset=0,totalRecords=0,hasMore=false,loadingPage=false,historyMutationInProgress=false,lastKnownTotal=0;
 const PAGE_SIZE=100;
 const loadOlderButton=document.getElementById('loadOlder');
+const clearHistoryButton=document.getElementById('clearHistory');
+const refreshButton=document.getElementById('refresh');
 function dungeonLabel(r){const id=String(r.dungeon_id||'').trim();return r.dungeon_name||(id?`Run ID: ${id}`:'Unknown run ID')}
 function rewardData(r){return (r.batch_id&&r.totals&&Object.keys(r.totals).length)?r.totals:(r.settlement||r.totals||{})}
 function legacyRunCount(r){const settlement=r.settlement||{},totals=r.totals||{};const count=settlement.settled_runs??totals.settled_runs??totals.runs??totals.wins??settlement.runs??settlement.wins;return Number(r.run_count??(r.path==='/api/battles/finish'?1:(count??0)))}
@@ -39,8 +41,8 @@ function elapsedTimeText(record){const start=Number(record.dungeon_started_at_un
 function render(){const q=(document.getElementById('historySearch').value||'').toLowerCase();const rows=rewards.slice().reverse().filter(r=>r.display_name.toLowerCase().includes(q)||r.kind.toLowerCase().includes(q));document.getElementById('historyTable').innerHTML=rows.map(r=>{const duration=elapsedTimeText(r);return `<tr><td>${esc(timeText(r.timestamp_unix_ms))}</td><td>${esc(duration)}</td><td>${esc(r.display_name)}</td><td><span class="pill">${esc(r.kind)}</span></td><td>${fmt(r.values.runs)}</td><td>${fmt(r.values.zel)}</td><td>${fmt(r.values.karma)}</td><td>${fmt(r.values.honor)}</td><td>${fmt(r.values.exp)}</td></tr>`}).join('')||'<tr><td colspan="9" class="empty">No matching reward records.</td></tr>'}
 async function load(append=false){
  const status=document.getElementById('status');
- if(loadingPage)return;
- loadingPage=true;loadOlderButton.disabled=true;
+ if(loadingPage||historyMutationInProgress)return;
+ loadingPage=true;loadOlderButton.disabled=true;clearHistoryButton.disabled=true;refreshButton.disabled=true;
  try{
   const invoke=window.__TAURI_INTERNALS__?.invoke;
   if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');
@@ -54,7 +56,7 @@ async function load(append=false){
   status.className='status';
   status.textContent=`Showing ${rewards.length.toLocaleString()} completion rows from ${rawRewards.length.toLocaleString()} loaded entries (${totalRecords.toLocaleString()} saved entries)`;
  }catch(e){status.className='status error';status.textContent=`Could not load run history: ${String(e)}`;}
- finally{loadingPage=false;loadOlderButton.disabled=!hasMore;}
+ finally{loadingPage=false;loadOlderButton.disabled=!hasMore;clearHistoryButton.disabled=false;refreshButton.disabled=false;}
 }
 loadOlderButton.addEventListener('click',()=>load(true));
 let pinned=false,pinStateReady=false;const pinButton=document.getElementById('pin');const pinStatus=document.getElementById('status');
@@ -64,11 +66,12 @@ function showPinError(message){pinStatus.className='status error';pinStatus.text
 pinButton.addEventListener('click',async()=>{if(!pinStateReady||pinButton.disabled)return;const next=!pinned;pinButton.disabled=true;try{const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!=='function')throw new Error('Window controls unavailable');await invoke('tracker_set_pinned',{pinned:next});pinned=next;updatePinButton()}catch(e){showPinError(`Pin error: ${String(e)}`)}finally{pinButton.disabled=!pinStateReady}});
 document.getElementById('refresh').addEventListener('click',load);
 document.getElementById('historySearch').addEventListener('input',render);
-const clearHistoryButton=document.getElementById('clearHistory');
 clearHistoryButton.addEventListener('click',async()=>{
+ if(loadingPage||historyMutationInProgress)return;
  if(!window.confirm('Permanently clear all saved Run History records? This does not affect settings or saved macros.'))return;
  const status=document.getElementById('status');
- clearHistoryButton.disabled=true;
+ historyMutationInProgress=true;
+ clearHistoryButton.disabled=true;refreshButton.disabled=true;loadOlderButton.disabled=true;
  try{
   const invoke=window.__TAURI_INTERNALS__?.invoke;
   if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');
@@ -80,10 +83,15 @@ clearHistoryButton.addEventListener('click',async()=>{
   status.className='status';
   status.textContent='Run History cleared. New completed runs will be saved from now on.';
  }catch(e){
-  status.className='status error';
-  status.textContent=`Could not clear Run History: ${String(e)}`;
+  var clearError=`Could not clear Run History: ${String(e)}`;
  }finally{
-  clearHistoryButton.disabled=false;
+  historyMutationInProgress=false;
+  clearHistoryButton.disabled=false;refreshButton.disabled=false;loadOlderButton.disabled=!hasMore;
+ }
+ if(clearError){
+  await load(false);
+  status.className='status error';
+  status.textContent=clearError;
  }
 });
 load();

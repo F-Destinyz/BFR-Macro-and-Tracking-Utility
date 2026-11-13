@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: application-checks-${{ github.ref }}
@@ -42,25 +42,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Refresh Cargo.lock for the Wry patch
-        working-directory: BFR-Utility-Project
-        run: cargo update -p wry --manifest-path src-tauri/Cargo.toml
-
-      - name: Commit refreshed Cargo.lock
-        if: github.event_name == 'pull_request'
-        working-directory: BFR-Utility-Project
-        shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src-tauri/Cargo.lock
-          if (-not (git diff --cached --quiet)) {
-            git commit -m "deps: refresh Cargo.lock for Wry 0.57.2"
-            git fetch origin "${{ github.head_ref }}"
-            git rebase "origin/${{ github.head_ref }}"
-            git push origin HEAD:${{ github.head_ref }}
-          }
 
       - name: Run Rust tests
         working-directory: BFR-Utility-Project

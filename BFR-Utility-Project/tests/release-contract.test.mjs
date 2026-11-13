@@ -89,6 +89,18 @@ test('macro actions are tray-controlled and no F8/F9/F10 shortcuts are required'
   assert.doesNotMatch(`${rust}\n${trackerHtml}`, /\bF(?:8|9|10)\b/i);
 });
 
+test('Run History reads and clear operations cannot race each other', () => {
+  assert.match(trackerHtml, /historyMutationInProgress=false/);
+  assert.match(trackerHtml, /if\(loadingPage\|\|historyMutationInProgress\)return/);
+  assert.match(trackerHtml, /clearHistoryButton\.disabled=true;refreshButton\.disabled=true/);
+  assert.match(trackerHtml, /loadOlderButton\.disabled=true/);
+  assert.match(trackerHtml, /finally\{loadingPage=false;loadOlderButton\.disabled=!hasMore;clearHistoryButton\.disabled=false;refreshButton\.disabled=false;\}/);
+  assert.match(trackerHtml, /historyMutationInProgress=true/);
+  assert.match(trackerHtml, /historyMutationInProgress=false/);
+  assert.match(trackerHtml, /if\(clearError\)\{\s*await load\(false\)/);
+  assert.match(trackerHtml, /status\.textContent=clearError/);
+});
+
 test('Run History clear remains confirmation-protected and does not target settings/macros', () => {
   assert.match(trackerHtml, /window\.confirm\('Permanently clear all saved Run History records\?/);
   assert.match(trackerHtml, /invoke\('tracker_clear_history'\)/);

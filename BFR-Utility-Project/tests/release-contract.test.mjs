@@ -218,6 +218,22 @@ test('repeat batch normalization prefers cumulative settled-run counters', () =>
   assert.equal(legacyRunCount({ path: '/api/battles/repeat', settlement: { runs: 10, settled_runs: 20 }, totals: { runs: 20 } }), 20);
 });
 
+test('local WebView Content Security Policy restricts resources and preserves Tauri IPC', () => {
+  const csp = tauriConfig.app.security.csp;
+  assert.ok(csp && typeof csp === 'object', 'A production CSP must be configured');
+  assert.equal(csp['default-src'], "'self'");
+  assert.equal(csp['script-src'], "'self'");
+  assert.equal(csp['connect-src'], "'self' ipc: http://ipc.localhost");
+  assert.equal(csp['object-src'], "'none'");
+  assert.equal(csp['base-uri'], "'self'");
+  assert.doesNotMatch(csp['script-src'], /unsafe-inline|unsafe-eval/);
+  assert.match(csp['style-src'], /'unsafe-inline'/);
+  assert.match(csp['img-src'], /asset:.*data:/);
+  assert.match(csp['font-src'], /'self'/);
+  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\b[^>]*\b(?:src|href)=["']https?:/i);
+  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\b[^>]*\b(?:src|href)=["']\/\//i);
+});
+
 test('remote game capability grants only the custom game bridge commands', () => {
   const capability = JSON.parse(read('src-tauri/capabilities/default.json'));
   assert.deepEqual(capability.permissions, ['allow-game-recording-bridge']);

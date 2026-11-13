@@ -509,6 +509,16 @@ test('macro click IPC queue is bounded and stops capture when the bridge stalls'
     'Further physical clicks must be ignored after overflow');
 });
 
+test('Run History pin control is accessible and waits for its initial state', () => {
+  assert.match(trackerHtml, /<button id="pin" title="Checking pin state…" disabled aria-label="Checking pin state">/);
+  assert.match(trackerHtml, /pinStateReady=false/);
+  assert.match(trackerHtml, /pinButton\.setAttribute\('aria-pressed',String\(pinned\)\)/);
+  assert.match(trackerHtml, /pinButton\.disabled=false/);
+  assert.match(trackerHtml, /if\(!pinStateReady\|\|pinButton\.disabled\)return/);
+  assert.match(trackerHtml, /finally\{pinButton\.disabled=!pinStateReady\}/);
+  assert.match(trackerHtml, /pinStatus\.className='status error'/);
+});
+
 test('Run History dashboard provides keyboard focus and accessible table semantics', () => {
   assert.match(trackerHtml, /button:focus-visible,input:focus-visible/);
   assert.match(trackerHtml, /<table aria-label="Completed dungeon rewards">/);

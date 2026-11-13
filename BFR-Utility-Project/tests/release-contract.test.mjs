@@ -189,6 +189,16 @@ test('stable documentation contains no development-only release notes or retired
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
+test('first-time legacy Run History migration uses the atomic staged-copy helper', () => {
+  const start = rust.indexOf('fn migrate_tracker_history(');
+  const end = rust.indexOf('fn reset_run_history_once(', start);
+  assert.ok(start >= 0 && end > start, 'Run History migration helper was not found');
+  const migration = rust.slice(start, end);
+  assert.match(migration, /copy_file_atomically\(legacy, destination\)/);
+  assert.doesNotMatch(migration, /fs::copy\(legacy, destination\)/);
+  assert.match(rust, /fn tracker_history_first_migration_uses_atomic_copy_and_preserves_recovery_bytes/);
+});
+
 test('user-data path inspection errors are not treated as missing files', () => {
   assert.match(rust, /fn path_entry_exists\(path: &Path\) -> std::io::Result<bool>/);
   assert.match(rust, /fs::symlink_metadata\(path\)/);

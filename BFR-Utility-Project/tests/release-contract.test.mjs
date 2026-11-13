@@ -230,8 +230,8 @@ test('local WebView Content Security Policy restricts resources and preserves Ta
   assert.match(csp['style-src'], /'unsafe-inline'/);
   assert.match(csp['img-src'], /asset:.*data:/);
   assert.match(csp['font-src'], /'self'/);
-  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\\b[^>]*(?:src|href)=["']https?:/i);
-  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\\b[^>]*(?:src|href)=["']\\/\\//i);
+  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\b[^>]*\b(?:src|href)=["']https?:/i);
+  assert.doesNotMatch(trackerHtml, /<(?:script|img|iframe|audio|video)\b[^>]*\b(?:src|href)=["']\/\//i);
 });
 
 test('remote game capability grants only the custom game bridge commands', () => {

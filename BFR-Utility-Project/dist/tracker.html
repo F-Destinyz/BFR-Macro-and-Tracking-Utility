@@ -72,6 +72,7 @@ clearHistoryButton.addEventListener('click',async()=>{
  const status=document.getElementById('status');
  historyMutationInProgress=true;
  clearHistoryButton.disabled=true;refreshButton.disabled=true;loadOlderButton.disabled=true;
+ let clearError=null;
  try{
   const invoke=window.__TAURI_INTERNALS__?.invoke;
   if(typeof invoke!=='function')throw new Error('Run history connection is unavailable.');
@@ -83,7 +84,7 @@ clearHistoryButton.addEventListener('click',async()=>{
   status.className='status';
   status.textContent='Run History cleared. New completed runs will be saved from now on.';
  }catch(e){
-  var clearError=`Could not clear Run History: ${String(e)}`;
+  clearError=`Could not clear Run History: ${String(e)}`;
  }finally{
   historyMutationInProgress=false;
   clearHistoryButton.disabled=false;refreshButton.disabled=false;loadOlderButton.disabled=!hasMore;

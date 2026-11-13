@@ -344,6 +344,17 @@ test('legacy macro compatibility fixture is explicitly synthetic', () => {
   assert.match(rust, /Synthetic compatibility fixture only/);
 });
 
+test('macro file loading and restore share validated BFRMACRO2/BFRMACRO3 parsing', () => {
+  assert.match(rust, /fn parse_macro_file\(bytes: &\[u8\]\) -> Result<MacroFile, String>/);
+  assert.match(rust, /data\.format != "BFRMACRO2" && data\.format != "BFRMACRO3"/);
+  assert.match(rust, /validate_macro_clicks\(&data\.clicks\)/);
+  const parserCalls = rust.match(/let data = parse_macro_file\(&bytes\)\?/g) || [];
+  assert.equal(parserCalls.length, 2, 'Load and restore must use the shared validator');
+  assert.match(rust, /macro_file_parser_accepts_both_supported_formats/);
+  assert.match(rust, /macro_file_parser_rejects_unsupported_formats_and_invalid_clicks/);
+  assert.match(rust, /macro_file_serialization_round_trips_as_current_format/);
+});
+
 test('macro click IPC queue is bounded and stops capture when the bridge stalls', async () => {
   const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
   assert.ok(injectionMatch, 'Rust game-page injection script was not found');

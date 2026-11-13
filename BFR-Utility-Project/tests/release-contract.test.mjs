@@ -56,6 +56,13 @@ test('CI builds a Windows installer artifact without publishing GitHub releases'
   assert.doesNotMatch(securityWorkflow, /^  push:/m);
 });
 
+test('Windows CI runs a non-gating synthetic Run History performance baseline', () => {
+  assert.match(rust, /fn history_performance_baseline_large_synthetic_history/);
+  assert.match(rust, /manual performance baseline; CI runs this explicitly on Windows/);
+  assert.match(applicationWorkflow, /Run synthetic Run History performance baseline/);
+  assert.match(applicationWorkflow, /history_performance_baseline_large_synthetic_history -- --ignored --nocapture/);
+});
+
 test('Windows process target and product identity are descriptive', () => {
   assert.match(cargoToml, /^name = "bfr-macro-tracking-utility"$/m);
   assert.match(cargoToml, /^name = "bfr_macro_tauri_edition_lib"$/m);

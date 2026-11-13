@@ -189,6 +189,19 @@ test('stable documentation contains no development-only release notes or retired
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
+test('legacy settings, macro and log migration uses an atomic staged copy', () => {
+  const start = rust.indexOf('fn copy_file_atomically(');
+  const end = rust.indexOf('fn migrate_tracker_history(', start);
+  assert.ok(start >= 0 && end > start, 'Atomic migration copy helper was not found');
+  const migration = rust.slice(start, end);
+  assert.match(migration, /create_new\(true\)/);
+  assert.match(migration, /std::io::copy\(&mut source_file, &mut temporary_file\)/);
+  assert.match(migration, /temporary_file\.sync_all\(\)/);
+  assert.match(migration, /replace_file\(&temporary_path, destination\)/);
+  assert.match(migration, /copy_file_atomically\(legacy, destination\)/);
+  assert.match(rust, /legacy_file_migration_copies_atomically_and_preserves_original/);
+});
+
 test('Run History page loading propagates second-pass read errors', () => {
   const start = rust.indexOf('fn read_jsonl_page(');
   const end = rust.indexOf('fn load_history_dedupe_keys(', start);

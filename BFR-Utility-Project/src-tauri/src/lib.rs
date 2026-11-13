@@ -3012,16 +3012,68 @@ fn icon_item(
     IconMenuItem::with_id(app, id, label, true, Some(icon), None::<&str>)
 }
 
+fn copy_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::AtomicU64;
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "File destination has no parent directory")
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("data");
+    let mut temporary = None;
+    for _ in 0..10 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.migration.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary_path, mut temporary_file) = temporary.ok_or_else(|| {
+        std::io::Error::other("Could not create a temporary migration file")
+    })?;
+    let copy_result = (|| {
+        let mut source_file = fs::File::open(source)?;
+        std::io::copy(&mut source_file, &mut temporary_file)?;
+        temporary_file.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    drop(temporary_file);
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(error) = replace_file(&temporary_path, destination).map_err(std::io::Error::other) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn migrate_legacy_file(legacy: &Path, destination: &Path) -> std::io::Result<()> {
     if destination.exists() || !legacy.exists() {
         return Ok(());
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
     // Copy rather than move so the original 0.5.1 data remains as a rollback copy.
-    fs::copy(legacy, destination)?;
-    Ok(())
+    // Stage the copy beside the destination and atomically replace it so an
+    // interrupted migration cannot leave a partial settings, macro, or log file.
+    copy_file_atomically(legacy, destination)
 }
 
 fn migrate_tracker_history(legacy: &Path, destination: &Path) -> std::io::Result<()> {
@@ -3916,6 +3968,22 @@ mod tests {
             );
         }
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_file_migration_copies_atomically_and_preserves_original() {
+        let dir = temp_dir("legacy-file-migration");
+        let legacy = dir.join("settings.json");
+        let destination = dir.join("Settings/settings.json");
+        let original = b"{\n  \"width\": 1200,\n  \"height\": 900\n}\n";
+        fs::write(&legacy, original).unwrap();
+
+        migrate_legacy_file(&legacy, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+        assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

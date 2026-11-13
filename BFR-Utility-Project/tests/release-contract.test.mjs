@@ -397,7 +397,7 @@ test('playback sessions are generation-scoped and CDP I/O is time-bounded', () =
 
 test('playback rechecks its session after viewport lookup before dispatching a click', () => {
   const start = rust.indexOf('fn start_playback(');
-  const end = rust.indexOf('fn stop_playback(', start);
+  const end = rust.indexOf('\\nfn ', start + 1);
   assert.ok(start >= 0 && end > start, 'Playback worker implementation was not found');
   const worker = rust.slice(start, end);
   const viewportLookup = worker.indexOf('viewport_size(');

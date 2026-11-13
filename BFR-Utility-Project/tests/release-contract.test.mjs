@@ -189,6 +189,22 @@ test('stable documentation contains no development-only release notes or retired
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
+test('user-data path inspection errors are not treated as missing files', () => {
+  assert.match(rust, /fn path_entry_exists\(path: &Path\) -> std::io::Result<bool>/);
+  assert.match(rust, /fs::symlink_metadata\(path\)/);
+  assert.match(rust, /fn resolve_settings_source\(/);
+  assert.match(rust, /path_entry_exists\(destination\)/);
+  assert.match(rust, /path_entry_exists\(legacy\)/);
+  assert.match(rust, /path_entry_exists\(&recovery_copy\)/);
+  assert.match(rust, /path_entry_exists\(&macro_state\.file\)/);
+  assert.match(rust, /path_entry_exists\(&self\.file\)/);
+  assert.match(rust, /path_entry_exists\(&marker_file\)/);
+  assert.match(rust, /fn path_entry_exists_distinguishes_missing_present_and_inspection_errors/);
+  assert.match(rust, /fn settings_source_prefers_new_location_and_falls_back_only_when_missing/);
+  assert.match(rust, /fn legacy_migrations_propagate_path_inspection_errors/);
+  assert.doesNotMatch(rust, /settings_file\.exists\(\)|settings_source\.exists\(\)|macro_state\.file\.exists\(\)/);
+});
+
 test('legacy settings, macro and log migration uses an atomic staged copy', () => {
   const start = rust.indexOf('fn copy_file_atomically(');
   const end = rust.indexOf('fn migrate_tracker_history(', start);

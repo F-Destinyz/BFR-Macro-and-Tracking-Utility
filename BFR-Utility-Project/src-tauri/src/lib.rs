@@ -1936,6 +1936,38 @@ fn validate_macro_clicks(clicks: &[MacroClick]) -> Result<(), String> {
     Ok(())
 }
 
+// Keep performance accounting scoped to this application and its WebView2
+// subprocesses. Windows parent-process IDs alone are not a safe process-tree
+// filter: unrelated processes can otherwise be included through stale/reused
+// ancestry relationships. WebView2 renderer, GPU, and utility processes use
+// msedgewebview2.exe; unrelated child executables are deliberately excluded.
+#[derive(Clone, Debug)]
+struct ProcessTreeEntry {
+    process_id: u32,
+    parent_process_id: u32,
+    image_name: String,
+}
+
+fn select_app_process_ids(root_pid: u32, entries: &[ProcessTreeEntry]) -> Vec<u32> {
+    let mut selected = vec![root_pid];
+    loop {
+        let before = selected.len();
+        for entry in entries {
+            let is_webview_process = entry.image_name.eq_ignore_ascii_case("msedgewebview2.exe");
+            if is_webview_process
+                && selected.contains(&entry.parent_process_id)
+                && !selected.contains(&entry.process_id)
+            {
+                selected.push(entry.process_id);
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    selected
+}
+
 #[cfg(windows)]
 #[derive(Default)]
 struct ProcessMetrics {
@@ -2036,10 +2068,8 @@ fn collect_process_metrics(previous_cpu: &mut Option<(u64, Instant)>) -> Process
     let mut result = ProcessMetrics::default();
     let root_pid = unsafe { GetCurrentProcessId() };
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    let mut process_ids = vec![root_pid];
-    let mut process_names = std::collections::HashMap::<u32, String>::new();
+    let mut entries = Vec::<ProcessTreeEntry>::new();
     if !snapshot.is_null() && snapshot as isize != INVALID_HANDLE_VALUE {
-        let mut entries = Vec::<(u32, u32)>::new();
         let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
         entry.size = size_of::<ProcessEntry32W>() as u32;
         if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
@@ -2050,8 +2080,11 @@ fn collect_process_metrics(previous_cpu: &mut Option<(u64, Instant)>) -> Process
                     .position(|unit| *unit == 0)
                     .unwrap_or(entry.exe_file.len());
                 let name = String::from_utf16_lossy(&entry.exe_file[..end]);
-                process_names.insert(entry.process_id, name.chars().take(80).collect());
-                entries.push((entry.process_id, entry.parent_process_id));
+                entries.push(ProcessTreeEntry {
+                    process_id: entry.process_id,
+                    parent_process_id: entry.parent_process_id,
+                    image_name: name.chars().take(80).collect(),
+                });
                 if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
                     break;
                 }
@@ -2060,19 +2093,12 @@ fn collect_process_metrics(previous_cpu: &mut Option<(u64, Instant)>) -> Process
         unsafe {
             CloseHandle(snapshot);
         }
-        // Include WebView2 renderer/GPU/utility descendants launched beneath this app.
-        loop {
-            let before = process_ids.len();
-            for (pid, parent) in &entries {
-                if process_ids.contains(parent) && !process_ids.contains(pid) {
-                    process_ids.push(*pid);
-                }
-            }
-            if process_ids.len() == before {
-                break;
-            }
-        }
     }
+    let process_ids = select_app_process_ids(root_pid, &entries);
+    let process_names = entries
+        .into_iter()
+        .map(|entry| (entry.process_id, entry.image_name))
+        .collect::<std::collections::HashMap<_, _>>();
 
     let mut working_set = 0_u64;
     let mut private_bytes = 0_u64;
@@ -4053,6 +4079,55 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn performance_process_selection_includes_only_webview2_descendants() {
+        let entries = vec![
+            ProcessTreeEntry {
+                process_id: 201,
+                parent_process_id: 100,
+                image_name: "msedgewebview2.exe".to_string(),
+            },
+            ProcessTreeEntry {
+                process_id: 202,
+                parent_process_id: 201,
+                image_name: "msedgewebview2.exe".to_string(),
+            },
+            ProcessTreeEntry {
+                process_id: 301,
+                parent_process_id: 100,
+                image_name: "Discord.exe".to_string(),
+            },
+            ProcessTreeEntry {
+                process_id: 302,
+                parent_process_id: 201,
+                image_name: "GitHubDesktop.exe".to_string(),
+            },
+            ProcessTreeEntry {
+                process_id: 401,
+                parent_process_id: 301,
+                image_name: "msedgewebview2.exe".to_string(),
+            },
+            ProcessTreeEntry {
+                process_id: 402,
+                parent_process_id: 999,
+                image_name: "msedgewebview2.exe".to_string(),
+            },
+        ];
+
+        assert_eq!(select_app_process_ids(100, &entries), vec![100, 201, 202]);
+    }
+
+    #[test]
+    fn performance_process_selection_matches_webview_image_name_case_insensitively() {
+        let entries = vec![ProcessTreeEntry {
+            process_id: 201,
+            parent_process_id: 100,
+            image_name: "MSEDGEWEBVIEW2.EXE".to_string(),
+        }];
+
+        assert_eq!(select_app_process_ids(100, &entries), vec![100, 201]);
+    }
 
     #[test]
     fn tracker_diagnostic_rate_limit_caps_events_and_resets_after_window() {

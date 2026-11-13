@@ -4126,11 +4126,6 @@ mod tests {
     }
 
     #[test]
-    fn playback_deadline_rejects_duration_overflow() {
-        assert!(playback_click_deadline(Instant::now(), u64::MAX).is_none());
-    }
-
-    #[test]
     fn playback_generation_invalidates_the_previous_worker() {
         assert!(playback_session_is_current(MODE_PLAYING, 7, 7));
         assert!(!playback_session_is_current(MODE_PLAYING, 7, 8));

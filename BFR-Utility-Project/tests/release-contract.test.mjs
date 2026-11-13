@@ -51,7 +51,7 @@ test('stable application identifier and data paths remain compatible', () => {
 });
 
 test('one-time history cleanup guard is retained without creating a new release reset', () => {
-  assert.match(rust, /if marker_file\.exists\(\)\s*\{\s*return Ok\(false\);/);
+  assert.match(rust, /if path_entry_exists\(&marker_file\)\.map_err\(/);
   assert.match(rust, /tracker_sessions_file\)/);
   assert.match(rust, /Non-destructive safeguard retained existing Run History/);
   assert.match(rust, /existing history, settings and saved macros were preserved/);
@@ -187,6 +187,22 @@ test('stable documentation contains no development-only release notes or retired
   assert.doesNotMatch(`${readme}\n${changelog}`, /F8|F9|F10/);
   assert.match(readme, /Macro controls are available from the tray; keyboard shortcuts are not required/);
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
+});
+
+test('user-data path inspection errors are not treated as missing files', () => {
+  assert.match(rust, /fn path_entry_exists\(path: &Path\) -> std::io::Result<bool>/);
+  assert.match(rust, /fs::symlink_metadata\(path\)/);
+  assert.match(rust, /fn resolve_settings_source\(/);
+  assert.match(rust, /path_entry_exists\(destination\)/);
+  assert.match(rust, /path_entry_exists\(legacy\)/);
+  assert.match(rust, /path_entry_exists\(&recovery_copy\)/);
+  assert.match(rust, /path_entry_exists\(&macro_state\.file\)/);
+  assert.match(rust, /path_entry_exists\(&self\.file\)/);
+  assert.match(rust, /path_entry_exists\(&marker_file\)/);
+  assert.match(rust, /fn path_entry_exists_distinguishes_missing_present_and_inspection_errors/);
+  assert.match(rust, /fn settings_source_prefers_new_location_and_falls_back_only_when_missing/);
+  assert.match(rust, /fn legacy_migrations_propagate_path_inspection_errors/);
+  assert.doesNotMatch(rust, /settings_file\.exists\(\)|settings_source\.exists\(\)|macro_state\.file\.exists\(\)/);
 });
 
 test('legacy settings, macro and log migration uses an atomic staged copy', () => {

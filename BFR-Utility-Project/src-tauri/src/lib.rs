@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     io::{BufRead, Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -28,6 +28,9 @@ const GAME_URL: &str = "https://rebornbf.com/home";
 const WINDOW_WIDTH: f64 = 900.0;
 const WINDOW_HEIGHT: f64 = 1125.0;
 const LOOP_GAP: Duration = Duration::from_millis(500);
+const TRACKER_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKER_DIAGNOSTICS_PER_WINDOW: u32 = 120;
+const MAX_RECORDING_ERROR_MESSAGE_CHARS: usize = 500;
 const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CDP_IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -813,6 +816,42 @@ impl SettingsState {
     }
 }
 
+#[derive(Debug, Default)]
+struct TrackerDiagnosticRateLimit {
+    accepted_at: VecDeque<Instant>,
+}
+
+impl TrackerDiagnosticRateLimit {
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .accepted_at
+            .front()
+            .is_some_and(|accepted| now.duration_since(*accepted) >= TRACKER_DIAGNOSTIC_WINDOW)
+        {
+            self.accepted_at.pop_front();
+        }
+        if self.accepted_at.len() >= MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize {
+            return false;
+        }
+        self.accepted_at.push_back(now);
+        true
+    }
+}
+
+fn sanitize_recording_error_message(message: &str) -> String {
+    let safe = message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_RECORDING_ERROR_MESSAGE_CHARS)
+        .collect::<String>();
+    if safe.is_empty() {
+        "Unknown recording bridge error".to_string()
+    } else {
+        safe
+    }
+}
+
 struct MacroState {
     file: PathBuf,
     log_file: PathBuf,
@@ -823,6 +862,7 @@ struct MacroState {
     tracker_legacy_file: PathBuf,
     tracker_data_lock: Mutex<()>,
     tracker_dedupe_keys: Mutex<HashSet<String>>,
+    tracker_diagnostic_rate_limit: Mutex<TrackerDiagnosticRateLimit>,
     cdp_port: u16,
     mode: AtomicU8,
     playback_generation: AtomicU64,
@@ -1103,27 +1143,25 @@ impl MacroState {
 
     fn tracker_diagnostic_event(&self, event: &str, details: Value) -> Result<(), String> {
         let safe_event = match event {
+            // Keep this list limited to events emitted by INJECTION_SCRIPT.
             "observer_started"
-            | "resource_seen"
             | "observer_error"
             | "dungeon_context_seen"
             | "begin_quest_click_seen"
             | "repeat_action_click_seen"
-            | "repeat_batch_click_seen"
-            | "repeat_battles_click_seen"
-            | "battle_response_seen"
-            | "battle_response_schema_seen"
-            | "api_response_schema_seen"
-            | "dungeon_metadata_seen"
             | "reward_persisted"
             | "reward_persist_failed"
-            | "network_activity"
-            | "websocket_activity"
-            | "dom_activity"
-            | "navigation_activity"
             | "observer_status" => event,
             _ => return Err("Unsupported tracker diagnostic event".to_string()),
         };
+        let allowed = self
+            .tracker_diagnostic_rate_limit
+            .lock()
+            .map_err(|_| "Tracker diagnostic rate limiter is unavailable".to_string())?
+            .allow();
+        if !allowed {
+            return Ok(());
+        }
         let safe_details = match safe_event {
             "observer_started" => json!({
                 "page_host": details.get("page_host").and_then(Value::as_str).unwrap_or("").chars().take(120).collect::<String>(),
@@ -1143,9 +1181,7 @@ impl MacroState {
                 "performance_resource": details.get("performance_resource").and_then(Value::as_bool).unwrap_or(false)
             }),
             "begin_quest_click_seen"
-            | "repeat_action_click_seen"
-            | "repeat_batch_click_seen"
-            | "repeat_battles_click_seen" => json!({
+            | "repeat_action_click_seen" => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
                 "action_kind": details.get("action_kind").and_then(Value::as_str).filter(|v| ["batch", "battles", "generic"].contains(v)).unwrap_or("begin_quest"),
@@ -1184,350 +1220,9 @@ impl MacroState {
                     "source": details.get("source").and_then(Value::as_str).unwrap_or("route").chars().take(40).collect::<String>()
                 })
             }
-            "resource_seen" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" {
-                    return Ok(());
-                }
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
-                    return Ok(());
-                }
-                json!({
-                    "host": host,
-                    "path": path.chars().take(300).collect::<String>(),
-                    "initiator_type": details.get("initiator_type").and_then(Value::as_str).unwrap_or("unknown").chars().take(40).collect::<String>(),
-                    "duration_ms": details.get("duration_ms").and_then(Value::as_u64).unwrap_or(0).min(600000),
-                    "transfer_size": details.get("transfer_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000),
-                    "encoded_body_size": details.get("encoded_body_size").and_then(Value::as_u64).unwrap_or(0).min(100_000_000)
-                })
-            }
-            "battle_response_seen" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com"
-                    || !(path == "/api/battles/repeat" || path == "/api/battles/finish")
-                {
-                    return Ok(());
-                }
-                let method = details
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("GET");
-                let content_type = details
-                    .get("content_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let mut safe_fields = Vec::new();
-                if let Some(fields) = details.get("fields").and_then(Value::as_array) {
-                    for field in fields.iter().take(80) {
-                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
-                        let lower = field_path.to_ascii_lowercase();
-                        if field_path.is_empty()
-                            || field_path.len() > 180
-                            || lower.contains("token")
-                            || lower.contains("auth")
-                            || lower.contains("cookie")
-                            || lower.contains("password")
-                            || lower.contains("account")
-                            || lower.contains("player")
-                            || lower.contains("session")
-                            || lower.contains("email")
-                        {
-                            continue;
-                        }
-                        let Some(value) = field.get("value") else {
-                            continue;
-                        };
-                        let safe_value = match value {
-                            Value::String(text) => Value::String(text.chars().take(100).collect()),
-                            Value::Number(number) => Value::Number(number.clone()),
-                            Value::Bool(boolean) => Value::Bool(*boolean),
-                            _ => continue,
-                        };
-                        safe_fields.push(json!({ "path": field_path, "value": safe_value }));
-                    }
-                }
-                json!({
-                    "host": host,
-                    "path": path,
-                    "method": method.chars().take(10).collect::<String>(),
-                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
-                    "content_type": content_type.chars().take(80).collect::<String>(),
-                    "dungeon_route": details.get("dungeon_route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
-                    "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
-                    "dungeon_name": details.get("dungeon_name").and_then(Value::as_str).unwrap_or("").chars().take(100).collect::<String>(),
-                    "field_count": safe_fields.len(),
-                    "fields": safe_fields
-                })
-            }
-            "battle_response_schema_seen" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com"
-                    || !(path == "/api/battles/repeat" || path == "/api/battles/finish")
-                {
-                    return Ok(());
-                }
-                let mut schema_fields = Vec::new();
-                if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
-                    for field in fields.iter().take(240) {
-                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
-                        let lower_path = field_path.to_ascii_lowercase();
-                        if field_path.is_empty()
-                            || field_path.len() > 180
-                            || !field_path.is_ascii()
-                            || [
-                                "token",
-                                "auth",
-                                "cookie",
-                                "password",
-                                "email",
-                                "account",
-                                "username",
-                                "player",
-                                "character",
-                                "session",
-                                "csrf",
-                                "secret",
-                                "credential",
-                                "profile",
-                                "user",
-                                "identity",
-                                "uuid",
-                            ]
-                            .iter()
-                            .any(|blocked| lower_path.contains(blocked))
-                            || field_path
-                                .chars()
-                                .any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
-                        {
-                            continue;
-                        }
-                        let value_type = match field
-                            .get("value_type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                        {
-                            "object" | "array" | "array_item" | "null" | "number" | "boolean"
-                            | "string" => field
-                                .get("value_type")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown"),
-                            _ => continue,
-                        };
-                        let mut safe = json!({ "path": field_path, "value_type": value_type });
-                        if value_type == "array" || value_type == "array_item" {
-                            let length = field
-                                .get("array_length")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0)
-                                .min(10000);
-                            safe["array_length"] = json!(length);
-                        }
-                        schema_fields.push(safe);
-                    }
-                }
-                json!({
-                    "host": host,
-                    "path": path,
-                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
-                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
-                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
-                    "schema_field_count": schema_fields.len(),
-                    "schema_fields": schema_fields
-                })
-            }
-            "api_response_schema_seen" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com"
-                    || !path.starts_with("/api/")
-                    || path.len() > 240
-                    || path.contains('?')
-                    || path.contains('#')
-                {
-                    return Ok(());
-                }
-                let mut schema_fields = Vec::new();
-                if let Some(fields) = details.get("schema_fields").and_then(Value::as_array) {
-                    for field in fields.iter().take(240) {
-                        let field_path = field.get("path").and_then(Value::as_str).unwrap_or("");
-                        let lower_path = field_path.to_ascii_lowercase();
-                        if field_path.is_empty()
-                            || field_path.len() > 180
-                            || !field_path.is_ascii()
-                            || [
-                                "token",
-                                "auth",
-                                "cookie",
-                                "password",
-                                "email",
-                                "account",
-                                "username",
-                                "player",
-                                "character",
-                                "session",
-                                "csrf",
-                                "secret",
-                                "credential",
-                                "profile",
-                                "user",
-                                "identity",
-                                "uuid",
-                            ]
-                            .iter()
-                            .any(|blocked| lower_path.contains(blocked))
-                            || field_path
-                                .chars()
-                                .any(|c| !(c.is_ascii_alphanumeric() || "._-*[]-".contains(c)))
-                        {
-                            continue;
-                        }
-                        let value_type = match field
-                            .get("value_type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                        {
-                            "object" | "array" | "array_item" | "null" | "number" | "boolean"
-                            | "string" => field
-                                .get("value_type")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown"),
-                            _ => continue,
-                        };
-                        let mut safe = json!({ "path": field_path, "value_type": value_type });
-                        if value_type == "array" || value_type == "array_item" {
-                            safe["array_length"] = json!(field
-                                .get("array_length")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0)
-                                .min(10000));
-                        }
-                        schema_fields.push(safe);
-                    }
-                }
-                json!({
-                    "host": host,
-                    "path": path,
-                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
-                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
-                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
-                    "schema_field_count": schema_fields.len(),
-                    "schema_fields": schema_fields
-                })
-            }
-            "dungeon_metadata_seen" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com"
-                    || !(path == "/dungeons"
-                        || path.starts_with("/dungeons/")
-                        || path.starts_with("/start/"))
-                    || path.contains('?')
-                    || path.contains('#')
-                {
-                    return Ok(());
-                }
-                let mut entries = Vec::new();
-                if let Some(items) = details.get("entries").and_then(Value::as_array) {
-                    for item in items.iter().take(40) {
-                        let mut safe = serde_json::Map::new();
-                        if let Some(source) = item.get("source_path").and_then(Value::as_str) {
-                            let clean = source
-                                .chars()
-                                .take(120)
-                                .filter(|c| c.is_ascii_alphanumeric() || "._-*[]".contains(*c))
-                                .collect::<String>();
-                            if !clean.is_empty() {
-                                safe.insert("source_path".into(), json!(clean));
-                            }
-                        }
-                        if let Some(label) = item.get("label").and_then(Value::as_str) {
-                            let label = label.trim();
-                            if !label.is_empty()
-                                && label.len() <= 100
-                                && !label.chars().any(|c| c.is_control())
-                            {
-                                safe.insert("label".into(), json!(label));
-                            }
-                        }
-                        for key in ["id", "level"] {
-                            if let Some(value) = item.get(key).and_then(Value::as_str) {
-                                if !value.is_empty()
-                                    && value.len() <= 40
-                                    && value
-                                        .chars()
-                                        .all(|c| c.is_ascii_alphanumeric() || " _.-".contains(c))
-                                {
-                                    safe.insert(key.into(), json!(value));
-                                }
-                            }
-                        }
-                        if safe.contains_key("label")
-                            || safe.contains_key("id")
-                            || safe.contains_key("level")
-                        {
-                            entries.push(Value::Object(safe));
-                        }
-                    }
-                }
-                json!({
-                    "host": host, "path": path,
-                    "method": if details.get("method").and_then(Value::as_str) == Some("DOM") { "DOM" } else { "GET" },
-                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
-                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
-                    "entry_count": entries.len(), "entries": entries
-                })
-            }
             "reward_persisted" => json!({
                 "dungeon_id": details.get("dungeon_id").and_then(Value::as_str).unwrap_or("").chars().take(40).collect::<String>(),
                 "settled_runs": details.get("settled_runs").and_then(Value::as_u64).unwrap_or(0).min(100000)
-            }),
-            "network_activity" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" {
-                    return Ok(());
-                }
-                let path = details.get("path").and_then(Value::as_str).unwrap_or("");
-                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
-                    return Ok(());
-                }
-                json!({
-                    "host": host,
-                    "path": path.chars().take(300).collect::<String>(),
-                    "transport": details.get("transport").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
-                    "phase": details.get("phase").and_then(Value::as_str).unwrap_or("response").chars().take(20).collect::<String>(),
-                    "method": details.get("method").and_then(Value::as_str).unwrap_or("GET").chars().take(10).collect::<String>(),
-                    "status": details.get("status").and_then(Value::as_u64).unwrap_or(0).min(599),
-                    "content_type": details.get("content_type").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>(),
-                    "duration_ms": details.get("duration_ms").and_then(Value::as_u64).unwrap_or(0).min(600000),
-                    "body_size": details.get("body_size").and_then(Value::as_u64).unwrap_or(0).min(100000000),
-                    "is_json": details.get("is_json").and_then(Value::as_bool).unwrap_or(false)
-                })
-            }
-            "websocket_activity" => {
-                let host = details.get("host").and_then(Value::as_str).unwrap_or("");
-                if host != "rebornbf.com" {
-                    return Ok(());
-                }
-                json!({
-                    "transport": "websocket",
-                    "phase": details.get("phase").and_then(Value::as_str).unwrap_or("message").chars().take(20).collect::<String>(),
-                    "direction": details.get("direction").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
-                    "data_type": details.get("data_type").and_then(Value::as_str).unwrap_or("unknown").chars().take(20).collect::<String>(),
-                    "payload_size": details.get("payload_size").and_then(Value::as_u64).unwrap_or(0).min(100000000)
-                })
-            }
-            "dom_activity" => json!({
-                "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
-                "mutation_count": details.get("mutation_count").and_then(Value::as_u64).unwrap_or(0).min(100000),
-                "added_nodes": details.get("added_nodes").and_then(Value::as_u64).unwrap_or(0).min(100000),
-                "removed_nodes": details.get("removed_nodes").and_then(Value::as_u64).unwrap_or(0).min(100000)
-            }),
-            "navigation_activity" => json!({
-                "route": details.get("route").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>(),
-                "source": details.get("source").and_then(Value::as_str).unwrap_or("unknown").chars().take(30).collect::<String>()
             }),
             _ => json!({
                 "stage": details.get("stage").and_then(Value::as_str).unwrap_or("unknown").chars().take(80).collect::<String>(),
@@ -2608,6 +2303,7 @@ fn finish_stopping_recording(mode: &AtomicU8) -> bool {
 
 #[tauri::command]
 fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_, MacroState>) {
+    let safe_message = sanitize_recording_error_message(&message);
     let snapshot = match begin_stopping_recording(&state.mode, &state.record_started, &state.clicks)
     {
         Ok(Some(snapshot)) => snapshot,
@@ -2622,9 +2318,9 @@ fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_,
     let (clicks, recording_duration_ms) = snapshot;
     state.performance_event(
         "recording_error",
-        json!({ "message": &message, "recording_duration_ms": recording_duration_ms }),
+        json!({ "message": &safe_message, "recording_duration_ms": recording_duration_ms }),
     );
-    state.log(&format!("Click capture IPC error: {message}"));
+    state.log(&format!("Click capture IPC error: {safe_message}"));
     let recovery = match state.save_macro_snapshot(&clicks) {
         Ok(0) => {
             match state.restore_saved_macro_during_stopping() {
@@ -2641,7 +2337,7 @@ fn report_recording_error(message: String, app: AppHandle<Wry>, state: State<'_,
         &app,
         "BFR Macro — Recording error",
         &format!(
-            "Recording stopped because communication with the game failed: {message}\n{recovery}"
+            "Recording stopped because communication with the game failed: {safe_message}\n{recovery}"
         ),
         true,
     );
@@ -3948,6 +3644,7 @@ pub fn run() {
                 tracker_legacy_file,
                 tracker_data_lock: Mutex::new(()),
                 tracker_dedupe_keys: Mutex::new(tracker_dedupe_keys.as_ref().cloned().unwrap_or_default()),
+                tracker_diagnostic_rate_limit: Mutex::new(TrackerDiagnosticRateLimit::default()),
                 cdp_port,
                 mode: AtomicU8::new(MODE_IDLE),
                 playback_generation: AtomicU64::new(0),
@@ -4135,6 +3832,34 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracker_diagnostic_rate_limit_caps_events_and_resets_after_window() {
+        let mut limiter = TrackerDiagnosticRateLimit::default();
+        for _ in 0..MAX_TRACKER_DIAGNOSTICS_PER_WINDOW {
+            assert!(limiter.allow());
+        }
+        assert!(!limiter.allow());
+        limiter.accepted_at = vec![
+            Instant::now() - Duration::from_secs(61);
+            MAX_TRACKER_DIAGNOSTICS_PER_WINDOW as usize
+        ]
+        .into();
+        assert!(limiter.allow());
+        assert_eq!(limiter.accepted_at.len(), 1);
+    }
+
+    #[test]
+    fn recording_error_message_is_bounded_and_removes_control_characters() {
+        let input = format!("capture\nfailed\r{}", "x".repeat(700));
+        let safe = sanitize_recording_error_message(&input);
+        assert!(!safe.chars().any(char::is_control));
+        assert_eq!(safe.chars().count(), MAX_RECORDING_ERROR_MESSAGE_CHARS);
+        assert_eq!(
+            sanitize_recording_error_message("\n\r\t"),
+            "Unknown recording bridge error"
+        );
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

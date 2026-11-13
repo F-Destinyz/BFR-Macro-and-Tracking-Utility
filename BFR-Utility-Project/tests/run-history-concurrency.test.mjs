@@ -225,3 +225,31 @@ test('Refresh reloads the newest page instead of treating the click event as Loa
   assert.match(harness.getElementById('historyTable').innerHTML, /Newest after refresh/);
   assert.doesNotMatch(harness.getElementById('historyTable').innerHTML, /Older loaded record/);
 });
+
+test('Run History empty states distinguish an empty history from a partial search', async () => {
+  const emptyHarness = createHarness({
+    pages: [Promise.resolve(emptyPage)],
+    clearResult: () => Promise.resolve()
+  });
+  await nextTask();
+  assert.match(emptyHarness.getElementById('historyTable').innerHTML, /No saved reward records yet/);
+
+  const oneRecord = {
+    record_type: 'battle_reward',
+    timestamp_unix_ms: 1000,
+    dungeon_name: 'Only loaded record',
+    path: '/api/battles/finish',
+    run_count: 1,
+    totals: { zel: 12 }
+  };
+  const partialHarness = createHarness({
+    pages: [Promise.resolve({ records: [oneRecord], total_records: 3, next_offset: 1, has_more: true })],
+    clearResult: () => Promise.resolve()
+  });
+  await nextTask();
+  const search = partialHarness.getElementById('historySearch');
+  search.value = 'not present in loaded records';
+  search.listeners.get('input')();
+  assert.match(partialHarness.getElementById('historyTable').innerHTML,
+    /No matches in loaded records\. Load older records to search more history/);
+});

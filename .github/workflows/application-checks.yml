@@ -56,3 +56,81 @@ jobs:
           if (-not (Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Filter '*setup.exe' -ErrorAction SilentlyContinue)) {
             throw 'Tauri build completed without producing the expected NSIS setup installer.'
           }
+
+      - name: Upload Windows NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-nsis-installer
+          path: BFR-Utility-Project/src-tauri/target/release/bundle/nsis/*setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  dependency-audit:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/security-audit.yml
+
+  publish-release:
+    name: Publish v2.0.3 GitHub release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [windows-checks, dependency-audit]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v7
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-nsis-installer
+          path: release-assets
+
+      - name: Publish v2.0.3 release and SHA-256 checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = (Get-Content 'BFR-Utility-Project/package.json' -Raw | ConvertFrom-Json).version
+          if ($version -ne '2.0.3') {
+            Write-Host "Skipping release; package version is $version."
+            exit 0
+          }
+
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw 'GitHub CLI is not available on this runner.'
+          }
+
+          $tag = "v$version"
+          $existingTags = @(gh release list --repo 'F-Destinyz/BFR-Macro-and-Tracking-Utility' --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not inspect existing GitHub releases.'
+          }
+          if ($existingTags -contains $tag) {
+            Write-Host "$tag already exists; refusing to overwrite the published release."
+            exit 0
+          }
+
+          $installers = @(Get-ChildItem -Path 'release-assets' -Filter '*setup.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS setup installer; found $($installers.Count)."
+          }
+
+          $changelog = Get-Content 'BFR-Utility-Project/CHANGELOG.md' -Raw
+          $releaseNotes = [regex]::Match($changelog, '(?ms)^## 2\.0\.3\b.*?(?=^## |\z)')
+          if (-not $releaseNotes.Success) {
+            throw 'The v2.0.3 release notes are missing from CHANGELOG.md.'
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'v2.0.3-release-notes.md'
+          [System.IO.File]::WriteAllText($notesPath, $releaseNotes.Value, [System.Text.UTF8Encoding]::new($false))
+
+          $installer = $installers[0]
+          $checksum = (Get-FileHash -Path $installer.FullName -Algorithm SHA256).Hash
+          $checksumPath = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
+          Set-Content -Path $checksumPath -Value "$checksum  $($installer.Name)" -Encoding ascii
+
+          gh release create $tag $installer.FullName $checksumPath --repo 'F-Destinyz/BFR-Macro-and-Tracking-Utility' --target $env:GITHUB_SHA --title "BFR Macro & Tracking Utility $tag" --notes-file $notesPath --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub release creation or installer upload failed.'
+          }

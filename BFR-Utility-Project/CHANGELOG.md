@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.3 — Run History concurrency and runtime refresh
+
+- Serialize Run History page reads and clearing so overlapping operations cannot overwrite each other; disable conflicting refresh, pagination, and clear actions while a history operation is active.
+- If clearing Run History fails, reload the on-disk records before displaying the error so the dashboard does not leave a stale view.
+- Add behavioral regression tests for overlapping history reads/clears and failed-clear recovery.
+- Add Rust regression tests for exact HTTPS game-origin validation and the loopback DevTools WebSocket endpoint.
+- Update the Tauri WebView runtime to Wry 0.57.2 and regenerate the Cargo.lock dependency graph.
+- Move CI to Node.js 26 LTS, current GitHub Actions releases, and the current Rust stable toolchain; validate the Windows NSIS installer and dependency audits before publishing.
+- Preserve the existing Tauri application identifier, Settings, Macros, Run History, Logs, and WebView2 profile. No user-data reset or migration is introduced.
+
 ## 2.0.2 — Post-audit reliability and preservation fixes
 
 - Prevent late recording-error notifications from changing an active playback state.

@@ -1113,6 +1113,9 @@ fn save_macro_snapshot_to_file(
 
 impl MacroState {
     fn save_macro_snapshot(&self, clicks: &[MacroClick]) -> Result<usize, String> {
+        if clicks.is_empty() {
+            return Ok(0);
+        }
         let mut blocked_reason = self
             .macro_save_blocked_reason
             .lock()

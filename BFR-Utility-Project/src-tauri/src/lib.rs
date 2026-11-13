@@ -3972,6 +3972,36 @@ mod tests {
     }
 
     #[test]
+    fn atomic_migration_copy_failure_removes_temporary_file() {
+        let dir = temp_dir("legacy-file-migration-copy-failure");
+        let missing_source = dir.join("missing-settings.json");
+        let destination = dir.join("Settings/settings.json");
+
+        let error = copy_file_atomically(&missing_source, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_migration_replace_failure_preserves_destination_and_cleans_temporary_file() {
+        let dir = temp_dir("legacy-file-migration-replace-failure");
+        let source = dir.join("settings.json");
+        let destination = dir.join("Settings/settings.json");
+        fs::write(&source, b"new settings").unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(copy_file_atomically(&source, &destination).is_err());
+
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn legacy_file_migration_copies_atomically_and_preserves_original() {
         let dir = temp_dir("legacy-file-migration");
         let legacy = dir.join("settings.json");

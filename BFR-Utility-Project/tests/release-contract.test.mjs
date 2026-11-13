@@ -395,6 +395,18 @@ test('playback sessions are generation-scoped and CDP I/O is time-bounded', () =
   assert.match(rust, /struct PlaybackSessionGuard/);
 });
 
+test('playback rechecks its session after viewport lookup before dispatching a click', () => {
+  const start = rust.indexOf('fn start_playback(');
+  const end = rust.indexOf('fn stop_playback(', start);
+  assert.ok(start >= 0 && end > start, 'Playback worker implementation was not found');
+  const worker = rust.slice(start, end);
+  const viewportLookup = worker.indexOf('viewport_size(');
+  const sessionRecheck = worker.indexOf('if !playback_session_is_current(', viewportLookup);
+  const clickDispatch = worker.indexOf('dispatch_click(', sessionRecheck);
+  assert.ok(viewportLookup >= 0 && sessionRecheck > viewportLookup && clickDispatch > sessionRecheck,
+    'The playback generation must be rechecked after viewport lookup and before click dispatch');
+});
+
 test('macro loading enforces size, click-count and delay limits', () => {
   assert.match(rust, /MAX_MACRO_FILE_BYTES/);
   assert.match(rust, /MAX_MACRO_CLICKS/);

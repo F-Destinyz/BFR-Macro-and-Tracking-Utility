@@ -280,7 +280,8 @@ test('click capture avoids layout reads on large non-interactive ancestors', () 
 });
 
 test('macro playback follows the original absolute click timeline', () => {
-  assert.match(rust, /loop_started\.checked_add\(Duration::from_millis\(click\.elapsed_ms\)\)/);
+  assert.match(rust, /playback_click_deadline\(loop_started, click\.elapsed_ms\)/);
+  assert.match(rust, /fn playback_click_deadline\(loop_started: Instant, elapsed_ms: u64\)[\s\S]*?loop_started\.checked_add\(Duration::from_millis\(elapsed_ms\)\)/);
   assert.match(rust, /checked_add\(LOOP_GAP\)/);
 });
 

@@ -47,12 +47,11 @@ test('build runtimes and WebView dependencies use the current compatible release
   assert.match(readme, /Node\.js 26 LTS/);
 });
 
-test('v2.0.3 release publishing waits for both installer build and dependency audit', () => {
+test('CI builds a Windows installer artifact without publishing GitHub releases', () => {
   assert.match(applicationWorkflow, /actions\/upload-artifact@v7/);
-  assert.match(applicationWorkflow, /actions\/download-artifact@v8/);
-  assert.match(applicationWorkflow, /needs: \[windows-checks, dependency-audit\]/);
-  assert.match(applicationWorkflow, /gh release create/);
-  assert.match(applicationWorkflow, /Get-FileHash/);
+  assert.match(applicationWorkflow, /name: windows-nsis-installer/);
+  assert.match(applicationWorkflow, /retention-days: 7/);
+  assert.doesNotMatch(applicationWorkflow, /publish-release|gh release create|actions\/download-artifact/);
   assert.match(securityWorkflow, /workflow_call:/);
   assert.doesNotMatch(securityWorkflow, /^  push:/m);
 });

@@ -4769,7 +4769,7 @@ mod tests {
             let started = Instant::now();
             let streaming_keys = load_history_dedupe_keys(&backup, &active).unwrap();
             streaming_times.push(started.elapsed());
-            assert_eq!(streaming_keys, *expected_keys.as_ref().unwrap());
+            assert_eq!(&streaming_keys, expected_keys.as_ref().unwrap());
         }
 
         let started = Instant::now();

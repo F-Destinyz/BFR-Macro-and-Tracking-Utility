@@ -1722,6 +1722,7 @@ where
     Ok(malformed_lines)
 }
 
+#[cfg(test)]
 fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
     *malformed_lines += scan_jsonl_records(path, |record| records.push(record))?;
     Ok(())

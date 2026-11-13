@@ -4927,4 +4927,53 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn game_page_url_validation_accepts_only_the_exact_https_origin() {
+        assert!(is_game_page_url("https://rebornbf.com/home"));
+        assert!(is_game_page_url("https://rebornbf.com:443/home"));
+        assert!(is_game_page_url("https://REBORNBF.COM/home"));
+
+        for invalid in [
+            "http://rebornbf.com/home",
+            "https://rebornbf.com:444/home",
+            "https://sub.rebornbf.com/home",
+            "https://rebornbf.com.evil.example/home",
+            "https://evilrebornbf.com/home",
+            "https://user@rebornbf.com/home",
+            "https://user:password@rebornbf.com/home",
+            "https://rebornbf.com:443.evil.example/home",
+            "not a URL",
+        ] {
+            assert!(!is_game_page_url(invalid), "unexpectedly accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn cdp_websocket_validation_requires_the_expected_loopback_page_endpoint() {
+        let port = 45678;
+        assert!(validate_cdp_websocket_url(
+            "ws://127.0.0.1:45678/devtools/page/abc123",
+            port
+        )
+        .is_ok());
+
+        for invalid in [
+            "wss://127.0.0.1:45678/devtools/page/abc123",
+            "http://127.0.0.1:45678/devtools/page/abc123",
+            "ws://localhost:45678/devtools/page/abc123",
+            "ws://127.0.0.2:45678/devtools/page/abc123",
+            "ws://0.0.0.0:45678/devtools/page/abc123",
+            "ws://127.0.0.1:45679/devtools/page/abc123",
+            "ws://127.0.0.1:45678/devtools/browser/abc123",
+            "ws://127.0.0.1:45678/devtools/page",
+            "ws://user@127.0.0.1:45678/devtools/page/abc123",
+            "ws://127.0.0.1.evil.example:45678/devtools/page/abc123",
+        ] {
+            assert!(
+                validate_cdp_websocket_url(invalid, port).is_err(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
+    }
+
 }

@@ -1726,9 +1726,11 @@ fn scan_jsonl_records<F>(path: &Path, mut visit: F) -> Result<usize, String>
 where
     F: FnMut(Value),
 {
-    if !path.exists() { return Ok(0); }
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Could not open tracker data file: {error}"))?;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("Could not open tracker data file: {error}")),
+    };
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
     let mut malformed_lines = 0usize;
@@ -3781,7 +3783,7 @@ pub fn run() {
                 macro_state.log(&format!("Could not write the non-destructive Run History marker; startup continued without changing history: {error}"));
             }
             if let Err(error) = tracker_dedupe_keys {
-                macro_state.log(&format!("Could not pre-load Run History duplicate keys; new events will still be recorded: {error}"));
+                macro_state.log(&format!("Could not pre-load Run History duplicate keys; deduplicated reward events will be rejected until history can be read: {error}"));
             }
             if macro_state.file.exists() {
                 if let Err(error) = macro_state.load_macro() {
@@ -4420,6 +4422,19 @@ mod tests {
         assert!(error.contains("could not be permanently deleted"));
         assert!(error.contains(quarantined.to_string_lossy().as_ref()));
         assert_eq!(fs::read(&quarantined).unwrap(), b"retained recovery data");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_scanner_skips_missing_files_and_propagates_read_errors() {
+        let dir = temp_dir("history-scanner-open-errors");
+        let missing = dir.join("missing.jsonl");
+        assert_eq!(scan_jsonl_records(&missing, |_| {}).unwrap(), 0);
+
+        let directory = dir.join("directory.jsonl");
+        fs::create_dir(&directory).unwrap();
+        assert!(scan_jsonl_records(&directory, |_| {}).is_err());
+
         fs::remove_dir_all(dir).unwrap();
     }
 

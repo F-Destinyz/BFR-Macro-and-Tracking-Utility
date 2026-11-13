@@ -199,7 +199,7 @@ test('legacy settings, macro and log migration uses an atomic staged copy', () =
   assert.match(migration, /temporary_file\.sync_all\(\)/);
   assert.match(migration, /replace_file\(&temporary_path, destination\)/);
   assert.match(migration, /copy_file_atomically\(legacy, destination\)/);
-  assert.match(migration, /legacy_file_migration_copies_atomically_and_preserves_original/);
+  assert.match(rust, /legacy_file_migration_copies_atomically_and_preserves_original/);
 });
 
 test('Run History page loading propagates second-pass read errors', () => {

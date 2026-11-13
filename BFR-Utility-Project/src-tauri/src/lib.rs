@@ -4722,7 +4722,7 @@ mod tests {
                     "totals": {"zel": 1200, "karma": 340, "honor": 56, "exp": 7800}
                 });
                 serde_json::to_writer(&mut writer, &record).unwrap();
-                writer.write_all(b"\\n").unwrap();
+                writer.write_all(b"\n").unwrap();
             }
             writer.flush().unwrap();
             fs::metadata(path).unwrap().len()

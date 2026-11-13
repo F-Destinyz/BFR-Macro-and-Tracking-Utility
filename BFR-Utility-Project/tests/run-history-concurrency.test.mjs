@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const trackerHtml = fs.readFileSync(path.join(root, 'dist', 'tracker.html'), 'utf8');
-const script = [...trackerHtml.matchAll(/<script\\b[^>]*>([\\s\\S]*?)<\\/script>/gi)].map((match) => match[1]).at(-1);
+const script = [...trackerHtml.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[1]).at(-1);
 
 assert.ok(script, 'Run History dashboard script was not found');
 

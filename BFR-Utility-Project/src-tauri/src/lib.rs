@@ -1722,6 +1722,7 @@ where
     Ok(malformed_lines)
 }
 
+#[cfg(test)]
 fn read_jsonl_records(path: &Path, records: &mut Vec<Value>, malformed_lines: &mut usize) -> Result<(), String> {
     *malformed_lines += scan_jsonl_records(path, |record| records.push(record))?;
     Ok(())
@@ -1772,19 +1773,19 @@ fn read_jsonl_page(
 }
 
 fn load_history_dedupe_keys(backup: &Path, active: &Path) -> Result<HashSet<String>, String> {
-    let mut records = Vec::new();
-    let mut malformed_lines = 0usize;
-    read_jsonl_records(backup, &mut records, &mut malformed_lines)?;
-    read_jsonl_records(active, &mut records, &mut malformed_lines)?;
-    Ok(records
-        .into_iter()
-        .filter_map(|record| {
-            record
-                .get("dedupe_key")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect())
+    // Stream each record directly into the deduplication set. Run History is
+    // intentionally retained without automatic rotation, so collecting every
+    // parsed JSON value in a temporary Vec would duplicate the full history in
+    // memory during startup.
+    let mut keys = HashSet::new();
+    for path in [backup, active] {
+        scan_jsonl_records(path, |record| {
+            if let Some(key) = record.get("dedupe_key").and_then(Value::as_str) {
+                keys.insert(key.to_string());
+            }
+        })?;
+    }
+    Ok(keys)
 }
 
 fn repeat_cumulative_run_count(settlement: &Value, totals: &Value) -> Option<u64> {
@@ -4260,6 +4261,31 @@ mod tests {
         assert_eq!(fs::read(&first).unwrap(), b"first history");
         assert_eq!(fs::read(&second).unwrap(), b"second history");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_dedupe_keys_stream_from_backup_and_active_files() {
+        let dir = temp_dir("history-dedupe-stream");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let active = dir.join("battle-rewards.jsonl");
+        fs::write(
+            &backup,
+            b"{\"dedupe_key\":\"batch:10\"}\n{bad-json}\n{\"dedupe_key\":\"finish:one\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            &active,
+            b"{\"dedupe_key\":\"batch:10\"}\n{\"dedupe_key\":\"batch:20\"}\n",
+        )
+        .unwrap();
+
+        let keys = load_history_dedupe_keys(&backup, &active).unwrap();
+
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains("batch:10"));
+        assert!(keys.contains("batch:20"));
+        assert!(keys.contains("finish:one"));
         fs::remove_dir_all(dir).unwrap();
     }
 

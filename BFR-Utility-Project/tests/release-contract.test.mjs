@@ -186,6 +186,16 @@ test('stable documentation contains no development-only release notes or retired
   assert.match(changelog, /^## 2\.0\.0 — Stable release/m);
 });
 
+test('Run History startup loads deduplication keys as a stream', () => {
+  const start = rust.indexOf('fn load_history_dedupe_keys(');
+  const end = rust.indexOf('fn repeat_cumulative_run_count(', start);
+  assert.ok(start >= 0 && end > start, 'Run History deduplication loader was not found');
+  const loader = rust.slice(start, end);
+  assert.match(loader, /scan_jsonl_records\(path,/);
+  assert.doesNotMatch(loader, /let mut records = Vec::new\(\)|read_jsonl_records/);
+  assert.match(rust, /fn history_dedupe_keys_stream_from_backup_and_active_files\(/);
+});
+
 test('Run History preserves old backups, does not rotate, and skips malformed lines', () => {
   assert.match(rust, /fn append_history_record\(path: &Path, record: &Value\)/);
   assert.match(rust, /append_history_record\(&self\.tracker_sessions_file, &record\)/);

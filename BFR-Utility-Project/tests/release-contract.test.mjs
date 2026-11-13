@@ -221,6 +221,9 @@ test('Run History startup loads deduplication keys as a stream', () => {
   assert.match(loader, /scan_jsonl_records\(path,/);
   assert.doesNotMatch(loader, /let mut records = Vec::new\(\)|read_jsonl_records/);
   assert.match(rust, /fn history_dedupe_keys_stream_from_backup_and_active_files\(/);
+  assert.match(rust, /fn ensure_history_dedupe_keys_loaded\(/);
+  assert.match(rust, /history_dedupe_cache_retries_after_initial_read_failure/);
+  assert.match(rust, /tracker_dedupe_keys_ready: AtomicBool/);
 });
 
 test('Run History preserves old backups, does not rotate, and skips malformed lines', () => {

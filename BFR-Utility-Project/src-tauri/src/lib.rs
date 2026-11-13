@@ -4426,11 +4426,12 @@ mod tests {
     #[test]
     fn history_dedupe_cache_retries_after_initial_read_failure() {
         let dir = temp_dir("history-dedupe-cache-retry");
-        let backup = dir.join("missing/backup.jsonl");
+        let backup = dir.join("blocked/backup.jsonl");
         let active = dir.join("Logs/battle-rewards.jsonl");
         let ready = AtomicBool::new(false);
         let keys = Mutex::new(HashSet::new());
 
+        fs::create_dir_all(&backup).unwrap();
         assert!(ensure_history_dedupe_keys_loaded(&ready, &keys, &backup, &active).is_err());
         assert!(!ready.load(Ordering::Acquire));
         assert!(keys.lock().unwrap().is_empty());

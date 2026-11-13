@@ -4886,6 +4886,103 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual performance baseline; CI runs this explicitly on Windows"]
+    fn history_performance_baseline_large_synthetic_history() {
+        use std::io::Write as _;
+
+        const RECORDS_PER_FILE: usize = 25_000;
+        const PAGE_SIZE: usize = 100;
+        const ROUNDS: usize = 3;
+
+        fn write_records(path: &Path, first: u64, count: usize) -> u64 {
+            let file = fs::File::create(path).unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+            for index in first..first + count as u64 {
+                let record = json!({
+                    "record_type": "battle_reward",
+                    "dedupe_key": format!("batch-{index:08}:1"),
+                    "timestamp_unix_ms": index,
+                    "totals": {"zel": 1200, "karma": 340, "honor": 56, "exp": 7800}
+                });
+                serde_json::to_writer(&mut writer, &record).unwrap();
+                writer.write_all(b"\n").unwrap();
+            }
+            writer.flush().unwrap();
+            fs::metadata(path).unwrap().len()
+        }
+
+        let dir = temp_dir("history-performance-baseline");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let active = dir.join("battle-rewards.jsonl");
+        let backup_bytes = write_records(&backup, 0, RECORDS_PER_FILE);
+        let active_bytes = write_records(&active, RECORDS_PER_FILE as u64, RECORDS_PER_FILE);
+        let paths = [backup.as_path(), active.as_path()];
+        let expected_records = RECORDS_PER_FILE * 2;
+        let mut buffered_times = Vec::with_capacity(ROUNDS);
+        let mut streaming_times = Vec::with_capacity(ROUNDS);
+        let mut expected_keys = None;
+
+        for _ in 0..ROUNDS {
+            // Recreate the previous buffered approach as a comparison point:
+            // all parsed JSON values are retained before the key set is built.
+            let started = Instant::now();
+            let mut buffered_records = Vec::new();
+            let mut malformed = 0;
+            read_jsonl_records(&backup, &mut buffered_records, &mut malformed).unwrap();
+            read_jsonl_records(&active, &mut buffered_records, &mut malformed).unwrap();
+            assert_eq!(malformed, 0);
+            let buffered_record_count = buffered_records.len();
+            let buffered_keys = buffered_records
+                .into_iter()
+                .filter_map(|record| {
+                    record
+                        .get("dedupe_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<HashSet<_>>();
+            buffered_times.push(started.elapsed());
+            assert_eq!(buffered_record_count, expected_records);
+            if let Some(expected) = &expected_keys {
+                assert_eq!(&buffered_keys, expected);
+            } else {
+                expected_keys = Some(buffered_keys);
+            }
+
+            let started = Instant::now();
+            let streaming_keys = load_history_dedupe_keys(&backup, &active).unwrap();
+            streaming_times.push(started.elapsed());
+            assert_eq!(&streaming_keys, expected_keys.as_ref().unwrap());
+        }
+
+        let started = Instant::now();
+        let (page, malformed) = read_jsonl_page(&paths, 0, 0, PAGE_SIZE).unwrap();
+        let page_elapsed = started.elapsed();
+        assert_eq!(malformed, 0);
+        assert_eq!(page.total_records, expected_records);
+        assert_eq!(page.records.len(), PAGE_SIZE);
+
+        buffered_times.sort();
+        streaming_times.sort();
+        let buffered_median = buffered_times[ROUNDS / 2];
+        let streaming_median = streaming_times[ROUNDS / 2];
+        let total_bytes = backup_bytes + active_bytes;
+        let buffered_value_slots_floor = expected_records * std::mem::size_of::<Value>();
+
+        println!(
+            "PERF_BASELINE records={} bytes={} buffered_dedupe_median_ms={:.2} streaming_dedupe_median_ms={:.2} page_100_two_pass_ms={:.2} buffered_value_slots_floor_kib={:.1}",
+            expected_records,
+            total_bytes,
+            buffered_median.as_secs_f64() * 1000.0,
+            streaming_median.as_secs_f64() * 1000.0,
+            page_elapsed.as_secs_f64() * 1000.0,
+            buffered_value_slots_floor as f64 / 1024.0
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn history_pages_are_bounded_ordered_and_stable_when_new_records_arrive() {
         let dir = temp_dir("history-pages");
         let backup = dir.join("battle-rewards.jsonl.1");

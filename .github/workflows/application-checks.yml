@@ -45,6 +45,10 @@ jobs:
         working-directory: BFR-Utility-Project
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
+      - name: Run synthetic Run History performance baseline
+        working-directory: BFR-Utility-Project
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml history_performance_baseline_large_synthetic_history -- --ignored --nocapture
+
       - name: Run Clippy
         working-directory: BFR-Utility-Project
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

@@ -4487,13 +4487,22 @@ mod tests {
     }
 
     #[test]
+    fn macro_save_block_remains_when_path_cannot_be_inspected() {
+        let invalid = PathBuf::from("invalid\\0recording.bfrmacro");
+        let mut blocked_reason = Some("startup path inspection failed".to_string());
+
+        assert!(clear_macro_save_block_if_file_missing(&invalid, &mut blocked_reason).is_err());
+        assert_eq!(blocked_reason.as_deref(), Some("startup path inspection failed"));
+    }
+
+    #[test]
     fn empty_macro_snapshot_remains_a_no_op_even_when_saving_is_blocked() {
         let dir = temp_dir("blocked-empty-macro-save");
         let path = dir.join("recording.bfrmacro");
         let original = b"existing saved macro";
         fs::write(&path, original).unwrap();
 
-        assert_eq!(save_macro_snapshot_to_file(&path, &[], Some("unreadable" )).unwrap(), 0);
+        assert_eq!(save_macro_snapshot_to_file(&path, &[], Some("unreadable")).unwrap(), 0);
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_dir_all(dir).unwrap();
     }

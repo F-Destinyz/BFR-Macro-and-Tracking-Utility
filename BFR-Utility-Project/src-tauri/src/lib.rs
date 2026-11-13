@@ -1013,6 +1013,26 @@ where
     Ok(staged.into_iter().map(|(_, quarantine)| quarantine).collect())
 }
 
+fn delete_quarantined_history_files<F>(paths: &[PathBuf], mut remove_file: F) -> Result<(), String>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut undeleted = Vec::new();
+    for path in paths {
+        if let Err(error) = remove_file(path) {
+            undeleted.push(format!("{} ({error})", path.display()));
+        }
+    }
+    if undeleted.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Run History was detached from active storage, but could not be permanently deleted: {}",
+            undeleted.join("; ")
+        ))
+    }
+}
+
 fn restore_quarantined_history_files(staged: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (original, quarantine) in staged.iter().rev() {
@@ -1537,25 +1557,19 @@ impl MacroState {
             migrated_legacy_file,
         ])?;
 
-        // All active/recovery paths are now detached, so no old records can be
-        // re-imported. A cleanup failure leaves a clearly named quarantine file
-        // rather than restoring data into the live history; report it in the log.
-        let mut undeleted = Vec::new();
-        for quarantined in staged_files {
-            if let Err(error) = fs::remove_file(&quarantined) {
-                undeleted.push(format!("{} ({error})", quarantined.display()));
-            }
-        }
+        // All active/recovery paths are now detached, so old records cannot be
+        // re-imported. Report a cleanup failure to the dashboard instead of
+        // claiming permanent deletion when a quarantined file remains on disk.
+        let cleanup_result = delete_quarantined_history_files(&staged_files, |path| fs::remove_file(path));
         if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
             keys.clear();
         }
-        if undeleted.is_empty() {
-            self.log("Run History cleared by the user.");
-        } else {
-            self.log(&format!(
-                "Run History was detached successfully, but quarantined files could not be permanently deleted: {}",
-                undeleted.join("; ")
-            ));
+        match cleanup_result {
+            Ok(()) => self.log("Run History cleared by the user."),
+            Err(error) => {
+                self.log(&error);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -4261,6 +4275,24 @@ mod tests {
         assert_eq!(fs::read(&first).unwrap(), b"first history");
         assert_eq!(fs::read(&second).unwrap(), b"second history");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_clear_reports_quarantined_files_that_cannot_be_deleted() {
+        let dir = temp_dir("history-clear-delete-failure");
+        let quarantined = dir.join("battle-rewards.jsonl.clear-test");
+        fs::write(&quarantined, b"retained recovery data").unwrap();
+
+        let result = delete_quarantined_history_files(
+            std::slice::from_ref(&quarantined),
+            |_| Err(std::io::Error::other("simulated deletion failure")),
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("could not be permanently deleted"));
+        assert!(error.contains(quarantined.to_string_lossy().as_ref()));
+        assert_eq!(fs::read(&quarantined).unwrap(), b"retained recovery data");
         fs::remove_dir_all(dir).unwrap();
     }
 

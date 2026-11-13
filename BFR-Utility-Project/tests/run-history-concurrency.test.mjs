@@ -207,6 +207,14 @@ test('Refresh reloads the newest page instead of treating the click event as Loa
   await harness.getElementById('loadOlder').listeners.get('click')();
   assert.match(harness.getElementById('historyTable').innerHTML, /Older loaded record/);
 
+  const search = harness.getElementById('historySearch');
+  search.value = 'Older loaded record';
+  search.listeners.get('input')();
+  assert.match(harness.getElementById('historyTable').innerHTML, /Older loaded record/);
+  assert.doesNotMatch(harness.getElementById('historyTable').innerHTML, /Latest before refresh/);
+  search.value = '';
+  search.listeners.get('input')();
+
   // Real browser click listeners receive a MouseEvent argument. It must not be
   // mistaken for the load(append=true) flag.
   await harness.getElementById('refresh').listeners.get('click')({ type: 'click' });

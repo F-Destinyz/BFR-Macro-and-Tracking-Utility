@@ -66,7 +66,7 @@ test('game reward endpoints and canonical Run History fields remain present', ()
     assert.ok(rust.includes(field), `Missing reward or batch field: ${field}`);
   }
   for (const heading of ['Completed', 'Time Taken', 'Dungeon', 'Type', 'Runs', 'Zel', 'Karma', 'Honor', 'EXP']) {
-    assert.ok(trackerHtml.includes(`<th>${heading}</th>`), `Missing Run History column: ${heading}`);
+    assert.ok(trackerHtml.includes(`<th scope="col">${heading}</th>`), `Missing Run History column: ${heading}`);
   }
 });
 

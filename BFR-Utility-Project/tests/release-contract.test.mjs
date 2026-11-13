@@ -228,7 +228,7 @@ test('Run History startup loads deduplication keys as a stream', () => {
 
 test('Run History scanner skips only missing files and propagates other open errors', () => {
   const start = rust.indexOf('fn scan_jsonl_records<');
-  const end = rust.indexOf('#[cfg(test)]\nfn read_jsonl_records', start);
+  const end = rust.indexOf('#[cfg(test)]', start);
   assert.ok(start >= 0 && end > start, 'Run History scanner was not found');
   const scanner = rust.slice(start, end);
   assert.doesNotMatch(scanner, /path\.exists\(\)/);

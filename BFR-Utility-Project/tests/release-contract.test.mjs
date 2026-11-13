@@ -408,7 +408,7 @@ test('playback rechecks its session after viewport lookup before dispatching a c
 });
 
 test('application shutdown stops macro activity and saves settings', () => {
-  const start = rust.indexOf('window.on_window_event');
+  const start = rust.lastIndexOf('window.on_window_event');
   const end = rust.indexOf('tauri::WindowEvent::Resized', start);
   assert.ok(start >= 0 && end > start, 'Main window event handler was not found');
   const closeHandler = rust.slice(start, end);

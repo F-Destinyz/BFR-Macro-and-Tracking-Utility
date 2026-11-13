@@ -454,6 +454,22 @@ test('macro file loading and restore share validated BFRMACRO2/BFRMACRO3 parsing
   assert.match(rust, /macro_file_serialization_round_trips_as_current_format/);
 });
 
+test('unreadable saved macros cannot be overwritten by later recordings', () => {
+  assert.match(rust, /macro_save_blocked_reason: Mutex<Option<String>>/);
+  assert.match(rust, /fn save_macro_snapshot_to_file\(/);
+  assert.match(rust, /fn block_macro_saves\(&self, reason: String\)/);
+  assert.match(rust, /automatic replacement is disabled until it can be loaded or removed/);
+  assert.match(rust, /path inspection failed: \{error\}/);
+  assert.match(rust, /fn blocked_macro_save_preserves_existing_file\(/);
+  assert.match(rust, /fn empty_macro_snapshot_remains_a_no_op_even_when_saving_is_blocked\(/);
+  const start = rust.indexOf('fn save_macro_snapshot_to_file(');
+  const end = rust.indexOf('impl MacroState {', start);
+  assert.ok(start >= 0 && end > start, 'Macro save guard helper was not found');
+  const saver = rust.slice(start, end);
+  assert.ok(saver.indexOf('if clicks.is_empty()') < saver.indexOf('if let Some(reason) = blocked_reason'));
+  assert.ok(saver.indexOf('if let Some(reason) = blocked_reason') < saver.indexOf('write_file_atomically('));
+});
+
 test('macro click IPC queue is bounded and stops capture when the bridge stalls', async () => {
   const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
   assert.ok(injectionMatch, 'Rust game-page injection script was not found');

@@ -18,18 +18,43 @@ const trackerHtml = read('dist/tracker.html');
 const trackerCapability = JSON.parse(read('src-tauri/capabilities/tracker.json'));
 const readme = read('../README.md');
 const changelog = read('CHANGELOG.md');
+const applicationWorkflow = read('../.github/workflows/application-checks.yml');
+const securityWorkflow = read('../.github/workflows/security-audit.yml');
 
 function scriptBodies(html) {
   return [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
 }
 
-test('all release version metadata is synchronized at 2.0.2', () => {
-  assert.equal(packageJson.version, '2.0.2');
-  assert.equal(packageLock.version, '2.0.2');
-  assert.equal(packageLock.packages[''].version, '2.0.2');
-  assert.equal(tauriConfig.version, '2.0.2');
+test('all release version metadata is synchronized at 2.0.3', () => {
+  assert.equal(packageJson.version, '2.0.3');
+  assert.equal(packageLock.version, '2.0.3');
+  assert.equal(packageLock.packages[''].version, '2.0.3');
+  assert.equal(tauriConfig.version, '2.0.3');
   assert.match(cargoToml, /^version = "2\.0\.2"$/m);
   assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0\.2"/);
+});
+
+
+test('build runtimes and WebView dependencies use the current compatible releases', () => {
+  assert.match(cargoToml, /wry = "=0\\.57\\.2"/);
+  assert.match(cargoLock, /name = "wry"\\r?\\nversion = "0\\.57\\.2"/);
+  assert.match(applicationWorkflow, /actions\\/checkout@v7/);
+  assert.match(applicationWorkflow, /actions\\/setup-node@v7/);
+  assert.match(applicationWorkflow, /node-version: 26/);
+  assert.match(securityWorkflow, /actions\\/checkout@v7/);
+  assert.match(securityWorkflow, /actions\\/setup-node@v7/);
+  assert.match(securityWorkflow, /node-version: 26/);
+  assert.match(readme, /Node\\.js 26 LTS/);
+});
+
+test('v2.0.3 release publishing waits for both installer build and dependency audit', () => {
+  assert.match(applicationWorkflow, /actions\\/upload-artifact@v7/);
+  assert.match(applicationWorkflow, /actions\\/download-artifact@v8/);
+  assert.match(applicationWorkflow, /needs: \\[windows-checks, dependency-audit\\]/);
+  assert.match(applicationWorkflow, /gh release create/);
+  assert.match(applicationWorkflow, /Get-FileHash/);
+  assert.match(securityWorkflow, /workflow_call:/);
+  assert.doesNotMatch(securityWorkflow, /^  push:/m);
 });
 
 test('Windows process target and product identity are descriptive', () => {

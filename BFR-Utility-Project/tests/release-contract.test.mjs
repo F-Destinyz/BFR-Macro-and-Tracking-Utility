@@ -188,7 +188,7 @@ test('stable documentation contains no development-only release notes or retired
 
 test('Run History startup loads deduplication keys as a stream', () => {
   const start = rust.indexOf('fn load_history_dedupe_keys(');
-  const end = rust.indexOf('\n}\n', start);
+  const end = rust.indexOf('fn repeat_cumulative_run_count(', start);
   assert.ok(start >= 0 && end > start, 'Run History deduplication loader was not found');
   const loader = rust.slice(start, end);
   assert.match(loader, /scan_jsonl_records\(path,/);

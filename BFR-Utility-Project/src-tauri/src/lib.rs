@@ -2945,6 +2945,17 @@ fn start_playback(app: AppHandle<Wry>) {
                         return;
                     }
                 };
+                // Stop may be requested while the bounded DevTools viewport
+                // lookup is in flight. Recheck before dispatching so an obsolete
+                // worker cannot send another click after the user stops playback.
+                if !playback_session_is_current(
+                    state.mode.load(Ordering::SeqCst),
+                    generation,
+                    state.playback_generation.load(Ordering::SeqCst),
+                ) {
+                    completed_normally = false;
+                    break 'playback;
+                }
                 let (x, y) = playback_click_position(click, width, height);
                 if let Err(error) = dispatch_click(&mut socket, &mut next_id, x, y) {
                     playback_failed(&app, generation, &error);
@@ -4703,6 +4714,30 @@ mod tests {
         assert!(playback_session_is_current(MODE_PLAYING, 7, 7));
         assert!(!playback_session_is_current(MODE_PLAYING, 7, 8));
         assert!(!playback_session_is_current(MODE_IDLE, 7, 7));
+    }
+
+    #[test]
+    fn playback_stop_during_viewport_lookup_prevents_the_next_click() {
+        let mode = AtomicU8::new(MODE_PLAYING);
+        let generation = AtomicU64::new(7);
+
+        // The worker's first check succeeds before it begins the viewport lookup.
+        assert!(playback_session_is_current(
+            mode.load(Ordering::SeqCst),
+            7,
+            generation.load(Ordering::SeqCst)
+        ));
+
+        // Simulate Stop Playback completing while viewport_size is in flight.
+        generation.fetch_add(1, Ordering::SeqCst);
+        mode.store(MODE_IDLE, Ordering::SeqCst);
+
+        // The new post-lookup guard must reject dispatch for the old worker.
+        assert!(!playback_session_is_current(
+            mode.load(Ordering::SeqCst),
+            7,
+            generation.load(Ordering::SeqCst)
+        ));
     }
 
     #[test]

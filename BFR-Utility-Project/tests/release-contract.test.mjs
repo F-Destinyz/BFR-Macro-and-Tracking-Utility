@@ -627,15 +627,22 @@ test('Run History dashboard provides keyboard focus and accessible table semanti
 });
 
 
+
 test('dungeon heading observer ignores unrelated DOM mutations', () => {
-  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\\s\\S]*?)"#;/);
-  assert.ok(injectionMatch, 'Rust game-page injection script was not found');
-  const helperMatch = injectionMatch[1].match(/const mutationAffectsDungeonHeading = \(mutation\) => \{[\\s\\S]*?\n    \};/);
-  assert.ok(helperMatch, 'Dungeon heading mutation filter was not found');
-  const mutationAffectsDungeonHeading = vm.runInNewContext(
-    `(${helperMatch[0]})`,
-    {}
+  const injectionStart = rust.indexOf('const INJECTION_SCRIPT: &str = r#"');
+  const injectionEnd = rust.indexOf('"#;', injectionStart);
+  assert.ok(injectionStart >= 0 && injectionEnd > injectionStart,
+    'Rust game-page injection script was not found');
+  const injection = rust.slice(
+    injectionStart + 'const INJECTION_SCRIPT: &str = r#"'.length,
+    injectionEnd
   );
+  const helperStart = injection.indexOf('const mutationAffectsDungeonHeading = (mutation) => {');
+  const helperEnd = injection.indexOf('\n    };', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart,
+    'Dungeon heading mutation filter was not found');
+  const helperSource = injection.slice(helperStart, helperEnd + '\n    };'.length);
+  const mutationAffectsDungeonHeading = vm.runInNewContext(`(${helperSource})`, {});
 
   const ordinaryElement = {
     nodeType: 1,
@@ -677,8 +684,13 @@ test('dungeon heading observer ignores unrelated DOM mutations', () => {
   assert.equal(mutationAffectsDungeonHeading({
     type: 'childList', target: ordinaryElement, addedNodes: [], removedNodes: [heading]
   }), true, 'Removing the H1 must schedule a heading capture');
-  assert.match(injectionMatch[1], /new MutationObserver\(\(mutations\) => \{\s*if \(!mutations\.some\(mutationAffectsDungeonHeading\)/,
+
+  assert.ok(injection.includes('new MutationObserver((mutations) => {'),
+    'The observer must inspect mutation records');
+  assert.ok(injection.includes('!mutations.some(mutationAffectsDungeonHeading)'),
     'The observer must filter mutation records before scheduling the debounced capture');
-  assert.match(injectionMatch[1], /headingObserver\.observe\(document\.documentElement, \{ childList: true, subtree: true \}\)/,
+  assert.ok(injection.includes('}, 120);'),
+    'The existing 120 ms debounce must be preserved');
+  assert.ok(injection.includes('headingObserver.observe(document.documentElement, { childList: true, subtree: true })'),
     'The existing child-list observer coverage must remain unchanged');
 });

@@ -1398,7 +1398,7 @@ impl MacroState {
             let bytes = fs::read(&self.tracker_reward_samples_file).map_err(|error| format!("Could not read existing reward samples: {error}"))?;
             if bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES { return Err("Existing reward sample file exceeds its safety limit; it was left unchanged".to_string()); }
             serde_json::from_slice(&bytes).map_err(|error| format!("Existing reward sample file is invalid and was left unchanged: {error}"))?
-        } else { Vec::new() };
+        } else { VecDeque::new() };
         samples.push(record);
         while samples.len() > MAX_REWARD_SAMPLE_COUNT { samples.pop_front(); }
         let mut bytes = serde_json::to_vec_pretty(&samples).map_err(|error| error.to_string())?;

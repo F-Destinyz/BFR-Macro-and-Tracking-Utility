@@ -47,6 +47,18 @@ test('build runtimes and WebView dependencies use the current compatible release
   assert.match(readme, /Node\.js 26 LTS/);
 });
 
+test('playtest installer uses a separate app identity and data profile', () => {
+  const playtestConfig = JSON.parse(read('src-tauri/tauri.playtest.conf.json'));
+  assert.equal(tauriConfig.identifier, 'com.bfrmacro.tauri.dev');
+  assert.equal(playtestConfig.identifier, 'com.bfrmacro.tauri.playtest');
+  assert.notEqual(playtestConfig.identifier, tauriConfig.identifier);
+  assert.equal(playtestConfig.productName, 'BFR Macro & Tracking Utility Playtest');
+  assert.equal(playtestConfig.bundle.windows.nsis.startMenuFolder, 'BFR Macro & Tracking Utility Playtest');
+  assert.match(packageJson.scripts['build:windows:playtest'], /--config src-tauri\/tauri\.playtest\.conf\.json/);
+  assert.match(applicationWorkflow, /npm run build:windows:playtest/);
+  assert.doesNotMatch(applicationWorkflow, /npm run build:windows\s*$/m);
+});
+
 test('CI builds a Windows installer artifact without publishing GitHub releases', () => {
   assert.match(applicationWorkflow, /actions\/upload-artifact@v7/);
   assert.match(applicationWorkflow, /name: windows-nsis-installer/);

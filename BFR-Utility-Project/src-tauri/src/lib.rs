@@ -2389,30 +2389,29 @@ fn tracker_set_pinned(
 }
 
 #[tauri::command]
-fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), String> {
-    if state.mode.load(Ordering::SeqCst) != MODE_RECORDING {
+fn append_recorded_click(
+    mode: &AtomicU8,
+    clicks: &Mutex<Vec<MacroClick>>,
+    x: f64,
+    y: f64,
+    elapsed_ms: u64,
+) -> Result<(), String> {
+    if mode.load(Ordering::SeqCst) != MODE_RECORDING {
         return Ok(());
     }
     if !x.is_finite() || !y.is_finite() {
         return Err("The game page sent invalid click coordinates".to_string());
     }
-    let elapsed_ms = state
-        .record_started
-        .lock()
-        .map_err(|_| "Recording timer is unavailable".to_string())?
-        .as_ref()
-        .map(|instant| instant.elapsed().as_millis() as u64)
-        .unwrap_or(0);
     if elapsed_ms > MAX_MACRO_DURATION_MS {
         return Err("Recording reached the 24-hour safety limit".to_string());
     }
-    let mut clicks = state
-        .clicks
+
+    let mut clicks = clicks
         .lock()
         .map_err(|_| "Macro data is unavailable".to_string())?;
     // Recheck after acquiring the data lock. This prevents a late IPC call from
     // appending a click after stop_recording has taken its save snapshot.
-    if state.mode.load(Ordering::SeqCst) == MODE_RECORDING {
+    if mode.load(Ordering::SeqCst) == MODE_RECORDING {
         if clicks.len() >= MAX_MACRO_CLICKS {
             return Err(format!(
                 "Recording reached the {MAX_MACRO_CLICKS}-click safety limit"
@@ -2425,6 +2424,20 @@ fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), Stri
         });
     }
     Ok(())
+}
+
+fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), String> {
+    if state.mode.load(Ordering::SeqCst) != MODE_RECORDING {
+        return Ok(());
+    }
+    let elapsed_ms = state
+        .record_started
+        .lock()
+        .map_err(|_| "Recording timer is unavailable".to_string())?
+        .as_ref()
+        .map(|instant| instant.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    append_recorded_click(&state.mode, &state.clicks, x, y, elapsed_ms)
 }
 
 // An immutable copy of the completed recording and its elapsed duration.
@@ -4636,6 +4649,76 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
+    }
+
+    #[test]
+    fn recorded_clicks_are_ignored_outside_recording() {
+        for inactive_mode in [MODE_IDLE, MODE_PLAYING, MODE_STOPPING] {
+            let mode = AtomicU8::new(inactive_mode);
+            let clicks = Mutex::new(Vec::new());
+            append_recorded_click(&mode, &clicks, f64::NAN, f64::INFINITY, u64::MAX).unwrap();
+            assert!(clicks.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn recorded_clicks_clamp_coordinates_and_preserve_elapsed_time() {
+        let mode = AtomicU8::new(MODE_RECORDING);
+        let clicks = Mutex::new(Vec::new());
+
+        append_recorded_click(&mode, &clicks, -0.25, 1.25, 425).unwrap();
+
+        let clicks = clicks.lock().unwrap();
+        assert_eq!(clicks.len(), 1);
+        assert_eq!(clicks[0].x, 0.0);
+        assert_eq!(clicks[0].y, 1.0);
+        assert_eq!(clicks[0].elapsed_ms, 425);
+    }
+
+    #[test]
+    fn recorded_clicks_reject_non_finite_coordinates_without_mutation() {
+        for (x, y) in [(f64::NAN, 0.5), (0.5, f64::INFINITY), (f64::NEG_INFINITY, 0.5)] {
+            let mode = AtomicU8::new(MODE_RECORDING);
+            let clicks = Mutex::new(Vec::new());
+
+            let error = append_recorded_click(&mode, &clicks, x, y, 10).unwrap_err();
+
+            assert_eq!(error, "The game page sent invalid click coordinates");
+            assert!(clicks.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn recorded_clicks_enforce_duration_and_click_count_limits() {
+        let mode = AtomicU8::new(MODE_RECORDING);
+        let clicks = Mutex::new(Vec::new());
+
+        let duration_error = append_recorded_click(
+            &mode,
+            &clicks,
+            0.5,
+            0.5,
+            MAX_MACRO_DURATION_MS + 1,
+        )
+        .unwrap_err();
+        assert_eq!(duration_error, "Recording reached the 24-hour safety limit");
+        assert!(clicks.lock().unwrap().is_empty());
+
+        let full_clicks = (0..MAX_MACRO_CLICKS)
+            .map(|_| MacroClick {
+                x: 0.5,
+                y: 0.5,
+                elapsed_ms: 0,
+            })
+            .collect();
+        let full_clicks = Mutex::new(full_clicks);
+        let count_error =
+            append_recorded_click(&mode, &full_clicks, 0.5, 0.5, 10).unwrap_err();
+        assert_eq!(
+            count_error,
+            format!("Recording reached the {MAX_MACRO_CLICKS}-click safety limit")
+        );
+        assert_eq!(full_clicks.lock().unwrap().len(), MAX_MACRO_CLICKS);
     }
 
     #[test]

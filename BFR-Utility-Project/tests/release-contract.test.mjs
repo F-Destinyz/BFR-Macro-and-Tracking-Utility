@@ -743,3 +743,49 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
   assert.ok(trackerHtml.includes('historyRowsHtml(rewards,q,emptyMessage)'), 'Dashboard render must use the optimized row renderer');
   assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
 });
+
+
+test('macro capture accepts only trusted left clicks and normalizes viewport coordinates', async () => {
+  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
+  assert.ok(injectionMatch, 'Rust game-page injection script was not found');
+  const source = injectionMatch[1];
+  const start = source.indexOf('// Serialize IPC calls so rapid physical clicks cannot be stored out of order.');
+  const end = source.indexOf('        }, true);', start);
+  assert.ok(start >= 0 && end > start, 'Physical click capture handler was not found');
+  const captureSource = source.slice(start, end + '        }, true);'.length);
+
+  let pointerHandler;
+  const calls = [];
+  const context = {
+    window: { innerWidth: 1000, innerHeight: 800 },
+    document: {
+      addEventListener(name, handler) {
+        assert.equal(name, 'pointerdown');
+        pointerHandler = handler;
+      }
+    },
+    console: { error() {}, info() {} },
+    invoke(command, payload) {
+      calls.push({ command, payload });
+      return Promise.resolve();
+    }
+  };
+
+  vm.runInNewContext(captureSource, context);
+  assert.equal(typeof pointerHandler, 'function', 'Physical pointer handler must be registered');
+
+  pointerHandler({ isTrusted: false, button: 0, clientX: 500, clientY: 400 });
+  pointerHandler({ isTrusted: true, button: 2, clientX: 500, clientY: 400 });
+  assert.equal(calls.length, 0, 'Synthetic and non-left pointer events must be ignored');
+
+  pointerHandler({ isTrusted: true, button: 0, clientX: 250, clientY: 400 });
+  pointerHandler({ isTrusted: true, button: 0, clientX: -10, clientY: 810 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls.map((call) => call.command), ['record_click', 'record_click']);
+  assert.equal(
+    JSON.stringify(calls.map((call) => call.payload)),
+    JSON.stringify([{ x: 0.25, y: 0.5 }, { x: 0, y: 1 }]),
+    'Accepted clicks must be normalized to the viewport and clamped at its edges'
+  );
+});

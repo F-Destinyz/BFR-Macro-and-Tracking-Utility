@@ -740,6 +740,6 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
   const empty = historyRowsHtml(records, 'missing', 'No matching reward records.');
   assert.match(empty, /No matching reward records/);
   assert.match(empty, /colspan="9"/);
-  assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
+  assert.ok(trackerHtml.includes('historyRowsHtml(rewards,q,emptyMessage)'), 'Dashboard render must use the optimized row renderer');
   assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
 });

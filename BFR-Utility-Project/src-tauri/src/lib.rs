@@ -2953,9 +2953,13 @@ fn discover_cdp_target(port: u16) -> Result<String, String> {
     let endpoint = format!("http://127.0.0.1:{port}/json/list");
     let started = Instant::now();
     let mut last_error = String::from("WebView2 debugging endpoint is not ready yet");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(CDP_IO_TIMEOUT))
+        .build()
+        .into();
     while started.elapsed() < CDP_DISCOVERY_TIMEOUT {
-        match ureq::get(&endpoint).timeout(CDP_IO_TIMEOUT).call() {
-            Ok(response) => match response.into_string() {
+        match agent.get(&endpoint).call() {
+            Ok(mut response) => match response.body_mut().read_to_string() {
                 Ok(body) => match serde_json::from_str::<Vec<CdpTarget>>(&body) {
                     Ok(targets) => {
                         if let Some(target) = targets.into_iter().find(|target| {

@@ -29,9 +29,9 @@ jobs:
           echo "Fetching all repository branches and pull requests..."
           # Keep the paginated API responses in files; passing full PR JSON
           # through jq command-line arguments can exceed the OS argv limit.
-          gh api --paginate --slurp "repos/${REPO}/branches?per_page=100" > /tmp/branches.json
-          gh api --paginate --slurp "repos/${REPO}/pulls?state=closed&per_page=100" > /tmp/closed-prs.json
-          gh api --paginate --slurp "repos/${REPO}/pulls?state=open&per_page=100" > /tmp/open-prs.json
+          gh api "repos/${REPO}/branches?per_page=100" > /tmp/branches.json
+          gh api "repos/${REPO}/pulls?state=closed&per_page=100" > /tmp/closed-prs.json
+          gh api "repos/${REPO}/pulls?state=open&per_page=100" > /tmp/open-prs.json
 
           candidates="$(jq -cn \
             --slurpfile branches /tmp/branches.json \

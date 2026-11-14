@@ -1,11 +1,33 @@
 # Changelog
 
-## Unreleased — Run History and tray usability
+## Unreleased — post-v2.0.3 improvements
 
-- Add per-entry deletion to Run History while retaining the existing Clear All action.
+### Run History and data preservation
+- Load Run History incrementally, showing the newest 100 records first and fetching older records in bounded pages.
+- Bound oversized JSONL record handling and strengthen recovery for failed history clearing, migration, and atomic-save operations.
+- Add individual Run History entry deletion while retaining the confirmed Clear All action; preserve unrelated valid records and backup data during rewrites.
+- Add regression coverage for pagination, concurrent reads and clears, migration retries, torn JSONL records, and failure-path data preservation.
+
+### Security and tracker boundaries
+- Restrict game-page and dashboard Tauri permissions to their intended command sets; remove the dashboard's broad default permission bundle.
+- Add a restrictive local dashboard Content Security Policy and validate game-origin and loopback DevTools endpoints.
+- Validate and bound tracker reward and diagnostic inputs, and limit the observer to the supported reward endpoints and relevant dungeon-heading context.
+
+### Performance and macro reliability
+- Scope performance metrics to the application and its WebView2 process descendants rather than unrelated processes.
+- Avoid scheduling dungeon-heading capture for unrelated page-wide DOM mutations.
+- Reduce intermediate allocations when rendering Run History rows without changing row order, filtering, or formatting.
+- Expand macro regression coverage for trusted physical pointer capture, coordinate normalization and clamping, backend recording-state validation, click limits, file compatibility, and playback timing/cancellation.
+
+### Run History and tray usability
 - Make the Run History table's horizontal scroll region keyboard-accessible with a visible focus indicator.
 - Improve Run History header wrapping and keep pin feedback separate from history status messages.
+- Add per-entry deletion while retaining Clear All.
 - Rename the tray menu exit item to **Exit Application**.
+
+### Build and release preparation
+- Validate the Windows NSIS installer in CI alongside JavaScript tests, Rust tests, Clippy, and dependency vulnerability audits.
+- Read the Windows release helper's displayed application version from Tauri configuration instead of hardcoding it.
 
 ## 2.0.3 — Run History concurrency and runtime refresh
 

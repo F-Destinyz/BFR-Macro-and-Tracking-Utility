@@ -625,3 +625,60 @@ test('Run History dashboard provides keyboard focus and accessible table semanti
   assert.match(trackerHtml, /id="loadOlder" aria-controls="historyTable"/);
   assert.match(trackerHtml, /id="status" class="status" role="status" aria-live="polite"/);
 });
+
+
+test('dungeon heading observer ignores unrelated DOM mutations', () => {
+  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\\s\\S]*?)"#;/);
+  assert.ok(injectionMatch, 'Rust game-page injection script was not found');
+  const helperMatch = injectionMatch[1].match(/const mutationAffectsDungeonHeading = \(mutation\) => \{[\\s\\S]*?\n    \};/);
+  assert.ok(helperMatch, 'Dungeon heading mutation filter was not found');
+  const mutationAffectsDungeonHeading = vm.runInNewContext(
+    `(${helperMatch[0]})`,
+    {}
+  );
+
+  const ordinaryElement = {
+    nodeType: 1,
+    matches: () => false,
+    closest: () => null,
+    querySelector: () => null
+  };
+  const heading = {
+    nodeType: 1,
+    matches: (selector) => selector === 'h1',
+    closest: (selector) => selector === 'h1' ? heading : null,
+    querySelector: () => null
+  };
+  const headingChild = {
+    nodeType: 1,
+    matches: () => false,
+    closest: (selector) => selector === 'h1' ? heading : null,
+    querySelector: () => null
+  };
+  const insertedContainer = {
+    nodeType: 1,
+    matches: () => false,
+    closest: () => null,
+    querySelector: (selector) => selector === 'h1' ? heading : null
+  };
+
+  assert.equal(mutationAffectsDungeonHeading({
+    type: 'childList', target: ordinaryElement, addedNodes: [ordinaryElement], removedNodes: []
+  }), false, 'Unrelated page content must not schedule a heading capture');
+  assert.equal(mutationAffectsDungeonHeading({
+    type: 'childList', target: heading, addedNodes: [], removedNodes: []
+  }), true, 'Replacing the H1 contents must schedule a heading capture');
+  assert.equal(mutationAffectsDungeonHeading({
+    type: 'childList', target: headingChild, addedNodes: [], removedNodes: []
+  }), true, 'Changing content inside the H1 must schedule a heading capture');
+  assert.equal(mutationAffectsDungeonHeading({
+    type: 'childList', target: ordinaryElement, addedNodes: [insertedContainer], removedNodes: []
+  }), true, 'Inserting a subtree containing an H1 must schedule a heading capture');
+  assert.equal(mutationAffectsDungeonHeading({
+    type: 'childList', target: ordinaryElement, addedNodes: [], removedNodes: [heading]
+  }), true, 'Removing the H1 must schedule a heading capture');
+  assert.match(injectionMatch[1], /new MutationObserver\(\(mutations\) => \{\s*if \(!mutations\.some\(mutationAffectsDungeonHeading\)/,
+    'The observer must filter mutation records before scheduling the debounced capture');
+  assert.match(injectionMatch[1], /headingObserver\.observe\(document\.documentElement, \{ childList: true, subtree: true \}\)/,
+    'The existing child-list observer coverage must remain unchanged');
+});

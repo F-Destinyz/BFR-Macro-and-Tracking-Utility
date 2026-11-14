@@ -746,7 +746,7 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
 
 
 test('macro capture accepts only trusted left clicks and normalizes viewport coordinates', async () => {
-  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\\s\\S]*?)"#;/);
+  const injectionMatch = rust.match(/const INJECTION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
   assert.ok(injectionMatch, 'Rust game-page injection script was not found');
   const source = injectionMatch[1];
   const start = source.indexOf('// Serialize IPC calls so rapid physical clicks cannot be stored out of order.');

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — Run History and tray usability
+
+- Add per-entry deletion to Run History while retaining the existing Clear All action.
+- Make the Run History table's horizontal scroll region keyboard-accessible with a visible focus indicator.
+- Improve Run History header wrapping and keep pin feedback separate from history status messages.
+- Rename the tray menu exit item to **Exit Application**.
+
 ## 2.0.3 — Run History concurrency and runtime refresh
 
 - Serialize Run History page reads and clearing so overlapping operations cannot overwrite each other; disable conflicting refresh, pagination, and clear actions while a history operation is active.

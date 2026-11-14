@@ -62,12 +62,12 @@ The Run History window stores completed dungeon results and supports searching b
 | Runs | Number of completed runs represented |
 | Zel, Karma, Honor, EXP | Separate reward totals |
 
-Run History can be cleared from the dashboard after a confirmation prompt. Clearing history does not clear settings or saved macros.
+Individual Run History entries can be deleted from their row actions, or all history can be cleared from the dashboard after a confirmation prompt. Clearing history does not clear settings or saved macros.
 
 ### Background operation and system tray
 
 - The game and tracker continue running when the main window is minimized to the system tray.
-- The tray menu provides window controls, pinning, Run History, macro controls, folder shortcuts, and Exit.
+- The tray menu provides window controls, pinning, Run History, macro controls, folder shortcuts, and **Exit Application**.
 - Window size, pin state, and loop setting are persisted.
 - A single-instance guard prevents multiple application instances from sharing the same files.
 - While hidden, the app requests WebView2's low-memory target. This is a runtime hint, not a guarantee of a specific memory reduction.

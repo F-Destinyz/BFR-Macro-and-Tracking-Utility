@@ -1,7 +1,7 @@
 [[permission]]
 identifier = "allow-tracker-dashboard-controls"
-description = "Allows the local tracker dashboard to read, clear, and manage its saved reward history."
-commands.allow = ["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"]
+description = "Allows the local tracker dashboard to read, clear, and manage its saved reward history, including deleting an individual entry."
+commands.allow = ["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned"]
 
 [[permission]]
 identifier = "deny-tracker-dashboard-controls"

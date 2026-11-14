@@ -3750,7 +3750,7 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let exit = icon_item(
         app,
         "exit",
-        "Exit",
+        "Exit Application",
         include_bytes!("../icons/menu/exit.png"),
     )?;
 

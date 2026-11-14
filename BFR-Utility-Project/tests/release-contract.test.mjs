@@ -626,6 +626,16 @@ test('Run History dashboard provides keyboard focus and accessible table semanti
   assert.match(trackerHtml, /id="status" class="status" role="status" aria-live="polite"/);
 });
 
+test('Run History pin feedback is isolated and header controls can wrap', () => {
+  assert.match(trackerHtml, /id="pinStatus" class="pin-status" role="status" aria-live="polite"/);
+  assert.match(trackerHtml, /const pinStatus=document\.getElementById\('pinStatus'\)/);
+  assert.match(trackerHtml, /function showPinError\(message\)\{pinStatus\.className='pin-status error'/);
+  assert.match(trackerHtml, /pinStatus\.textContent=pinned\?'Window pinned\.'\:'Window unpinned\.'/);
+  assert.match(trackerHtml, /header\{display:flex;flex-wrap:wrap/);
+  assert.match(trackerHtml, /\.actions\{display:flex;flex-wrap:wrap/);
+  assert.doesNotMatch(trackerHtml, /const pinStatus=document\.getElementById\('status'\)/);
+});
+
 
 
 test('dungeon heading observer ignores unrelated DOM mutations', () => {

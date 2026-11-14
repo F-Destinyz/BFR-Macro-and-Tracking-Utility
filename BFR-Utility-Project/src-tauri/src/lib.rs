@@ -621,22 +621,22 @@ const INJECTION_SCRIPT: &str = r#"
     };
     captureDungeonHeadings();
     if (!window.__bfrDungeonHeadingObserver && typeof MutationObserver !== 'undefined') {
-    // Ignore page-wide DOM churn unless a mutation touches an H1 or inserts/removes a subtree containing one.
-    // This keeps unrelated game UI updates from scheduling repeated heading lookups.
-    const mutationAffectsDungeonHeading = (mutation) => {
-      const target = mutation?.target;
-      if (target?.nodeType === 1 && (target.matches?.('h1') || target.closest?.('h1'))) return true;
-      if (target?.nodeType === 3 && target.parentElement?.closest?.('h1')) return true;
-      const containsHeading = (node) => node?.nodeType === 1
-        && (node.matches?.('h1') || Boolean(node.querySelector?.('h1')));
-      for (const node of mutation?.addedNodes || []) {
-        if (containsHeading(node)) return true;
-      }
-      for (const node of mutation?.removedNodes || []) {
-        if (containsHeading(node)) return true;
-      }
-      return false;
-    };
+      // Ignore page-wide DOM churn unless a mutation touches an H1 or inserts/removes a subtree containing one.
+      // This keeps unrelated game UI updates from scheduling repeated heading lookups.
+      const mutationAffectsDungeonHeading = (mutation) => {
+        const target = mutation?.target;
+        if (target?.nodeType === 1 && (target.matches?.('h1') || target.closest?.('h1'))) return true;
+        if (target?.nodeType === 3 && target.parentElement?.closest?.('h1')) return true;
+        const containsHeading = (node) => node?.nodeType === 1
+          && (node.matches?.('h1') || Boolean(node.querySelector?.('h1')));
+        for (const node of mutation?.addedNodes || []) {
+          if (containsHeading(node)) return true;
+        }
+        for (const node of mutation?.removedNodes || []) {
+          if (containsHeading(node)) return true;
+        }
+        return false;
+      };
       let headingCaptureScheduled = false;
       const headingObserver = new MutationObserver((mutations) => {
         if (!mutations.some(mutationAffectsDungeonHeading) || headingCaptureScheduled) return;

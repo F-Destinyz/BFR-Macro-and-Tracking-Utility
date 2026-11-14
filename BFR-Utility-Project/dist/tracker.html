@@ -16,7 +16,7 @@ header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-betw
 </style></head>
 <body><div class="shell">
 <header><div class="brand"><div class="crest">✧</div><div><h1>BFR RUN HISTORY</h1><div class="subtitle">DUNGEON REWARDS & COMPLETIONS</div></div></div><div class="actions"><button id="pin" title="Checking pin state…" disabled aria-label="Checking pin state">♧ Pin</button><button id="refresh" title="Refresh latest records">↻ Refresh</button><button id="clearHistory" title="Permanently clear all saved Run History records">✕ Clear All</button><span id="pinStatus" class="pin-status" role="status" aria-live="polite"></span></div></header>
-<main><section class="history-panel"><div class="history-head"><h2>Completed Runs</h2><input id="historySearch" placeholder="Search dungeon or run type…" aria-label="Search run history"></div><div class="table-wrap"><table aria-label="Completed dungeon rewards"><thead><tr><th scope="col">Completed</th><th scope="col">Time Taken</th><th scope="col">Dungeon</th><th scope="col">Type</th><th scope="col">Runs</th><th scope="col">Zel</th><th scope="col">Karma</th><th scope="col">Honor</th><th scope="col">EXP</th><th scope="col">Actions</th></tr></thead><tbody id="historyTable"><tr><td colspan="9" class="empty">Loading run history…</td></tr></tbody></table></div><div class="history-pagination"><button id="loadOlder" aria-controls="historyTable" disabled>Load older records</button></div></section><div id="status" class="status" role="status" aria-live="polite">Loading saved records…</div></main>
+<main><section class="history-panel"><div class="history-head"><h2>Completed Runs</h2><input id="historySearch" placeholder="Search dungeon or run type…" aria-label="Search run history"></div><div class="table-wrap"><table aria-label="Completed dungeon rewards"><thead><tr><th scope="col">Completed</th><th scope="col">Time Taken</th><th scope="col">Dungeon</th><th scope="col">Type</th><th scope="col">Runs</th><th scope="col">Zel</th><th scope="col">Karma</th><th scope="col">Honor</th><th scope="col">EXP</th><th scope="col">Actions</th></tr></thead><tbody id="historyTable"><tr><td colspan="10" class="empty">Loading run history…</td></tr></tbody></table></div><div class="history-pagination"><button id="loadOlder" aria-controls="historyTable" disabled>Load older records</button></div></section><div id="status" class="status" role="status" aria-live="polite">Loading saved records…</div></main>
 </div>
 <script>
 const fmt=n=>Number(n||0).toLocaleString();
@@ -84,8 +84,8 @@ document.getElementById('historyTable').addEventListener('click',async event=>{
  if(!record)return;
  const isBatch=Boolean(record.batch_id);
  const prompt=isBatch
-  ?\`Delete this repeat-battle entry (\${fmt(record.values.runs)} runs)? All saved snapshots for this repeat batch will be removed.\`
-  :\`Delete "\${record.display_name}" from Run History? This cannot be undone.\`;
+  ?`Delete this repeat-battle entry (${fmt(record.values.runs)} runs)? All saved snapshots for this repeat batch will be removed.`
+  :`Delete "${record.display_name}" from Run History? This cannot be undone.`;
  if(!window.confirm(prompt))return;
  historyMutationInProgress=true;
  rowButton.disabled=true;
@@ -118,7 +118,7 @@ document.getElementById('historyTable').addEventListener('click',async event=>{
   status.className='status';
   status.textContent=isBatch?'Repeat-battle entry deleted.':'Run History entry deleted.';
  }catch(error){
-  deleteError=\`Could not delete Run History entry: \${String(error)}\`;
+  deleteError=`Could not delete Run History entry: ${String(error)}`;
  }finally{
   historyMutationInProgress=false;
   clearHistoryButton.disabled=false;refreshButton.disabled=false;loadOlderButton.disabled=!hasMore;

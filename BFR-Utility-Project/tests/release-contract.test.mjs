@@ -783,9 +783,9 @@ test('macro capture accepts only trusted left clicks and normalizes viewport coo
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(calls.map((call) => call.command), ['record_click', 'record_click']);
-  assert.deepEqual(
-    calls.map((call) => call.payload),
-    [{ x: 0.25, y: 0.5 }, { x: 0, y: 1 }],
+  assert.equal(
+    JSON.stringify(calls.map((call) => call.payload)),
+    JSON.stringify([{ x: 0.25, y: 0.5 }, { x: 0, y: 1 }]),
     'Accepted clicks must be normalized to the viewport and clamped at its edges'
   );
 });

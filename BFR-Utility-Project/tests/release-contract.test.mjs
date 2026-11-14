@@ -658,8 +658,8 @@ test('Run History entries expose an accessible individual delete action', () => 
   assert.match(rust, /tracker_delete_history_entry,/);
 });
 
-test('tray menu exit item is labeled simply Exit', () => {
-  assert.match(rust, /"exit",\s*"Exit",/);
+test('tray menu exit item is labeled Exit Application', () => {
+  assert.match(rust, /"exit",\s*"Exit Application",/);
   assert.doesNotMatch(rust, /"Exit BFR Macro & Tracking Utility"/);
 });
 

@@ -6,9 +6,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - ci
 
   - package-ecosystem: npm
     directory: /BFR-Utility-Project
@@ -16,8 +13,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    labels:
-      - dependencies
     groups:
       npm-minor-and-patch:
         update-types:
@@ -30,8 +25,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    labels:
-      - dependencies
     groups:
       rust-minor-and-patch:
         update-types:

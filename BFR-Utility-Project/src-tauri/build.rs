@@ -9,6 +9,7 @@ fn main() {
             "tracker_reward_event",
             "tracker_read_data_page",
             "tracker_clear_history",
+            "tracker_delete_history_entry",
             "tracker_get_pinned",
             "tracker_set_pinned",
         ]));

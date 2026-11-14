@@ -388,7 +388,7 @@ test('Tauri app command manifest matches every registered IPC command and dashbo
   const declared = [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]).sort();
   assert.deepEqual(declared, registered, 'Every registered command must be included in AppManifest');
   const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
-  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_get_pinned", "tracker_set_pinned"\]/);
+  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned"\]/);
   assert.match(dashboard, /commands\.deny = \["tracker_read_data_page"\]/);
   assert.doesNotMatch(dashboard, /\btracker_read_data\b/);
 });
@@ -452,7 +452,7 @@ test('macro playback follows the original absolute click timeline', () => {
 });
 
 test('disk-heavy tracker IPC commands run away from the UI thread', () => {
-  for (const name of ['tracker_diagnostic_event', 'tracker_dungeon_context', 'tracker_reward_event', 'tracker_read_data_page', 'tracker_clear_history']) {
+  for (const name of ['tracker_diagnostic_event', 'tracker_dungeon_context', 'tracker_reward_event', 'tracker_read_data_page', 'tracker_clear_history', 'tracker_delete_history_entry']) {
     assert.match(rust, new RegExp(`#\\[tauri::command\\(async\\)\\]\\s*fn ${name}`));
   }
   assert.match(rust, /tracker_dedupe_keys: Mutex<HashSet<String>>/);
@@ -615,18 +615,53 @@ test('Run History pin control is accessible and waits for its initial state', ()
   assert.match(trackerHtml, /pinButton\.disabled=false/);
   assert.match(trackerHtml, /if\(!pinStateReady\|\|pinButton\.disabled\)return/);
   assert.match(trackerHtml, /finally\{pinButton\.disabled=!pinStateReady\}/);
-  assert.match(trackerHtml, /pinStatus\.className='status error'/);
+  assert.match(trackerHtml, /pinStatus\.className='pin-status error'/);
 });
 
 test('Run History dashboard provides keyboard focus and accessible table semantics', () => {
   assert.match(trackerHtml, /button:focus-visible,input:focus-visible/);
   assert.match(trackerHtml, /<table aria-label="Completed dungeon rewards">/);
-  assert.equal((trackerHtml.match(/<th scope="col">/g) || []).length, 9);
+  assert.equal((trackerHtml.match(/<th scope="col">/g) || []).length, 10);
   assert.match(trackerHtml, /id="loadOlder" aria-controls="historyTable"/);
   assert.match(trackerHtml, /id="status" class="status" role="status" aria-live="polite"/);
 });
 
+test('Run History pin feedback is isolated and header controls can wrap', () => {
+  assert.match(trackerHtml, /id="pinStatus" class="pin-status" role="status" aria-live="polite"/);
+  assert.match(trackerHtml, /const pinStatus=document\.getElementById\('pinStatus'\)/);
+  assert.match(trackerHtml, /function showPinError\(message\)\{pinStatus\.className='pin-status error'/);
+  assert.match(trackerHtml, /pinStatus\.textContent=pinned\?'Window pinned\.'\:'Window unpinned\.'/);
+  assert.match(trackerHtml, /header\{display:flex;flex-wrap:wrap/);
+  assert.match(trackerHtml, /\.actions\{display:flex;flex-wrap:wrap/);
+  assert.doesNotMatch(trackerHtml, /const pinStatus=document\.getElementById\('status'\)/);
+});
 
+
+
+
+test('Run History header orders Pin, Refresh, then Clear All', () => {
+  const actions = trackerHtml.match(/<div class="actions">([\s\S]*?)<\/div>/)?.[1] || '';
+  const order = [...actions.matchAll(/id="(pin|refresh|clearHistory)"/g)].map((match) => match[1]);
+  assert.deepEqual(order, ['pin', 'refresh', 'clearHistory']);
+  assert.match(actions, /id="clearHistory"[^>]*>✕ Clear All<\/button>/);
+});
+
+test('Run History entries expose an accessible individual delete action', () => {
+  assert.match(trackerHtml, /<th scope="col">Actions<\/th>/);
+  assert.match(trackerHtml, /class="delete-entry" type="button" data-delete-index="\$\{i\}"/);
+  assert.match(trackerHtml, /aria-label="Delete \$\{esc\(r\.display_name\)\} from Run History"/);
+  assert.match(trackerHtml, /title="Delete this entry">🗑<\/button>/);
+  assert.match(trackerHtml, /historyTable'\)\.addEventListener\('click',async event=>/);
+  assert.match(trackerHtml, /invoke\('tracker_delete_history_entry'/);
+  assert.match(trackerHtml, /window\.confirm\(prompt\)/);
+  assert.match(trackerHtml, /All saved snapshots for this repeat batch will be removed/);
+  assert.match(rust, /tracker_delete_history_entry,/);
+});
+
+test('tray menu exit item is labeled Exit Application', () => {
+  assert.match(rust, /"exit",\s*"Exit Application",/);
+  assert.doesNotMatch(rust, /"Exit BFR Macro & Tracking Utility"/);
+});
 
 test('dungeon heading observer ignores unrelated DOM mutations', () => {
   const injectionStart = rust.indexOf('const INJECTION_SCRIPT: &str = r#"');
@@ -729,6 +764,8 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
   assert.ok(allRows.indexOf('Third &amp; Final') < allRows.indexOf('Second Dungeon'));
   assert.ok(allRows.indexOf('Second Dungeon') < allRows.indexOf('First Dungeon'));
   assert.equal((allRows.match(/<tr>/g) || []).length, 3);
+  assert.equal((allRows.match(/class="delete-entry"/g) || []).length, 3);
+  assert.match(allRows, /data-delete-index="2"/);
   assert.match(allRows, /&lt;Third &amp; Final&gt;/);
   assert.match(allRows, /time-3/);
 
@@ -739,7 +776,7 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
 
   const empty = historyRowsHtml(records, 'missing', 'No matching reward records.');
   assert.match(empty, /No matching reward records/);
-  assert.match(empty, /colspan="9"/);
+  assert.match(empty, /colspan="10"/);
   assert.ok(trackerHtml.includes('historyRowsHtml(rewards,q,emptyMessage)'), 'Dashboard render must use the optimized row renderer');
   assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
 });

@@ -1624,6 +1624,73 @@ impl MacroState {
         Ok(page)
     }
 
+    fn tracker_delete_history_entry(
+        &self,
+        timestamp_unix_ms: u64,
+        batch_id: Option<String>,
+        path: String,
+        dungeon_route: String,
+    ) -> Result<usize, String> {
+        if path != "/api/battles/finish" && path != "/api/battles/repeat" {
+            return Err("Invalid Run History entry path".to_string());
+        }
+        if dungeon_route.len() > 200 {
+            return Err("Invalid Run History dungeon route".to_string());
+        }
+        if batch_id.as_ref().is_some_and(|value| value.len() > 120) {
+            return Err("Invalid Run History batch identifier".to_string());
+        }
+        let batch_id = batch_id.filter(|value| !value.is_empty());
+        if batch_id.is_none() && timestamp_unix_ms == 0 {
+            return Err("Invalid Run History entry timestamp".to_string());
+        }
+
+        let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
+            "Tracker history is unavailable because its lock was poisoned".to_string()
+        })?;
+        let backup_file = self.tracker_sessions_file.with_extension("jsonl.1");
+        let sources = [&backup_file, &self.tracker_sessions_file];
+        let matches = |record: &Value| {
+            history_record_matches_delete_target(
+                record,
+                timestamp_unix_ms,
+                batch_id.as_deref(),
+                &path,
+                &dungeon_route,
+            )
+        };
+
+        let mut removed_dedupe_keys = HashSet::new();
+        for source in sources {
+            scan_jsonl_records(source, |record| {
+                if matches(&record) {
+                    if let Some(key) = record.get("dedupe_key").and_then(Value::as_str) {
+                        removed_dedupe_keys.insert(key.to_string());
+                    }
+                }
+            })?;
+        }
+
+        let mut removed = 0usize;
+        for source in sources {
+            removed = removed.saturating_add(rewrite_jsonl_without_matching_records(
+                source,
+                |record| matches(record),
+            )?);
+        }
+        if removed == 0 {
+            return Err("That Run History entry no longer exists. Refresh the list and try again.".to_string());
+        }
+
+        if let Ok(mut keys) = self.tracker_dedupe_keys.lock() {
+            for key in removed_dedupe_keys {
+                keys.remove(&key);
+            }
+        }
+        self.log(&format!("Run History entry deleted ({removed} stored record(s))."));
+        Ok(removed)
+    }
+
     fn tracker_clear_history(&self) -> Result<(), String> {
         let _history_guard = self.tracker_data_lock.lock().map_err(|_| {
             "Tracker history is unavailable because its lock was poisoned".to_string()
@@ -1870,6 +1937,150 @@ fn read_jsonl_page(
         },
         malformed_lines,
     ))
+}
+
+fn history_record_matches_delete_target(
+    record: &Value,
+    timestamp_unix_ms: u64,
+    batch_id: Option<&str>,
+    path: &str,
+    dungeon_route: &str,
+) -> bool {
+    if record.get("record_type").and_then(Value::as_str) != Some("battle_reward")
+        || record.get("path").and_then(Value::as_str) != Some(path)
+        || record.get("dungeon_route").and_then(Value::as_str) != Some(dungeon_route)
+    {
+        return false;
+    }
+
+    if let Some(batch_id) = batch_id.filter(|value| !value.is_empty()) {
+        record.get("batch_id").and_then(Value::as_str) == Some(batch_id)
+    } else {
+        record.get("timestamp_unix_ms").and_then(Value::as_u64) == Some(timestamp_unix_ms)
+    }
+}
+
+// Refuse to rewrite a file containing an oversized line. The bounded reader
+// intentionally discards the tail of such a line, so rewriting it would risk
+// destroying bytes that the history reader cannot safely parse.
+fn ensure_jsonl_lines_within_limit(path: &Path) -> Result<(), String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Could not open tracker data file: {error}")),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    while let Some(within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
+        .map_err(|error| format!("Could not inspect tracker data: {error}"))?
+    {
+        if !within_limit {
+            return Err("Cannot safely delete this entry because the Run History file contains an oversized record. No records were changed.".to_string());
+        }
+    }
+    Ok(())
+}
+
+// Rewrite one JSONL source through a sibling temporary file. Valid unrelated
+// records, malformed lines, blank lines, and original line endings are retained.
+fn rewrite_jsonl_without_matching_records<F>(
+    path: &Path,
+    mut should_remove: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&Value) -> bool,
+{
+    if !path.exists() {
+        return Ok(0);
+    }
+    ensure_jsonl_lines_within_limit(path)?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Tracker data file has no parent directory".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.jsonl");
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let mut temporary = None;
+    for _ in 0..10 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.delete.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not prepare Run History update: {error}")),
+        }
+    }
+    let (temporary_path, output_file) = temporary
+        .ok_or_else(|| "Could not create a temporary Run History file".to_string())?;
+
+    let result = (|| -> Result<usize, String> {
+        let input_file = fs::File::open(path)
+            .map_err(|error| format!("Could not read Run History before deletion: {error}"))?;
+        let mut reader = std::io::BufReader::new(input_file);
+        let mut writer = std::io::BufWriter::new(output_file);
+        let mut line = Vec::new();
+        let mut removed = 0usize;
+
+        while let Some(within_limit) = read_bounded_jsonl_line(&mut reader, &mut line)
+            .map_err(|error| format!("Could not read Run History during deletion: {error}"))?
+        {
+            if !within_limit {
+                return Err("Run History changed while an entry was being deleted. No further records were changed.".to_string());
+            }
+            let mut json_length = line.len();
+            if json_length > 0 && line[json_length - 1] == b'\n' {
+                json_length -= 1;
+            }
+            if json_length > 0 && line[json_length - 1] == b'\r' {
+                json_length -= 1;
+            }
+            let matches = serde_json::from_slice::<Value>(&line[..json_length])
+                .ok()
+                .is_some_and(|record| should_remove(&record));
+            if matches {
+                removed = removed.saturating_add(1);
+            } else {
+                writer
+                    .write_all(&line)
+                    .map_err(|error| format!("Could not write updated Run History: {error}"))?;
+            }
+        }
+
+        writer
+            .flush()
+            .map_err(|error| format!("Could not finish updated Run History: {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("Could not sync updated Run History: {error}"))?;
+        drop(writer);
+
+        if removed == 0 {
+            fs::remove_file(&temporary_path).map_err(|error| error.to_string())?;
+            return Ok(0);
+        }
+        replace_file(&temporary_path, path)?;
+        Ok(removed)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn ensure_history_dedupe_keys_loaded(
@@ -2355,6 +2566,17 @@ fn tracker_read_data_page(offset: usize, anchor_total: usize, limit: usize, stat
 #[tauri::command(async)]
 fn tracker_clear_history(state: State<'_, MacroState>) -> Result<(), String> {
     state.tracker_clear_history()
+}
+
+#[tauri::command(async)]
+fn tracker_delete_history_entry(
+    timestamp_unix_ms: u64,
+    batch_id: Option<String>,
+    path: String,
+    dungeon_route: String,
+    state: State<'_, MacroState>,
+) -> Result<usize, String> {
+    state.tracker_delete_history_entry(timestamp_unix_ms, batch_id, path, dungeon_route)
 }
 
 #[tauri::command]
@@ -3521,7 +3743,7 @@ fn build_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let exit = icon_item(
         app,
         "exit",
-        "Exit BFR Macro & Tracking Utility",
+        "Exit",
         include_bytes!("../icons/menu/exit.png"),
     )?;
 
@@ -3814,6 +4036,7 @@ pub fn run() {
             tracker_reward_event,
             tracker_read_data_page,
             tracker_clear_history,
+            tracker_delete_history_entry,
             tracker_get_pinned,
             tracker_set_pinned,
             record_click,

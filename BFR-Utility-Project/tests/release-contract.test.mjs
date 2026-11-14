@@ -834,7 +834,7 @@ test('macro capture accepts only trusted left clicks and normalizes viewport coo
 
 test('Windows release helper reads its displayed version from Tauri configuration', () => {
   const releaseHelper = read('BUILD_WINDOWS_RELEASE.ps1');
-  assert.match(releaseHelper, /Get-Content -Raw -Path 'src-tauri\\\\tauri\\\\.conf\\\\json'/);
+  assert.ok(releaseHelper.includes("Get-Content -Raw -Path 'src-tauri\\tauri.conf.json'"));
   assert.match(releaseHelper, /\\$appVersion = \\[string\\]\\$tauriConfig\\.version/);
   assert.match(releaseHelper, /Building the BFR Macro & Tracking Utility \\$appVersion Windows installer/);
   assert.match(releaseHelper, /BFR Macro & Tracking Utility \\$appVersion installer/);

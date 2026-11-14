@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — post-v2.0.3 improvements
+## 2.0.4 — Post-v2.0.3 reliability, security, and usability improvements
 
 ### Run History and data preservation
 - Load Run History incrementally, showing the newest 100 records first and fetching older records in bounded pages.

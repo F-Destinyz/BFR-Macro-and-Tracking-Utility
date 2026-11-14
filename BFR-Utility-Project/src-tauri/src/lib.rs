@@ -2064,6 +2064,7 @@ where
                     .map_err(|error| format!("Could not write updated Run History: {error}"))?;
             }
         }
+        drop(reader);
 
         writer
             .flush()

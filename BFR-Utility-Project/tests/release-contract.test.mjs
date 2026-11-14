@@ -701,7 +701,7 @@ test('dungeon heading observer ignores unrelated DOM mutations', () => {
 
 test('Run History rendering preserves newest-first order, filtering, and escaping', () => {
   const helperStart = trackerHtml.indexOf('function historyRowsHtml(');
-  const helperEnd = trackerHtml.indexOf('\\n}', helperStart);
+  const helperEnd = trackerHtml.indexOf('\n}', helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, 'Run History row renderer was not found');
   const helperSource = trackerHtml.slice(helperStart, helperEnd + 2);
   const context = {

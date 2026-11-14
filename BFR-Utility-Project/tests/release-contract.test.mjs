@@ -399,6 +399,7 @@ test('reward API sample capture is narrowly scoped, sanitized and separate from 
   assert.match(gameBridge, /"tracker_reward_sample_event"/);
   assert.match(dashboard, /"tracker_open_reward_samples_folder"/);
   assert.match(rust, /fn tracker_reward_sample_event\(/);
+  assert.match(rust, /host != "rebornbf\.com"/);
   assert.match(rust, /sanitize_reward_sample_value/);
   assert.match(rust, /MAX_REWARD_SAMPLE_COUNT: usize = 40/);
   assert.match(rust, /MAX_REWARD_SAMPLE_FILE_BYTES: usize = 4 \* 1024 \* 1024/);

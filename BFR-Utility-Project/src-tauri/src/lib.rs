@@ -1394,16 +1394,16 @@ impl MacroState {
         let encoded_record = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
         if encoded_record.len() > MAX_REWARD_SAMPLE_BYTES { return Err("Reward response sample exceeded the 512 KB safety limit and was not saved".to_string()); }
         let _guard = self.tracker_data_lock.lock().map_err(|_| "Reward sample storage is unavailable because its lock was poisoned".to_string())?;
-        let mut samples: Vec<Value> = if self.tracker_reward_samples_file.exists() {
+        let mut samples: VecDeque<Value> = if self.tracker_reward_samples_file.exists() {
             let bytes = fs::read(&self.tracker_reward_samples_file).map_err(|error| format!("Could not read existing reward samples: {error}"))?;
             if bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES { return Err("Existing reward sample file exceeds its safety limit; it was left unchanged".to_string()); }
             serde_json::from_slice(&bytes).map_err(|error| format!("Existing reward sample file is invalid and was left unchanged: {error}"))?
         } else { Vec::new() };
         samples.push(record);
-        if samples.len() > MAX_REWARD_SAMPLE_COUNT { let excess = samples.len() - MAX_REWARD_SAMPLE_COUNT; samples.drain(0..excess); }
+        while samples.len() > MAX_REWARD_SAMPLE_COUNT { samples.pop_front(); }
         let mut bytes = serde_json::to_vec_pretty(&samples).map_err(|error| error.to_string())?;
         while bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES && samples.len() > 1 {
-            samples.remove(0);
+            samples.pop_front();
             bytes = serde_json::to_vec_pretty(&samples).map_err(|error| error.to_string())?;
         }
         if bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES { return Err("Reward sample export exceeded its 4 MB safety limit and was not saved".to_string()); }

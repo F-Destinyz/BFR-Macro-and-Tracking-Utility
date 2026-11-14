@@ -27,20 +27,22 @@ jobs:
           set -euo pipefail
 
           echo "Fetching all repository branches and pull requests..."
-          branches="$(gh api --paginate --slurp "repos/${REPO}/branches?per_page=100" | jq -c 'add')"
-          closed_prs="$(gh api --paginate --slurp "repos/${REPO}/pulls?state=closed&per_page=100" | jq -c 'add')"
-          open_prs="$(gh api --paginate --slurp "repos/${REPO}/pulls?state=open&per_page=100" | jq -c 'add')"
+          # Keep the paginated API responses in files; passing full PR JSON
+          # through jq command-line arguments can exceed the OS argv limit.
+          gh api --paginate --slurp "repos/${REPO}/branches?per_page=100" > /tmp/branches.json
+          gh api --paginate --slurp "repos/${REPO}/pulls?state=closed&per_page=100" > /tmp/closed-prs.json
+          gh api --paginate --slurp "repos/${REPO}/pulls?state=open&per_page=100" > /tmp/open-prs.json
 
           candidates="$(jq -cn \
-            --argjson branches "$branches" \
-            --argjson closed "$closed_prs" \
-            --argjson open "$open_prs" '
+            --slurpfile branches /tmp/branches.json \
+            --slurpfile closed /tmp/closed-prs.json \
+            --slurpfile open /tmp/open-prs.json '
             [
-              $branches[] as $b
+              $branches[0][] as $b
               | select($b.name != "main")
               | select(($b.name | test("^(dependabot/|audit/|maintenance/|experimental/)"; "i")) | not)
-              | select(all($open[]; .head.ref != $b.name))
-              | select(any($closed[];
+              | select(all($open[0][]; .head.ref != $b.name))
+              | select(any($closed[0][];
                   .merged_at != null
                   and .base.ref == "main"
                   and .head.ref == $b.name

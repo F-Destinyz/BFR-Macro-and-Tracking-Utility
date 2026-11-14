@@ -615,7 +615,7 @@ test('Run History pin control is accessible and waits for its initial state', ()
   assert.match(trackerHtml, /pinButton\.disabled=false/);
   assert.match(trackerHtml, /if\(!pinStateReady\|\|pinButton\.disabled\)return/);
   assert.match(trackerHtml, /finally\{pinButton\.disabled=!pinStateReady\}/);
-  assert.match(trackerHtml, /pinStatus\.className='status error'/);
+  assert.match(trackerHtml, /pinStatus\.className='pin-status error'/);
 });
 
 test('Run History dashboard provides keyboard focus and accessible table semantics', () => {

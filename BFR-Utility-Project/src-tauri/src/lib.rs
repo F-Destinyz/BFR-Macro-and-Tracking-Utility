@@ -1953,7 +1953,7 @@ fn history_record_matches_delete_target(
 ) -> bool {
     if record.get("record_type").and_then(Value::as_str) != Some("battle_reward")
         || record.get("path").and_then(Value::as_str) != Some(path)
-        || record.get("dungeon_route").and_then(Value::as_str) != Some(dungeon_route)
+        || record.get("dungeon_route").and_then(Value::as_str).unwrap_or("") != dungeon_route
     {
         return false;
     }
@@ -4543,7 +4543,7 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(
             fs::read(&active).unwrap(),
-            format!("not-json\n{}\n", other).as_bytes()
+            format!("not-json\n{}\n", other).into_bytes()
         );
         let keys = state.tracker_dedupe_keys.lock().unwrap();
         assert!(!keys.contains("finish:/start/100501/begin:10"));

@@ -226,6 +226,13 @@ const INJECTION_SCRIPT: &str = r#"
         });
       return diagnosticQueue;
     };
+    const reportRewardSample = (endpoint, status, payload) => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== 'function') return;
+      invoke('tracker_reward_sample_event', { endpoint, status: Number(status), payload }).catch((error) => {
+        console.error('[BFR Tracker] Could not save reward API sample:', String(error));
+      });
+    };
 
     report('observer_started', {
       page_host: window.location.hostname,
@@ -673,6 +680,7 @@ const INJECTION_SCRIPT: &str = r#"
               const contentType = response.headers.get('content-type') || '';
               if (contentType.toLowerCase().includes('json')) {
                 response.clone().json().then((payload) => {
+                  reportRewardSample(parsed.pathname, response.status, payload);
                   if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, requestMethod, response.status, contentType, payload);
                   else inspectBattleFinishResponse(parsed.href, requestMethod, response.status, contentType, payload);
                 }).catch(() => {});
@@ -708,6 +716,7 @@ const INJECTION_SCRIPT: &str = r#"
             if (!contentType.toLowerCase().includes('json')) return;
             let payload = this.responseType === 'json' ? this.response : this.responseText;
             if (typeof payload === 'string') payload = JSON.parse(payload);
+            reportRewardSample(parsed.pathname, this.status, payload);
             if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
             else inspectBattleFinishResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
           } catch (_) {}

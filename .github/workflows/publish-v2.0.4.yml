@@ -1,0 +1,95 @@
+name: Publish v2.0.4
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-v2.0.4.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v2.0.4
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build and publish Windows v2.0.4 release
+    runs-on: windows-latest
+    steps:
+      - name: Check out validated release source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: BFR-Utility-Project/package-lock.json
+
+      - name: Install JavaScript dependencies
+        working-directory: BFR-Utility-Project
+        run: npm ci
+
+      - name: Run JavaScript release-contract tests
+        working-directory: BFR-Utility-Project
+        run: npm test
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Rust tests
+        working-directory: BFR-Utility-Project
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Clippy
+        working-directory: BFR-Utility-Project
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build Windows NSIS installer
+        working-directory: BFR-Utility-Project
+        run: |
+          npm run build:windows
+          $installer = Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Filter '*setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Expected NSIS installer was not produced.' }
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLower()
+          Set-Content -Path "$env:GITHUB_WORKSPACE/SHA256SUMS.txt" -Value "$hash  $($installer.Name)"
+          "INSTALLER_PATH=$($installer.FullName)" >> $env:GITHUB_ENV
+          "INSTALLER_NAME=$($installer.Name)" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub release and attach installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v2.0.4 --repo ${{ github.repository }} 2>$null
+          if ($LASTEXITCODE -eq 0) { throw 'Release v2.0.4 already exists; refusing to overwrite it.' }
+          $notes = @'
+          ## BFR Macro & Tracking Utility v2.0.4
+
+          This release focuses on Run History reliability, safer data preservation, security boundaries, and macro regression coverage.
+
+          ### Run History and data preservation
+          - Load Run History incrementally, showing the newest 100 records first and fetching older records in bounded pages.
+          - Bound oversized JSONL record handling and strengthen recovery for failed history clearing, migration, and atomic-save operations.
+          - Add individual Run History entry deletion while retaining the confirmed Clear All action; preserve unrelated valid records and backup data during rewrites.
+          - Add regression coverage for pagination, concurrent reads and clears, migration retries, torn JSONL records, and failure-path data preservation.
+
+          ### Security and tracker boundaries
+          - Restrict game-page and dashboard Tauri permissions to their intended command sets; remove the dashboard's broad default permission bundle.
+          - Add a restrictive local dashboard Content Security Policy and validate game-origin and loopback DevTools endpoints.
+          - Validate and bound tracker reward and diagnostic inputs, and limit the observer to supported reward endpoints and relevant dungeon-heading context.
+
+          ### Macro, usability, and build
+          - Expand macro regression coverage for pointer capture, coordinate validation, click limits, file compatibility, playback timing, and cancellation.
+          - Improve Run History keyboard accessibility and tray menu wording.
+          - Validate the Windows installer in CI alongside JavaScript tests, Rust tests, Clippy, and dependency audits.
+          
+          ### Upgrade
+          Install over your existing installation. Do not uninstall first or delete application data. Existing Settings, Macros, Run History, Logs, and WebView2 profile data are retained.
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP/release-notes.md" -Value $notes
+          gh release create v2.0.4 "$env:INSTALLER_PATH" "$env:GITHUB_WORKSPACE/SHA256SUMS.txt" --repo ${{ github.repository }} --title "BFR Macro & Tracking Utility v2.0.4" --notes-file "$env:RUNNER_TEMP/release-notes.md"

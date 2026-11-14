@@ -638,10 +638,10 @@ test('dungeon heading observer ignores unrelated DOM mutations', () => {
     injectionEnd
   );
   const helperStart = injection.indexOf('const mutationAffectsDungeonHeading = (mutation) => {');
-  const helperEnd = injection.indexOf('\n    };', helperStart);
+  const helperEnd = injection.indexOf('\n      };', helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart,
     'Dungeon heading mutation filter was not found');
-  const helperSource = injection.slice(helperStart, helperEnd + '\n    };'.length);
+  const helperSource = injection.slice(helperStart, helperEnd + '\n      };'.length);
   const mutationAffectsDungeonHeading = vm.runInNewContext(
     `(() => { ${helperSource}; return mutationAffectsDungeonHeading; })()`,
     {}

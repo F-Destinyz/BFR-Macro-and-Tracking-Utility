@@ -1660,6 +1660,11 @@ impl MacroState {
             )
         };
 
+        // Validate every source before changing either one, so an oversized backup or active file cannot cause a partial deletion.
+        for source in sources {
+            ensure_jsonl_lines_within_limit(source)?;
+        }
+
         let mut removed_dedupe_keys = HashSet::new();
         for source in sources {
             scan_jsonl_records(source, |record| {

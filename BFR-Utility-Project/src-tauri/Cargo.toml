@@ -1,6 +1,6 @@
 [package]
 name = "bfr-macro-tracking-utility"
-version = "2.0.3"
+version = "2.0.4"
 description = "BFR Macro & Tracking Utility — game macro recording, playback, and dungeon reward history"
 authors = ["BFR Macro"]
 edition = "2021"

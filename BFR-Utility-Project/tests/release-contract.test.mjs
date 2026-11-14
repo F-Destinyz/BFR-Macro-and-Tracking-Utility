@@ -25,13 +25,13 @@ function scriptBodies(html) {
   return [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
 }
 
-test('all release version metadata is synchronized at 2.0.3', () => {
-  assert.equal(packageJson.version, '2.0.3');
-  assert.equal(packageLock.version, '2.0.3');
-  assert.equal(packageLock.packages[''].version, '2.0.3');
-  assert.equal(tauriConfig.version, '2.0.3');
-  assert.match(cargoToml, /^version = "2\.0\.3"$/m);
-  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0.3"/);
+test('all release version metadata is synchronized at 2.0.4', () => {
+  assert.equal(packageJson.version, '2.0.4');
+  assert.equal(packageLock.version, '2.0.4');
+  assert.equal(packageLock.packages[''].version, '2.0.4');
+  assert.equal(tauriConfig.version, '2.0.4');
+  assert.match(cargoToml, /^version = "2\.0\.4"$/m);
+  assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0.4"/);
 });
 
 
@@ -838,5 +838,5 @@ test('Windows release helper reads its displayed version from Tauri configuratio
   assert.ok(releaseHelper.includes('$appVersion = [string]$tauriConfig.version'));
   assert.ok(releaseHelper.includes('Building the BFR Macro & Tracking Utility $appVersion Windows installer'));
   assert.ok(releaseHelper.includes('BFR Macro & Tracking Utility $appVersion installer'));
-  assert.ok(!releaseHelper.includes('2.0.3'));
+  assert.ok(!releaseHelper.includes('2.0.4'));
 });

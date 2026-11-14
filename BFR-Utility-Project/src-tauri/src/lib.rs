@@ -4594,6 +4594,46 @@ mod tests {
     }
 
     #[test]
+    fn reward_sample_sanitizer_preserves_shapes_and_removes_sensitive_fields() {
+        let payload = json!({
+            "rewards": {"items": [{"unit_id": 123, "quantity": 2}, {"material_id": "mat_7", "quantity": 4}]},
+            "batch_id": "batch_abc",
+            "user_id": "private-user",
+            "access_token": "private-token",
+            "nested": {"sessionCookie": "private-cookie", "safe_value": true}
+        });
+        let mut nodes = 20_000;
+        let safe = sanitize_reward_sample_value(&payload, 0, &mut nodes).unwrap();
+        assert_eq!(safe["rewards"]["items"][0]["unit_id"], 123);
+        assert_eq!(safe["rewards"]["items"][1]["material_id"], "mat_7");
+        assert_eq!(safe["batch_id"], "batch_abc");
+        assert!(safe.get("user_id").is_none());
+        assert!(safe.get("access_token").is_none());
+        assert!(safe["nested"].get("sessionCookie").is_none());
+        assert_eq!(safe["nested"]["safe_value"], true);
+    }
+
+    #[test]
+    fn reward_sample_capture_accepts_only_successful_known_endpoints_and_preserves_history_separately() {
+        let dir = temp_dir("reward-api-samples");
+        let state = test_macro_state(&dir);
+        assert!(!state.tracker_reward_sample_event("/api/other", 200, json!({"ignored": true})).unwrap());
+        assert!(!state.tracker_reward_sample_event("/api/battles/finish", 500, json!({"ignored": true})).unwrap());
+        assert!(state.tracker_reward_sample_event("/api/battles/finish", 200, json!({"rewards": {"items": [{"id": 12, "quantity": 1}]}})).unwrap());
+        assert!(state.tracker_reward_sample_event("/api/battles/repeat", 200, json!({"settlement": {"items": [{"id": 12, "quantity": 2}]}, "totals": {"finished": true}})).unwrap());
+
+        let bytes = fs::read(&state.tracker_reward_samples_file).unwrap();
+        let samples: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["endpoint"], "/api/battles/finish");
+        assert_eq!(samples[0]["response"]["rewards"]["items"][0]["quantity"], 1);
+        assert_eq!(samples[1]["endpoint"], "/api/battles/repeat");
+        assert_eq!(samples[1]["response"]["settlement"]["items"][0]["quantity"], 2);
+        assert!(!dir.join("battle-rewards.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn tracker_delete_removes_only_the_selected_single_record_and_preserves_other_lines() {
         let dir = temp_dir("tracker-delete-single");
         let state = test_macro_state(&dir);

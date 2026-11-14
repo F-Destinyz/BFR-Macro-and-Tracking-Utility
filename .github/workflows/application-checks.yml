@@ -56,7 +56,7 @@ jobs:
       - name: Build Windows NSIS installer
         working-directory: BFR-Utility-Project
         run: |
-          npm run build:windows
+          npm run build:windows:playtest
           if (-not (Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Filter '*setup.exe' -ErrorAction SilentlyContinue)) {
             throw 'Tauri build completed without producing the expected NSIS setup installer.'
           }

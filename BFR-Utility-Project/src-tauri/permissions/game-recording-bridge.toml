@@ -7,5 +7,6 @@ commands.allow = [
   "report_recording_error",
   "tracker_diagnostic_event",
   "tracker_dungeon_context",
-  "tracker_reward_event"
+  "tracker_reward_event",
+  "tracker_reward_sample_event"
 ]

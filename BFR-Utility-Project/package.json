@@ -6,7 +6,8 @@
   "scripts": {
     "tauri": "tauri",
     "build:windows": "tauri build",
-    "test": "node --test"
+    "test": "node --test",
+    "build:windows:playtest": "tauri build --config src-tauri/tauri.playtest.conf.json"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.4"

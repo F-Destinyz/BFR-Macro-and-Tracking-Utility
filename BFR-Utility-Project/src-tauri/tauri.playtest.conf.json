@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BFR Macro & Tracking Utility Playtest",
+  "identifier": "com.bfrmacro.tauri.playtest",
+  "bundle": {
+    "windows": {
+      "nsis": {
+        "startMenuFolder": "BFR Macro & Tracking Utility Playtest"
+      }
+    }
+  }
+}

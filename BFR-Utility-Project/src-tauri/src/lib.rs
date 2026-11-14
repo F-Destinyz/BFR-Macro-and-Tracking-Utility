@@ -31,6 +31,9 @@ const LOOP_GAP: Duration = Duration::from_millis(500);
 const TRACKER_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKER_DIAGNOSTICS_PER_WINDOW: u32 = 120;
 const MAX_RECORDING_ERROR_MESSAGE_CHARS: usize = 500;
+const MAX_REWARD_SAMPLE_COUNT: usize = 40;
+const MAX_REWARD_SAMPLE_BYTES: usize = 512 * 1024;
+const MAX_REWARD_SAMPLE_FILE_BYTES: usize = 4 * 1024 * 1024;
 const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CDP_IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -222,6 +225,17 @@ const INJECTION_SCRIPT: &str = r#"
           console.error('[BFR Tracker] Diagnostic log IPC failed:', event, String(error));
         });
       return diagnosticQueue;
+    };
+    let rewardSampleQueue = Promise.resolve();
+    const reportRewardSample = (endpoint, status, payload) => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== 'function') return;
+      // Preserve the order in which repeat-batch responses arrive.
+      rewardSampleQueue = rewardSampleQueue.then(() =>
+        invoke('tracker_reward_sample_event', { host: window.location.hostname, endpoint, status: Number(status), payload })
+      ).catch((error) => {
+        console.error('[BFR Tracker] Could not save reward API sample:', String(error));
+      });
     };
 
     report('observer_started', {
@@ -670,6 +684,7 @@ const INJECTION_SCRIPT: &str = r#"
               const contentType = response.headers.get('content-type') || '';
               if (contentType.toLowerCase().includes('json')) {
                 response.clone().json().then((payload) => {
+                  reportRewardSample(parsed.pathname, response.status, payload);
                   if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, requestMethod, response.status, contentType, payload);
                   else inspectBattleFinishResponse(parsed.href, requestMethod, response.status, contentType, payload);
                 }).catch(() => {});
@@ -705,6 +720,7 @@ const INJECTION_SCRIPT: &str = r#"
             if (!contentType.toLowerCase().includes('json')) return;
             let payload = this.responseType === 'json' ? this.response : this.responseText;
             if (typeof payload === 'string') payload = JSON.parse(payload);
+            reportRewardSample(parsed.pathname, this.status, payload);
             if (parsed.pathname === '/api/battles/repeat') inspectRepeatResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
             else inspectBattleFinishResponse(parsed.href, this.__bfrTrackerMethod, this.status, contentType, payload);
           } catch (_) {}
@@ -868,6 +884,39 @@ fn sanitize_recording_error_message(message: &str) -> String {
     }
 }
 
+
+fn sanitize_reward_sample_value(value: &Value, depth: usize, nodes: &mut usize) -> Result<Value, String> {
+    if depth > 16 { return Err("Reward sample exceeded the maximum JSON nesting depth".to_string()); }
+    if *nodes == 0 { return Err("Reward sample exceeded the maximum JSON node count".to_string()); }
+    *nodes -= 1;
+    match value {
+        Value::Object(object) => {
+            if object.len() > 2_000 { return Err("Reward sample contained too many object fields".to_string()); }
+            let mut safe = serde_json::Map::new();
+            for (key, child) in object {
+                let normalized = key.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+                let sensitive = ["authorization", "token", "cookie", "password", "secret", "session", "accountid", "userid", "playerid", "username", "email", "phone", "csrf", "apikey"].iter().any(|part| normalized.contains(part));
+                if sensitive || key.len() > 120 || key.chars().any(char::is_control) { continue; }
+                safe.insert(key.clone(), sanitize_reward_sample_value(child, depth + 1, nodes)?);
+            }
+            Ok(Value::Object(safe))
+        }
+        Value::Array(array) => {
+            if array.len() > 2_000 { return Err("Reward sample contained an oversized array".to_string()); }
+            let mut safe = Vec::with_capacity(array.len());
+            for child in array { safe.push(sanitize_reward_sample_value(child, depth + 1, nodes)?); }
+            Ok(Value::Array(safe))
+        }
+        Value::String(value) => {
+            if value.len() > 8_192 { return Err("Reward sample contained an oversized string".to_string()); }
+            Ok(Value::String(value.clone()))
+        }
+        Value::Number(number) => Ok(Value::Number(number.clone())),
+        Value::Bool(value) => Ok(Value::Bool(*value)),
+        Value::Null => Ok(Value::Null),
+    }
+}
+
 struct MacroState {
     file: PathBuf,
     log_file: PathBuf,
@@ -875,6 +924,7 @@ struct MacroState {
     tracker_diagnostics_file: PathBuf,
     tracker_sessions_file: PathBuf,
     tracker_context_file: PathBuf,
+    tracker_reward_samples_file: PathBuf,
     tracker_legacy_file: PathBuf,
     tracker_data_lock: Mutex<()>,
     tracker_dedupe_keys: Mutex<HashSet<String>>,
@@ -1333,6 +1383,32 @@ impl MacroState {
             "details": safe_details
         });
         append_performance_record(&self.tracker_diagnostics_file, &record)
+    }
+
+
+    fn tracker_reward_sample_event(&self, host: &str, endpoint: &str, status: u16, payload: Value) -> Result<bool, String> {
+        if host != "rebornbf.com" || !["/api/battles/finish", "/api/battles/repeat"].contains(&endpoint) || !(200..300).contains(&status) { return Ok(false); }
+        let mut nodes = 20_000;
+        let safe_response = sanitize_reward_sample_value(&payload, 0, &mut nodes)?;
+        let record = json!({"captured_at_unix_ms": unix_timestamp_ms(), "endpoint": endpoint, "status": status, "response": safe_response});
+        let encoded_record = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        if encoded_record.len() > MAX_REWARD_SAMPLE_BYTES { return Err("Reward response sample exceeded the 512 KB safety limit and was not saved".to_string()); }
+        let _guard = self.tracker_data_lock.lock().map_err(|_| "Reward sample storage is unavailable because its lock was poisoned".to_string())?;
+        let mut samples: VecDeque<Value> = if self.tracker_reward_samples_file.exists() {
+            let bytes = fs::read(&self.tracker_reward_samples_file).map_err(|error| format!("Could not read existing reward samples: {error}"))?;
+            if bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES { return Err("Existing reward sample file exceeds its safety limit; it was left unchanged".to_string()); }
+            serde_json::from_slice(&bytes).map_err(|error| format!("Existing reward sample file is invalid and was left unchanged: {error}"))?
+        } else { VecDeque::new() };
+        samples.push_back(record);
+        while samples.len() > MAX_REWARD_SAMPLE_COUNT { samples.pop_front(); }
+        let mut bytes = serde_json::to_vec_pretty(&samples).map_err(|error| error.to_string())?;
+        while bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES && samples.len() > 1 {
+            samples.pop_front();
+            bytes = serde_json::to_vec_pretty(&samples).map_err(|error| error.to_string())?;
+        }
+        if bytes.len() > MAX_REWARD_SAMPLE_FILE_BYTES { return Err("Reward sample export exceeded its 4 MB safety limit and was not saved".to_string()); }
+        write_file_atomically(&self.tracker_reward_samples_file, &bytes)?;
+        Ok(true)
     }
 
     fn tracker_dungeon_context(&self, details: Value) -> Result<(), String> {
@@ -2563,6 +2639,18 @@ fn tracker_dungeon_context(details: Value, state: State<'_, MacroState>) -> Resu
 #[tauri::command(async)]
 fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<bool, String> {
     state.tracker_reward_event(details)
+}
+
+#[tauri::command(async)]
+fn tracker_reward_sample_event(host: String, endpoint: String, status: u16, payload: Value, state: State<'_, MacroState>) -> Result<bool, String> {
+    state.tracker_reward_sample_event(&host, &endpoint, status, payload)
+}
+
+#[tauri::command]
+fn tracker_open_reward_samples_folder(app: AppHandle<Wry>) -> Result<(), String> {
+    let folder = app.path().app_data_dir().map_err(|error| error.to_string())?.join("Logs");
+    open_data_folder(&app, folder, "Logs");
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -4045,6 +4133,8 @@ pub fn run() {
             tracker_diagnostic_event,
             tracker_dungeon_context,
             tracker_reward_event,
+            tracker_reward_sample_event,
+            tracker_open_reward_samples_folder,
             tracker_read_data_page,
             tracker_clear_history,
             tracker_delete_history_entry,
@@ -4127,6 +4217,7 @@ pub fn run() {
             let tracker_diagnostics_file = logs_dir.join("tracker-discovery.jsonl");
             let tracker_sessions_file = logs_dir.join("battle-rewards.jsonl");
             let tracker_context_file = logs_dir.join("tracker-context.jsonl");
+            let tracker_reward_samples_file = logs_dir.join("reward-api-samples.json");
             let tracker_legacy_file = app_data.join("tracker-data").join("battle-rewards.jsonl");
             let tracker_backup_file = tracker_sessions_file.with_extension("jsonl.1");
             let tracker_dedupe_keys = load_history_dedupe_keys(&tracker_backup_file, &tracker_sessions_file);
@@ -4155,6 +4246,7 @@ pub fn run() {
                 tracker_diagnostics_file,
                 tracker_sessions_file,
                 tracker_context_file,
+                tracker_reward_samples_file,
                 tracker_legacy_file,
                 tracker_data_lock: Mutex::new(()),
                 tracker_dedupe_keys: Mutex::new(tracker_dedupe_keys.as_ref().cloned().unwrap_or_default()),
@@ -4480,6 +4572,7 @@ mod tests {
             tracker_diagnostics_file: dir.join("tracker-diagnostics.jsonl"),
             tracker_sessions_file: dir.join("battle-rewards.jsonl"),
             tracker_context_file: dir.join("dungeon-context.jsonl"),
+            tracker_reward_samples_file: dir.join("reward-api-samples.json"),
             tracker_legacy_file: dir.join("legacy-history.jsonl"),
             tracker_data_lock: Mutex::new(()),
             tracker_dedupe_keys: Mutex::new(HashSet::new()),
@@ -4502,6 +4595,47 @@ mod tests {
         read_jsonl_records(path, &mut records, &mut malformed).unwrap();
         assert_eq!(malformed, 0, "test history should contain only valid JSONL");
         records
+    }
+
+    #[test]
+    fn reward_sample_sanitizer_preserves_shapes_and_removes_sensitive_fields() {
+        let payload = json!({
+            "rewards": {"items": [{"unit_id": 123, "quantity": 2}, {"material_id": "mat_7", "quantity": 4}]},
+            "batch_id": "batch_abc",
+            "user_id": "private-user",
+            "access_token": "private-token",
+            "nested": {"sessionCookie": "private-cookie", "safe_value": true}
+        });
+        let mut nodes = 20_000;
+        let safe = sanitize_reward_sample_value(&payload, 0, &mut nodes).unwrap();
+        assert_eq!(safe["rewards"]["items"][0]["unit_id"], 123);
+        assert_eq!(safe["rewards"]["items"][1]["material_id"], "mat_7");
+        assert_eq!(safe["batch_id"], "batch_abc");
+        assert!(safe.get("user_id").is_none());
+        assert!(safe.get("access_token").is_none());
+        assert!(safe["nested"].get("sessionCookie").is_none());
+        assert_eq!(safe["nested"]["safe_value"], true);
+    }
+
+    #[test]
+    fn reward_sample_capture_accepts_only_successful_known_endpoints_and_preserves_history_separately() {
+        let dir = temp_dir("reward-api-samples");
+        let state = test_macro_state(&dir);
+        assert!(!state.tracker_reward_sample_event("rebornbf.com", "/api/other", 200, json!({"ignored": true})).unwrap());
+        assert!(!state.tracker_reward_sample_event("evil.example", "/api/battles/finish", 200, json!({"ignored": true})).unwrap());
+        assert!(!state.tracker_reward_sample_event("rebornbf.com", "/api/battles/finish", 500, json!({"ignored": true})).unwrap());
+        assert!(state.tracker_reward_sample_event("rebornbf.com", "/api/battles/finish", 200, json!({"rewards": {"items": [{"id": 12, "quantity": 1}]}})).unwrap());
+        assert!(state.tracker_reward_sample_event("rebornbf.com", "/api/battles/repeat", 200, json!({"settlement": {"items": [{"id": 12, "quantity": 2}]}, "totals": {"finished": true}})).unwrap());
+
+        let bytes = fs::read(&state.tracker_reward_samples_file).unwrap();
+        let samples: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["endpoint"], "/api/battles/finish");
+        assert_eq!(samples[0]["response"]["rewards"]["items"][0]["quantity"], 1);
+        assert_eq!(samples[1]["endpoint"], "/api/battles/repeat");
+        assert_eq!(samples[1]["response"]["settlement"]["items"][0]["quantity"], 2);
+        assert!(!dir.join("battle-rewards.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

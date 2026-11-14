@@ -2388,7 +2388,6 @@ fn tracker_set_pinned(
     settings.save()
 }
 
-#[tauri::command]
 fn append_recorded_click(
     mode: &AtomicU8,
     clicks: &Mutex<Vec<MacroClick>>,
@@ -2426,6 +2425,7 @@ fn append_recorded_click(
     Ok(())
 }
 
+#[tauri::command]
 fn record_click(x: f64, y: f64, state: State<'_, MacroState>) -> Result<(), String> {
     if state.mode.load(Ordering::SeqCst) != MODE_RECORDING {
         return Ok(());

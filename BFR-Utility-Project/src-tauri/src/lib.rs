@@ -232,7 +232,7 @@ const INJECTION_SCRIPT: &str = r#"
       if (typeof invoke !== 'function') return;
       // Preserve the order in which repeat-batch responses arrive.
       rewardSampleQueue = rewardSampleQueue.then(() =>
-        invoke('tracker_reward_sample_event', { endpoint, status: Number(status), payload })
+        invoke('tracker_reward_sample_event', { host: window.location.hostname, endpoint, status: Number(status), payload })
       ).catch((error) => {
         console.error('[BFR Tracker] Could not save reward API sample:', String(error));
       });
@@ -1386,8 +1386,8 @@ impl MacroState {
     }
 
 
-    fn tracker_reward_sample_event(&self, endpoint: &str, status: u16, payload: Value) -> Result<bool, String> {
-        if !["/api/battles/finish", "/api/battles/repeat"].contains(&endpoint) || !(200..300).contains(&status) { return Ok(false); }
+    fn tracker_reward_sample_event(&self, host: &str, endpoint: &str, status: u16, payload: Value) -> Result<bool, String> {
+        if host != "rebornbf.com" || !["/api/battles/finish", "/api/battles/repeat"].contains(&endpoint) || !(200..300).contains(&status) { return Ok(false); }
         let mut nodes = 20_000;
         let safe_response = sanitize_reward_sample_value(&payload, 0, &mut nodes)?;
         let record = json!({"captured_at_unix_ms": unix_timestamp_ms(), "endpoint": endpoint, "status": status, "response": safe_response});
@@ -2642,8 +2642,8 @@ fn tracker_reward_event(details: Value, state: State<'_, MacroState>) -> Result<
 }
 
 #[tauri::command(async)]
-fn tracker_reward_sample_event(endpoint: String, status: u16, payload: Value, state: State<'_, MacroState>) -> Result<bool, String> {
-    state.tracker_reward_sample_event(&endpoint, status, payload)
+fn tracker_reward_sample_event(host: String, endpoint: String, status: u16, payload: Value, state: State<'_, MacroState>) -> Result<bool, String> {
+    state.tracker_reward_sample_event(&host, &endpoint, status, payload)
 }
 
 #[tauri::command]
@@ -4621,10 +4621,11 @@ mod tests {
     fn reward_sample_capture_accepts_only_successful_known_endpoints_and_preserves_history_separately() {
         let dir = temp_dir("reward-api-samples");
         let state = test_macro_state(&dir);
-        assert!(!state.tracker_reward_sample_event("/api/other", 200, json!({"ignored": true})).unwrap());
-        assert!(!state.tracker_reward_sample_event("/api/battles/finish", 500, json!({"ignored": true})).unwrap());
-        assert!(state.tracker_reward_sample_event("/api/battles/finish", 200, json!({"rewards": {"items": [{"id": 12, "quantity": 1}]}})).unwrap());
-        assert!(state.tracker_reward_sample_event("/api/battles/repeat", 200, json!({"settlement": {"items": [{"id": 12, "quantity": 2}]}, "totals": {"finished": true}})).unwrap());
+        assert!(!state.tracker_reward_sample_event("rebornbf.com", "/api/other", 200, json!({"ignored": true})).unwrap());
+        assert!(!state.tracker_reward_sample_event("evil.example", "/api/battles/finish", 200, json!({"ignored": true})).unwrap());
+        assert!(!state.tracker_reward_sample_event("rebornbf.com", "/api/battles/finish", 500, json!({"ignored": true})).unwrap());
+        assert!(state.tracker_reward_sample_event("rebornbf.com", "/api/battles/finish", 200, json!({"rewards": {"items": [{"id": 12, "quantity": 1}]}})).unwrap());
+        assert!(state.tracker_reward_sample_event("rebornbf.com", "/api/battles/repeat", 200, json!({"settlement": {"items": [{"id": 12, "quantity": 2}]}, "totals": {"finished": true}})).unwrap());
 
         let bytes = fs::read(&state.tracker_reward_samples_file).unwrap();
         let samples: Vec<Value> = serde_json::from_slice(&bytes).unwrap();

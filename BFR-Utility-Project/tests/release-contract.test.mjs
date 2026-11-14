@@ -388,7 +388,7 @@ test('Tauri app command manifest matches every registered IPC command and dashbo
   const declared = [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]).sort();
   assert.deepEqual(declared, registered, 'Every registered command must be included in AppManifest');
   const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
-  assert.match(dashboard, /commands\\.allow = \\["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned"\\]/);
+  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned"\]/);
   assert.match(dashboard, /commands\.deny = \["tracker_read_data_page"\]/);
   assert.doesNotMatch(dashboard, /\btracker_read_data\b/);
 });

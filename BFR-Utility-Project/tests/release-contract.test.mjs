@@ -388,9 +388,25 @@ test('Tauri app command manifest matches every registered IPC command and dashbo
   const declared = [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]).sort();
   assert.deepEqual(declared, registered, 'Every registered command must be included in AppManifest');
   const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
-  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned"\]/);
+  assert.match(dashboard, /commands\.allow = \["tracker_read_data_page", "tracker_clear_history", "tracker_delete_history_entry", "tracker_get_pinned", "tracker_set_pinned", "tracker_open_reward_samples_folder"\]/);
   assert.match(dashboard, /commands\.deny = \["tracker_read_data_page"\]/);
   assert.doesNotMatch(dashboard, /\btracker_read_data\b/);
+});
+
+test('reward API sample capture is narrowly scoped, sanitized and separate from Run History', () => {
+  const gameBridge = read('src-tauri/permissions/game-recording-bridge.toml');
+  const dashboard = read('src-tauri/permissions/tracker-dashboard.toml');
+  assert.match(gameBridge, /"tracker_reward_sample_event"/);
+  assert.match(dashboard, /"tracker_open_reward_samples_folder"/);
+  assert.match(rust, /fn tracker_reward_sample_event\(/);
+  assert.match(rust, /sanitize_reward_sample_value/);
+  assert.match(rust, /MAX_REWARD_SAMPLE_COUNT: usize = 40/);
+  assert.match(rust, /MAX_REWARD_SAMPLE_FILE_BYTES: usize = 4 \* 1024 \* 1024/);
+  assert.match(rust, /reward-api-samples\.json/);
+  assert.match(rust, /reportRewardSample\(parsed\.pathname/);
+  assert.match(trackerHtml, /id="openSamples"/);
+  assert.match(trackerHtml, /tracker_open_reward_samples_folder/);
+  assert.doesNotMatch(rust.slice(rust.indexOf('fn tracker_reward_sample_event(&self'), rust.indexOf('fn tracker_dungeon_context(&self')), /headers|cookies|request_body/i);
 });
 
 test('playback sessions are generation-scoped and CDP I/O is time-bounded', () => {

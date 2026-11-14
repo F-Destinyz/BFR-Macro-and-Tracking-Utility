@@ -4494,6 +4494,123 @@ mod tests {
     }
 
     #[test]
+    fn tracker_delete_removes_only_the_selected_single_record_and_preserves_other_lines() {
+        let dir = temp_dir("tracker-delete-single");
+        let state = test_macro_state(&dir);
+        let active = dir.join("battle-rewards.jsonl");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let selected = json!({
+            "record_type": "battle_reward",
+            "timestamp_unix_ms": 100_u64,
+            "path": "/api/battles/finish",
+            "dungeon_route": "/start/100501/begin",
+            "dedupe_key": "finish:/start/100501/begin:10"
+        });
+        let other = json!({
+            "record_type": "battle_reward",
+            "timestamp_unix_ms": 200_u64,
+            "path": "/api/battles/finish",
+            "dungeon_route": "/start/100502/begin",
+            "dedupe_key": "finish:/start/100502/begin:20"
+        });
+        fs::write(
+            &active,
+            format!("{}\r\nnot-json\n{}\n", selected, other),
+        )
+        .unwrap();
+        fs::write(&backup, b"").unwrap();
+        {
+            let mut keys = state.tracker_dedupe_keys.lock().unwrap();
+            keys.insert("finish:/start/100501/begin:10".to_string());
+            keys.insert("finish:/start/100502/begin:20".to_string());
+        }
+        state.tracker_dedupe_keys_ready.store(true, Ordering::Release);
+
+        let removed = state
+            .tracker_delete_history_entry(
+                100,
+                None,
+                "/api/battles/finish".to_string(),
+                "/start/100501/begin".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            fs::read(&active).unwrap(),
+            format!("not-json\n{}\n", other).as_bytes()
+        );
+        let keys = state.tracker_dedupe_keys.lock().unwrap();
+        assert!(!keys.contains("finish:/start/100501/begin:10"));
+        assert!(keys.contains("finish:/start/100502/begin:20"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tracker_delete_removes_all_repeat_batch_snapshots_from_active_and_backup() {
+        let dir = temp_dir("tracker-delete-repeat-batch");
+        let state = test_macro_state(&dir);
+        let active = dir.join("battle-rewards.jsonl");
+        let backup = dir.join("battle-rewards.jsonl.1");
+        let snapshot = |timestamp, batch, route| json!({
+            "record_type": "battle_reward",
+            "timestamp_unix_ms": timestamp,
+            "batch_id": batch,
+            "path": "/api/battles/repeat",
+            "dungeon_route": route,
+            "dedupe_key": format!("{batch}:{timestamp}")
+        });
+        let first = snapshot(100_u64, "batch-A", "/dungeons/vortex/100501");
+        let latest = snapshot(200_u64, "batch-A", "/dungeons/vortex/100501");
+        let other_batch = snapshot(300_u64, "batch-B", "/dungeons/vortex/100501");
+        let old_batch_snapshot = snapshot(50_u64, "batch-A", "/dungeons/vortex/100501");
+        fs::write(&active, format!("{}\n{}\n", first, latest)).unwrap();
+        fs::write(&backup, format!("{}\n{}\n", old_batch_snapshot, other_batch)).unwrap();
+        {
+            let mut keys = state.tracker_dedupe_keys.lock().unwrap();
+            for timestamp in [50, 100, 200] {
+                keys.insert(format!("batch-A:{timestamp}"));
+            }
+            keys.insert("batch-B:300".to_string());
+        }
+        state.tracker_dedupe_keys_ready.store(true, Ordering::Release);
+
+        let removed = state
+            .tracker_delete_history_entry(
+                200,
+                Some("batch-A".to_string()),
+                "/api/battles/repeat".to_string(),
+                "/dungeons/vortex/100501".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(removed, 3);
+        assert!(read_test_history(&active).is_empty());
+        assert_eq!(read_test_history(&backup), vec![other_batch]);
+        let keys = state.tracker_dedupe_keys.lock().unwrap();
+        assert!(!keys.iter().any(|key| key.starts_with("batch-A:")));
+        assert!(keys.contains("batch-B:300"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tracker_delete_refuses_oversized_jsonl_without_changing_original_bytes() {
+        let dir = temp_dir("tracker-delete-oversized");
+        let path = dir.join("history.jsonl");
+        let mut original = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
+        original.extend_from_slice(b"\n");
+        original.extend_from_slice(br#"{"record_type":"battle_reward"}"#);
+        fs::write(&path, &original).unwrap();
+
+        let error = rewrite_jsonl_without_matching_records(&path, |_| true).unwrap_err();
+
+        assert!(error.contains("oversized record"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reward_tracker_persists_single_completion_and_deduplicates_after_restart() {
         let dir = temp_dir("reward-single-regression");
         let state = test_macro_state(&dir);

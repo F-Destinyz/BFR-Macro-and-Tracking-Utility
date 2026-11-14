@@ -226,10 +226,14 @@ const INJECTION_SCRIPT: &str = r#"
         });
       return diagnosticQueue;
     };
+    let rewardSampleQueue = Promise.resolve();
     const reportRewardSample = (endpoint, status, payload) => {
       const invoke = window.__TAURI_INTERNALS__?.invoke;
       if (typeof invoke !== 'function') return;
-      invoke('tracker_reward_sample_event', { endpoint, status: Number(status), payload }).catch((error) => {
+      // Preserve the order in which repeat-batch responses arrive.
+      rewardSampleQueue = rewardSampleQueue.then(() =>
+        invoke('tracker_reward_sample_event', { endpoint, status: Number(status), payload })
+      ).catch((error) => {
         console.error('[BFR Tracker] Could not save reward API sample:', String(error));
       });
     };

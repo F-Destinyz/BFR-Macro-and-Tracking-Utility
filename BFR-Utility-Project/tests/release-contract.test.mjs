@@ -30,7 +30,7 @@ test('all release version metadata is synchronized at 2.0.4', () => {
   assert.equal(packageLock.version, '2.0.4');
   assert.equal(packageLock.packages[''].version, '2.0.4');
   assert.equal(tauriConfig.version, '2.0.4');
-  assert.match(cargoToml, /^version = "2\.0\.3"$/m);
+  assert.match(cargoToml, /^version = "2\.0\.4"$/m);
   assert.match(cargoLock, /name = "bfr-macro-tracking-utility"\r?\nversion = "2\.0.3"/);
 });
 

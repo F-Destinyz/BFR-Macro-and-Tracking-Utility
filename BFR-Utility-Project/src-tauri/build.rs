@@ -7,6 +7,8 @@ fn main() {
             "tracker_diagnostic_event",
             "tracker_dungeon_context",
             "tracker_reward_event",
+            "tracker_reward_sample_event",
+            "tracker_open_reward_samples_folder",
             "tracker_read_data_page",
             "tracker_clear_history",
             "tracker_delete_history_entry",

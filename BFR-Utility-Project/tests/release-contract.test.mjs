@@ -621,7 +621,7 @@ test('Run History pin control is accessible and waits for its initial state', ()
 test('Run History dashboard provides keyboard focus and accessible table semantics', () => {
   assert.match(trackerHtml, /button:focus-visible,input:focus-visible/);
   assert.match(trackerHtml, /<table aria-label="Completed dungeon rewards">/);
-  assert.equal((trackerHtml.match(/<th scope="col">/g) || []).length, 9);
+  assert.equal((trackerHtml.match(/<th scope="col">/g) || []).length, 10);
   assert.match(trackerHtml, /id="loadOlder" aria-controls="historyTable"/);
   assert.match(trackerHtml, /id="status" class="status" role="status" aria-live="polite"/);
 });
@@ -637,6 +637,31 @@ test('Run History pin feedback is isolated and header controls can wrap', () => 
 });
 
 
+
+
+test('Run History header orders Pin, Refresh, then Clear All', () => {
+  const actions = trackerHtml.match(/<div class="actions">([\s\S]*?)<\/div>/)?.[1] || '';
+  const order = [...actions.matchAll(/id="(pin|refresh|clearHistory)"/g)].map((match) => match[1]);
+  assert.deepEqual(order, ['pin', 'refresh', 'clearHistory']);
+  assert.match(actions, /id="clearHistory"[^>]*>✕ Clear All<\/button>/);
+});
+
+test('Run History entries expose an accessible individual delete action', () => {
+  assert.match(trackerHtml, /<th scope="col">Actions<\/th>/);
+  assert.match(trackerHtml, /class="delete-entry" type="button" data-delete-index="\$\{i\}"/);
+  assert.match(trackerHtml, /aria-label="Delete \$\{esc\(r\.display_name\)\} from Run History"/);
+  assert.match(trackerHtml, /title="Delete this entry">🗑<\/button>/);
+  assert.match(trackerHtml, /historyTable'\)\.addEventListener\('click',async event=>/);
+  assert.match(trackerHtml, /invoke\('tracker_delete_history_entry'/);
+  assert.match(trackerHtml, /window\.confirm\(prompt\)/);
+  assert.match(trackerHtml, /All saved snapshots for this repeat batch will be removed/);
+  assert.match(rust, /tracker_delete_history_entry,/);
+});
+
+test('tray menu exit item is labeled simply Exit', () => {
+  assert.match(rust, /"exit",\s*"Exit",/);
+  assert.doesNotMatch(rust, /"Exit BFR Macro & Tracking Utility"/);
+});
 
 test('dungeon heading observer ignores unrelated DOM mutations', () => {
   const injectionStart = rust.indexOf('const INJECTION_SCRIPT: &str = r#"');
@@ -739,6 +764,8 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
   assert.ok(allRows.indexOf('Third &amp; Final') < allRows.indexOf('Second Dungeon'));
   assert.ok(allRows.indexOf('Second Dungeon') < allRows.indexOf('First Dungeon'));
   assert.equal((allRows.match(/<tr>/g) || []).length, 3);
+  assert.equal((allRows.match(/class="delete-entry"/g) || []).length, 3);
+  assert.match(allRows, /data-delete-index="2"/);
   assert.match(allRows, /&lt;Third &amp; Final&gt;/);
   assert.match(allRows, /time-3/);
 
@@ -749,7 +776,7 @@ test('Run History rendering preserves newest-first order, filtering, and escapin
 
   const empty = historyRowsHtml(records, 'missing', 'No matching reward records.');
   assert.match(empty, /No matching reward records/);
-  assert.match(empty, /colspan="9"/);
+  assert.match(empty, /colspan="10"/);
   assert.ok(trackerHtml.includes('historyRowsHtml(rewards,q,emptyMessage)'), 'Dashboard render must use the optimized row renderer');
   assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
 });

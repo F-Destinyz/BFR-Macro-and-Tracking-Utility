@@ -697,3 +697,49 @@ test('dungeon heading observer ignores unrelated DOM mutations', () => {
   assert.ok(injection.includes('headingObserver.observe(document.documentElement, { childList: true, subtree: true })'),
     'The existing child-list observer coverage must remain unchanged');
 });
+
+
+test('Run History rendering preserves newest-first order, filtering, and escaping', () => {
+  const helperStart = trackerHtml.indexOf('function historyRowsHtml(');
+  const helperEnd = trackerHtml.indexOf('\n}', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'Run History row renderer was not found');
+  const helperSource = trackerHtml.slice(helperStart, helperEnd + 2);
+  const context = {
+    elapsedTimeText: () => '1m 2s',
+    esc: (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]),
+    timeText: (value) => value ? `time-${value}` : '—',
+    fmt: (value) => String(Number(value || 0))
+  };
+  const historyRowsHtml = vm.runInNewContext(
+    `(() => { ${helperSource}; return historyRowsHtml; })()`,
+    context
+  );
+  const records = [
+    { display_name: 'First Dungeon', kind: 'Single run', timestamp_unix_ms: 1,
+      values: { runs: 1, zel: 10, karma: 2, honor: 3, exp: 4 } },
+    { display_name: 'Second Dungeon', kind: 'Repeat batch', timestamp_unix_ms: 2,
+      values: { runs: 5, zel: 50, karma: 6, honor: 7, exp: 8 } },
+    { display_name: '<Third & Final>', kind: 'Single run', timestamp_unix_ms: 3,
+      values: { runs: 1, zel: 30, karma: 4, honor: 5, exp: 6 } }
+  ];
+
+  const allRows = historyRowsHtml(records, '', 'No rows');
+  assert.ok(allRows.indexOf('Third &amp; Final') < allRows.indexOf('Second Dungeon'));
+  assert.ok(allRows.indexOf('Second Dungeon') < allRows.indexOf('First Dungeon'));
+  assert.equal((allRows.match(/<tr>/g) || []).length, 3);
+  assert.match(allRows, /&lt;Third &amp; Final&gt;/);
+  assert.match(allRows, /time-3/);
+
+  const filtered = historyRowsHtml(records, 'second', 'No matching reward records.');
+  assert.equal((filtered.match(/<tr>/g) || []).length, 1);
+  assert.match(filtered, /Second Dungeon/);
+  assert.doesNotMatch(filtered, /First Dungeon|Third/);
+
+  const empty = historyRowsHtml(records, 'missing', 'No matching reward records.');
+  assert.match(empty, /No matching reward records/);
+  assert.match(empty, /colspan="9"/);
+  assert.ok(trackerHtml.includes('historyRowsHtml(rewards,q,emptyMessage)'), 'Dashboard render must use the optimized row renderer');
+  assert.ok(!trackerHtml.includes('rewards.slice().reverse().filter('), 'Dashboard render must not recreate reversed and filtered reward arrays');
+});

@@ -646,6 +646,11 @@ test('Run History header orders Pin, Refresh, then Clear All', () => {
   assert.match(actions, /id="clearHistory"[^>]*>✕ Clear All<\/button>/);
 });
 
+test('Run History table scroller is keyboard accessible', () => {
+  assert.match(trackerHtml, /<div class="table-wrap" role="region" aria-label="Run History table; scroll horizontally to view all columns" tabindex="0">/);
+  assert.match(trackerHtml, /\.table-wrap:focus-visible\{outline:2px solid #e8c36f;outline-offset:3px\}/);
+});
+
 test('Run History entries expose an accessible individual delete action', () => {
   assert.match(trackerHtml, /<th scope="col">Actions<\/th>/);
   assert.match(trackerHtml, /class="delete-entry" type="button" data-delete-index="\$\{i\}"/);

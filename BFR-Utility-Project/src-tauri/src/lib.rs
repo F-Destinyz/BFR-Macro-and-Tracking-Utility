@@ -637,7 +637,7 @@ const INJECTION_SCRIPT: &str = r#"
       }
       return false;
     };
-    let headingCaptureScheduled = false;
+      let headingCaptureScheduled = false;
       const headingObserver = new MutationObserver((mutations) => {
         if (!mutations.some(mutationAffectsDungeonHeading) || headingCaptureScheduled) return;
         headingCaptureScheduled = true;

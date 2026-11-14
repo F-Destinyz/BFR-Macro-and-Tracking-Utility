@@ -2061,6 +2061,7 @@ where
             } else {
                 writer
                     .write_all(&line)
+                    .and_then(|()| writer.write_all(b"\\n"))
                     .map_err(|error| format!("Could not write updated Run History: {error}"))?;
             }
         }
